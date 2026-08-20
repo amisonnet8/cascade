@@ -1,10 +1,11 @@
 // Package sema performs semantic analysis on a Cascade ast.File, since
 // amivm delegates all type/scope checking to go/types and does not check
 // anything itself (see CLAUDE.md "意味検証の責任分担"). Only the checks
-// Steps 1-2 need are implemented so far: a single well-formed `main`,
-// scope-resolved `let`/`const` declarations and scalar assignment, and
-// nullable-type (`T?`) compatibility (cascade_spec.md §2.3, §4.2, §5).
-// Later steps add operators, control flow, and everything past that.
+// Steps 1-3 need are implemented so far: a single well-formed `main`,
+// scope-resolved `let`/`const` declarations and scalar assignment,
+// nullable-type (`T?`) compatibility (cascade_spec.md §2.3, §4.2, §5), and
+// the arithmetic/comparison/logical operators (§6). Later steps add
+// control flow and everything past that.
 package sema
 
 import (
@@ -198,8 +199,134 @@ func exprType(sc *scope, e ast.Expr) (ast.Type, error) {
 			return ast.Type{}, fmt.Errorf("line %d: undefined name %q", v.Line, v.Name)
 		}
 		return info.Type, nil
+	case *ast.CallExpr:
+		return checkCallExprValue(sc, v)
+	case *ast.UnaryExpr:
+		xt, err := exprType(sc, v.X)
+		if err != nil {
+			return ast.Type{}, err
+		}
+		rt, err := unaryResultType(v.Op, xt, v.Line)
+		if err != nil {
+			return ast.Type{}, err
+		}
+		v.ResultType = rt
+		return rt, nil
+	case *ast.BinaryExpr:
+		xt, err := exprType(sc, v.X)
+		if err != nil {
+			return ast.Type{}, err
+		}
+		yt, err := exprType(sc, v.Y)
+		if err != nil {
+			return ast.Type{}, err
+		}
+		rt, err := binaryResultType(v.Op, xt, yt, v.Line)
+		if err != nil {
+			return ast.Type{}, err
+		}
+		v.ResultType = rt
+		return rt, nil
 	default:
 		return ast.Type{}, fmt.Errorf("line %d: cannot determine the type of this expression yet", ast.ExprLine(e))
+	}
+}
+
+// checkCallExprValue validates a call expression used as a value (as
+// opposed to a bare statement — see checkExprStmt). Only the `string()`
+// builtin conversion (cascade_spec.md §13) is wired up so far, needed to
+// turn an operator's int/float/bool result into something print() can
+// take; the rest of §13's builtins land in the steps that need them.
+func checkCallExprValue(sc *scope, call *ast.CallExpr) (ast.Type, error) {
+	switch call.Callee {
+	case "string":
+		if len(call.Args) != 1 {
+			return ast.Type{}, fmt.Errorf("line %d: string() expects exactly 1 argument, got %d", call.Line, len(call.Args))
+		}
+		t, err := exprType(sc, call.Args[0])
+		if err != nil {
+			return ast.Type{}, err
+		}
+		if t.Nullable || (t.Name != "int" && t.Name != "float" && t.Name != "bool") {
+			return ast.Type{}, fmt.Errorf("line %d: string() does not support %s", call.Line, typeString(t))
+		}
+		call.ArgType = t
+		return ast.Type{Name: "string"}, nil
+	default:
+		return ast.Type{}, fmt.Errorf("line %d: %q cannot be used as a value", call.Line, call.Callee)
+	}
+}
+
+// unaryResultType validates op's operand type and returns its result type
+// (cascade_spec.md §6): "!" needs bool, "-" needs int or float, and either
+// way the operand must be non-nullable (narrow with `is not none` first —
+// deferred to Step 5, see CLAUDE.md's "確定した設計判断").
+func unaryResultType(op string, xt ast.Type, line int) (ast.Type, error) {
+	if xt.Nullable {
+		return ast.Type{}, fmt.Errorf("line %d: operator %q needs a non-nullable operand, got %s", line, op, typeString(xt))
+	}
+	switch op {
+	case "!":
+		if xt.Name != "bool" {
+			return ast.Type{}, fmt.Errorf("line %d: unary ! requires bool, got %s", line, xt.Name)
+		}
+		return xt, nil
+	case "-":
+		if xt.Name != "int" && xt.Name != "float" {
+			return ast.Type{}, fmt.Errorf("line %d: unary - requires int or float, got %s", line, xt.Name)
+		}
+		return xt, nil
+	default:
+		return ast.Type{}, fmt.Errorf("line %d: unsupported unary operator %q", line, op)
+	}
+}
+
+// binaryResultType validates op's operand types and returns its result
+// type (cascade_spec.md §6). Cascade never does implicit conversion, so
+// both operands must already share the exact same type; "+" is the one
+// operator whose AMIVM-IR instruction depends on that shared type (ADD for
+// int/float, CONCAT for string — codegen reads ResultType.Name to tell
+// them apart, mirroring Seed's identical `+` dispatch).
+func binaryResultType(op string, xt, yt ast.Type, line int) (ast.Type, error) {
+	if xt.Nullable || yt.Nullable {
+		return ast.Type{}, fmt.Errorf("line %d: operator %q needs non-nullable operands (narrow with 'is not none' first)", line, op)
+	}
+	if xt.Name != yt.Name {
+		return ast.Type{}, fmt.Errorf("line %d: operator %q: mismatched operand types %s and %s", line, op, xt.Name, yt.Name)
+	}
+
+	switch op {
+	case "+":
+		switch xt.Name {
+		case "int", "float", "string":
+			return xt, nil
+		default:
+			return ast.Type{}, fmt.Errorf("line %d: operator + does not support %s", line, xt.Name)
+		}
+	case "-", "*", "/":
+		if xt.Name != "int" && xt.Name != "float" {
+			return ast.Type{}, fmt.Errorf("line %d: operator %q requires int or float operands, got %s", line, op, xt.Name)
+		}
+		return xt, nil
+	case "%":
+		if xt.Name != "int" {
+			return ast.Type{}, fmt.Errorf("line %d: operator %% requires int operands, got %s", line, xt.Name)
+		}
+		return xt, nil
+	case "<", "<=", ">", ">=":
+		if xt.Name != "int" && xt.Name != "float" && xt.Name != "string" {
+			return ast.Type{}, fmt.Errorf("line %d: operator %q requires int, float, or string operands, got %s", line, op, xt.Name)
+		}
+		return ast.Type{Name: "bool"}, nil
+	case "==", "!=":
+		return ast.Type{Name: "bool"}, nil
+	case "&&", "||":
+		if xt.Name != "bool" {
+			return ast.Type{}, fmt.Errorf("line %d: operator %q requires bool operands, got %s", line, op, xt.Name)
+		}
+		return ast.Type{Name: "bool"}, nil
+	default:
+		return ast.Type{}, fmt.Errorf("line %d: unsupported operator %q", line, op)
 	}
 }
 

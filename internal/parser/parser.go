@@ -289,12 +289,123 @@ func (p *parser) parseReturnStmt() (ast.Stmt, error) {
 	return &ast.ReturnStmt{Results: results, Line: kw.Line}, nil
 }
 
-// parseExpr parses one expression. Only literals, identifiers, and calls
-// are supported so far; the full operator-precedence grammar (§6) lands in
-// Step 3.
+// parseExpr parses a full expression, following cascade_spec.md §6's
+// precedence table (lowest to highest so far): ||, &&, ==/!=, </<=/>/>=,
+// +/-, */%, unary !/-, then primaries. Bitwise/shift levels (§6 priorities
+// 5-7) are inserted between parseComparison and parseAdditive once Step 4
+// lands; postfix "?" (§8.6, Step 11), "."/"[]" (Steps 6/8), and the "|>"
+// pipeline operator (Step 12) extend parsePrimary/parseExpr further in
+// their own steps.
 func (p *parser) parseExpr() (ast.Expr, error) {
+	return p.parseOr()
+}
+
+// binOpNames maps a binary/logical operator token to its ast.BinaryExpr
+// Op string.
+var binOpNames = map[lexer.Kind]string{
+	lexer.OrOr:    "||",
+	lexer.AndAnd:  "&&",
+	lexer.Eq:      "==",
+	lexer.Neq:     "!=",
+	lexer.Lt:      "<",
+	lexer.Lte:     "<=",
+	lexer.Gt:      ">",
+	lexer.Gte:     ">=",
+	lexer.Plus:    "+",
+	lexer.Minus:   "-",
+	lexer.Star:    "*",
+	lexer.Slash:   "/",
+	lexer.Percent: "%",
+}
+
+// parseBinaryLevel implements one precedence level: it parses one operand
+// via next, then folds in `next (op next)*` left-associatively for any of
+// the given token kinds.
+func (p *parser) parseBinaryLevel(next func() (ast.Expr, error), kinds ...lexer.Kind) (ast.Expr, error) {
+	left, err := next()
+	if err != nil {
+		return nil, err
+	}
+	for kindIn(p.cur().Kind, kinds) {
+		opTok := p.advance()
+		right, err := next()
+		if err != nil {
+			return nil, err
+		}
+		left = &ast.BinaryExpr{Op: binOpNames[opTok.Kind], X: left, Y: right, Line: opTok.Line}
+	}
+	return left, nil
+}
+
+func kindIn(k lexer.Kind, kinds []lexer.Kind) bool {
+	for _, want := range kinds {
+		if k == want {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *parser) parseOr() (ast.Expr, error) {
+	return p.parseBinaryLevel(p.parseAnd, lexer.OrOr)
+}
+
+func (p *parser) parseAnd() (ast.Expr, error) {
+	return p.parseBinaryLevel(p.parseEquality, lexer.AndAnd)
+}
+
+func (p *parser) parseEquality() (ast.Expr, error) {
+	return p.parseBinaryLevel(p.parseComparison, lexer.Eq, lexer.Neq)
+}
+
+// parseComparison calls parseAdditive directly, skipping §6's shift/bitwise
+// levels (priorities 5-7) until Step 4 inserts them here.
+func (p *parser) parseComparison() (ast.Expr, error) {
+	return p.parseBinaryLevel(p.parseAdditive, lexer.Lt, lexer.Lte, lexer.Gt, lexer.Gte)
+}
+
+func (p *parser) parseAdditive() (ast.Expr, error) {
+	return p.parseBinaryLevel(p.parseMultiplicative, lexer.Plus, lexer.Minus)
+}
+
+func (p *parser) parseMultiplicative() (ast.Expr, error) {
+	return p.parseBinaryLevel(p.parseUnary, lexer.Star, lexer.Slash, lexer.Percent)
+}
+
+// parseUnary parses a prefix "!"/"-" (§6 priority 2). "*"/"&"/"~" join
+// once pointers (Step 8) and bitwise ops (Step 4) land.
+func (p *parser) parseUnary() (ast.Expr, error) {
+	if p.cur().Kind == lexer.Not || p.cur().Kind == lexer.Minus {
+		opTok := p.advance()
+		x, err := p.parseUnary()
+		if err != nil {
+			return nil, err
+		}
+		op := "!"
+		if opTok.Kind == lexer.Minus {
+			op = "-"
+		}
+		return &ast.UnaryExpr{Op: op, X: x, Line: opTok.Line}, nil
+	}
+	return p.parsePrimary()
+}
+
+// parsePrimary parses a literal, identifier, call, or parenthesized
+// expression (§6 priority 1's grouping form; ".", "[]", and postfix "?"
+// join in later steps).
+func (p *parser) parsePrimary() (ast.Expr, error) {
 	tok := p.cur()
 	switch tok.Kind {
+	case lexer.LParen:
+		p.advance()
+		x, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(lexer.RParen, "')'"); err != nil {
+			return nil, err
+		}
+		return x, nil
 	case lexer.String:
 		p.advance()
 		return &ast.StringLit{Value: tok.Literal, Line: tok.Line}, nil
@@ -321,6 +432,16 @@ func (p *parser) parseExpr() (ast.Expr, error) {
 	case lexer.KwNone:
 		p.advance()
 		return &ast.NoneLit{Line: tok.Line}, nil
+	case lexer.KwString, lexer.KwInt, lexer.KwFloat, lexer.KwBool:
+		// A type keyword can also name a builtin conversion call, e.g.
+		// string(x) (cascade_spec.md §13) — it's still a reserved
+		// keyword (not an Ident), so it needs its own case here rather
+		// than falling through to the Ident case below.
+		name := p.advance()
+		if p.cur().Kind == lexer.LParen {
+			return p.parseCallExprFrom(name)
+		}
+		return nil, fmt.Errorf("line %d: unexpected token %q", name.Line, name.Literal)
 	case lexer.Ident:
 		name := p.advance()
 		if p.cur().Kind == lexer.LParen {

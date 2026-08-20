@@ -104,3 +104,97 @@ func main(): int {
 		t.Fatalf("a non-nullable declaration must not get an _isset companion variable; got:\n%s", ir)
 	}
 }
+
+func TestGenerate_BinaryOperators(t *testing.T) {
+	tests := []struct {
+		name   string
+		src    string
+		wantIR string
+	}{
+		{"add", `let x = 1 + 2`, "\tADD\t"},
+		{"sub", `let x = 1 - 2`, "\tSUB\t"},
+		{"mul", `let x = 1 * 2`, "\tMUL\t"},
+		{"div", `let x = 1 / 2`, "\tDIV\t"},
+		{"mod", `let x = 1 % 2`, "\tMOD\t"},
+		{"string concat", `let x = "a" + "b"`, "\tCONCAT\t"},
+		{"eq", `let x = 1 == 2`, "\tEQ\t"},
+		{"neq", `let x = 1 != 2`, "\tNEQ\t"},
+		{"lt", `let x = 1 < 2`, "\tLT\t"},
+		{"lte", `let x = 1 <= 2`, "\tLTE\t"},
+		{"gt", `let x = 1 > 2`, "\tGT\t"},
+		{"gte", `let x = 1 >= 2`, "\tGTE\t"},
+		{"and", `let x = true && false`, "\tAND\t"},
+		{"or", `let x = true || false`, "\tOR\t"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ir := generate(t, "func main(): int {\n\t"+tt.src+"\n\treturn 0\n}\n")
+			if !strings.Contains(ir, tt.wantIR) {
+				t.Fatalf("expected IR to contain %q; got:\n%s", tt.wantIR, ir)
+			}
+		})
+	}
+}
+
+func TestGenerate_UnaryOperators(t *testing.T) {
+	// AMIVM-IR has no unary-minus instruction, so "-x" must be emitted as
+	// "SUB tmp 0 x" (seed_implementation_notes.md §5.6).
+	ir := generate(t, `
+func main(): int {
+	let x = 5
+	let y = -x
+	return 0
+}
+`)
+	if !strings.Contains(ir, "SUB\t%tmp_") || !strings.Contains(ir, "\t0\t%x_1") {
+		t.Fatalf("expected unary '-' to emit SUB tmp 0 x; got:\n%s", ir)
+	}
+
+	ir = generate(t, `
+func main(): int {
+	let x = true
+	let y = !x
+	return 0
+}
+`)
+	if !strings.Contains(ir, "\tNOT\t") {
+		t.Fatalf("expected unary '!' to emit NOT; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_PrecedenceMultiplicationBeforeAddition(t *testing.T) {
+	// "2 + 3 * 4" must compute the MUL into a temp before the ADD
+	// consumes it — i.e. MUL appears first in the emitted instruction
+	// order — which is exactly what §6's precedence table requires.
+	ir := generate(t, `
+func main(): int {
+	let x = 2 + 3 * 4
+	return 0
+}
+`)
+	mulIdx := strings.Index(ir, "\tMUL\t")
+	addIdx := strings.Index(ir, "\tADD\t")
+	if mulIdx == -1 || addIdx == -1 || mulIdx > addIdx {
+		t.Fatalf("expected MUL to be emitted before ADD (precedence); got:\n%s", ir)
+	}
+}
+
+func TestGenerate_StringConversion(t *testing.T) {
+	tests := []struct {
+		name     string
+		src      string
+		wantCall string
+	}{
+		{"int", `print(string(1))`, "?strconv.Itoa"},
+		{"float", `print(string(1.5))`, "?strconv.FormatFloat"},
+		{"bool", `print(string(true))`, "?strconv.FormatBool"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ir := generate(t, "func main(): int {\n\t"+tt.src+"\n\treturn 0\n}\n")
+			if !strings.Contains(ir, tt.wantCall) {
+				t.Fatalf("expected IR to call %s; got:\n%s", tt.wantCall, ir)
+			}
+		})
+	}
+}

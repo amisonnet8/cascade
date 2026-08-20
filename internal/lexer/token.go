@@ -61,11 +61,26 @@ const (
 	Comma
 	Question
 
-	// operators (cascade_spec.md §6). Only "=" is lexed so far, for plain
-	// assignment (§5) and `let`/`const` initializers (§4.2) — the rest of
-	// §6's operator set lands in Step 3 (arithmetic/comparison/logical)
-	// and Step 4 (bitwise/shift).
+	// operators (cascade_spec.md §6). "=" (Step 2) plus the arithmetic,
+	// comparison, and logical set below (Step 3). Bitwise/shift/unary-
+	// pointer/postfix-"?"/pipe operators are lexed starting in the steps
+	// that introduce them (see lexer.go's package doc) — in particular a
+	// lone "&" or "|" isn't lexed yet, only their doubled "&&"/"||" forms.
 	Assign
+	Plus
+	Minus
+	Star
+	Slash
+	Percent
+	Eq
+	Neq
+	Lt
+	Lte
+	Gt
+	Gte
+	AndAnd
+	OrOr
+	Not
 )
 
 // keywords holds Cascade's full reserved-word set (cascade_spec.md §14).

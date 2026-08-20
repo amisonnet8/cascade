@@ -2,14 +2,15 @@
 // cascade_spec.md §1: newlines are significant statement terminators, and
 // "//" starts a line comment.
 //
-// Only the punctuation Steps 1-2 need is lexed as an operator so far —
-// "(", ")", "{", "}", ":", ",", "?" (nullable-type suffix, §2.3), and "="
-// (plain assignment, §5) — since cascade_spec.md §6's full operator set
-// belongs to Step 3 (arithmetic/comparison/logical) and Step 4
-// (bitwise/shift). The full keyword set (§14) is already reserved from the
-// start (see token.go), since adding a keyword later is free but an
-// identifier silently becoming a keyword out from under existing code is
-// not.
+// Only the punctuation/operators Steps 1-3 need are lexed so far — "(",
+// ")", "{", "}", ":", ",", "?" (nullable-type suffix, §2.3), "=" (plain
+// assignment, §5), and §6's arithmetic/comparison/logical operators ("+"
+// "-" "*" "/" "%" "==" "!=" "<" "<=" ">" ">=" "&&" "||" "!"). Bitwise/shift
+// (Step 4), unary "*"/"&"/"~" (Steps 4/8), postfix "?" (Step 11), and "|>"
+// (Step 12) are lexed starting in the steps that introduce them. The full
+// keyword set (§14) is already reserved from the start (see token.go),
+// since adding a keyword later is free but an identifier silently
+// becoming a keyword out from under existing code is not.
 package lexer
 
 import (
@@ -195,10 +196,21 @@ func (l *Lexer) lexString(line int) (Token, error) {
 	}
 }
 
-// lexOperator scans one punctuation token. See the package doc for which
-// tokens from cascade_spec.md §6 are recognized so far.
+// lexOperator scans one punctuation/operator token. See the package doc
+// for which tokens from cascade_spec.md §6 are recognized so far.
 func (l *Lexer) lexOperator(line int) (Token, error) {
 	r := l.advanceRune()
+
+	// two matches a possible second rune to distinguish a two-character
+	// operator (e.g. "==") from its one-character prefix (e.g. "=").
+	two := func(next rune, twoKind, oneKind Kind) Token {
+		if l.peekRune() == next {
+			l.pos++
+			return Token{Kind: twoKind, Literal: string(r) + string(next), Line: line}
+		}
+		return Token{Kind: oneKind, Literal: string(r), Line: line}
+	}
+
 	switch r {
 	case '(':
 		return Token{Kind: LParen, Literal: "(", Line: line}, nil
@@ -214,8 +226,36 @@ func (l *Lexer) lexOperator(line int) (Token, error) {
 		return Token{Kind: Comma, Literal: ",", Line: line}, nil
 	case '?':
 		return Token{Kind: Question, Literal: "?", Line: line}, nil
+	case '+':
+		return Token{Kind: Plus, Literal: "+", Line: line}, nil
+	case '-':
+		return Token{Kind: Minus, Literal: "-", Line: line}, nil
+	case '*':
+		return Token{Kind: Star, Literal: "*", Line: line}, nil
+	case '/':
+		return Token{Kind: Slash, Literal: "/", Line: line}, nil
+	case '%':
+		return Token{Kind: Percent, Literal: "%", Line: line}, nil
 	case '=':
-		return Token{Kind: Assign, Literal: "=", Line: line}, nil
+		return two('=', Eq, Assign), nil
+	case '!':
+		return two('=', Neq, Not), nil
+	case '<':
+		return two('=', Lte, Lt), nil
+	case '>':
+		return two('=', Gte, Gt), nil
+	case '&':
+		if l.peekRune() == '&' {
+			l.pos++
+			return Token{Kind: AndAnd, Literal: "&&", Line: line}, nil
+		}
+		// a lone '&' (bitwise AND / address-of) isn't lexed until Step 4/8
+	case '|':
+		if l.peekRune() == '|' {
+			l.pos++
+			return Token{Kind: OrOr, Literal: "||", Line: line}, nil
+		}
+		// a lone '|' (bitwise OR) isn't lexed until Step 4
 	}
 	return Token{}, fmt.Errorf("line %d: unexpected character %q", line, r)
 }

@@ -41,6 +41,144 @@ func main(): int {
 	}
 }
 
+func TestCheck_ValidOperators(t *testing.T) {
+	src := `
+func main(): int {
+	let sum = 2 + 3 * 4
+	let grouped = (2 + 3) * 4
+	let ratio = 7 / 2
+	let remainder = 7 % 2
+	let negated = -sum
+
+	let isBig = sum > 5
+	let isEqual = sum == 14
+	let combined = isBig && !isEqual || isEqual
+
+	let greeting = "Hello, " + "Cascade" + "!"
+	print(greeting)
+	print(string(sum) + string(grouped) + string(ratio) + string(remainder) + string(negated))
+	print(string(combined))
+
+	return 0
+}
+`
+	if err := check(t, src); err != nil {
+		t.Fatalf("Check() = %v, want nil", err)
+	}
+}
+
+func TestCheck_OperatorErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		src     string
+		wantErr string
+	}{
+		{
+			name: "mismatched operand types",
+			src: `
+func main(): int {
+	let x = 1 + 1.0
+	return 0
+}
+`,
+			wantErr: "mismatched operand types int and float",
+		},
+		{
+			name: "modulo requires int",
+			src: `
+func main(): int {
+	let x = 1.0 % 2.0
+	return 0
+}
+`,
+			wantErr: "operator % requires int operands",
+		},
+		{
+			name: "logical and requires bool",
+			src: `
+func main(): int {
+	let x = 1 && 2
+	return 0
+}
+`,
+			wantErr: "operator \"&&\" requires bool operands",
+		},
+		{
+			name: "comparison rejects bool",
+			src: `
+func main(): int {
+	let x = true < false
+	return 0
+}
+`,
+			wantErr: "operator \"<\" requires int, float, or string operands",
+		},
+		{
+			name: "unary minus requires numeric operand",
+			src: `
+func main(): int {
+	let x = -"oops"
+	return 0
+}
+`,
+			wantErr: "unary - requires int or float",
+		},
+		{
+			name: "unary not requires bool operand",
+			src: `
+func main(): int {
+	let x = !1
+	return 0
+}
+`,
+			wantErr: "unary ! requires bool",
+		},
+		{
+			name: "binary operator rejects a nullable operand",
+			src: `
+func main(): int {
+	let x: int? = 1
+	let y = x + 1
+	return 0
+}
+`,
+			wantErr: "needs non-nullable operands",
+		},
+		{
+			name: "string() rejects a string argument",
+			src: `
+func main(): int {
+	let x = string("already a string")
+	return 0
+}
+`,
+			wantErr: "string() does not support string",
+		},
+		{
+			name: "+ does not support bool",
+			src: `
+func main(): int {
+	let x = true + false
+	return 0
+}
+`,
+			wantErr: "operator + does not support bool",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := check(t, tt.src)
+			if err == nil {
+				t.Fatalf("Check() = nil, want error containing %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Check() = %q, want error containing %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestCheck_Errors(t *testing.T) {
 	tests := []struct {
 		name    string

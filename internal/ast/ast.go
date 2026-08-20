@@ -142,13 +142,51 @@ type NoneLit struct {
 func (*NoneLit) exprNode() {}
 
 // CallExpr is a function call, e.g. print("hello").
+//
+// ArgType is filled in by sema.Check only for the overloaded builtin
+// string() (cascade_spec.md §13), which accepts several argument types
+// and needs different AMIVM-IR per one. It holds Args[0]'s resolved type,
+// so codegen can pick the right instruction without re-deriving a type on
+// its own (mirroring BinaryExpr/UnaryExpr's ResultType — the same pattern
+// Seed's identical CallExpr.ArgType uses). It's the zero Type for every
+// other call.
 type CallExpr struct {
-	Callee string
-	Args   []Expr
-	Line   int
+	Callee  string
+	Args    []Expr
+	Line    int
+	ArgType Type
 }
 
 func (*CallExpr) exprNode() {}
+
+// UnaryExpr is a prefix unary operator (cascade_spec.md §6): "!" or "-" so
+// far — "*"/"&"/"~" are added once pointers (Step 8) and bitwise ops
+// (Step 4) land. ResultType is filled in by sema.Check; codegen relies on
+// it to pick the right AMIVM-IR type for the temporary holding the result
+// (the same ast-annotation pattern LetDecl.ResolvedType uses).
+type UnaryExpr struct {
+	Op         string
+	X          Expr
+	Line       int
+	ResultType Type
+}
+
+func (*UnaryExpr) exprNode() {}
+
+// BinaryExpr is a binary operator expression (cascade_spec.md §6): the
+// arithmetic ("+" "-" "*" "/" "%"), comparison ("==" "!=" "<" "<=" ">"
+// ">="), and logical ("&&" "||") operators so far — bitwise/shift land in
+// Step 4. ResultType is filled in by sema.Check; codegen relies on it both
+// to pick the right AMIVM-IR type for the temporary holding the result,
+// and to disambiguate "+" (ADD for int/float, CONCAT for string).
+type BinaryExpr struct {
+	Op         string
+	X, Y       Expr
+	Line       int
+	ResultType Type
+}
+
+func (*BinaryExpr) exprNode() {}
 
 // StmtLine returns the source line a statement node was parsed from.
 func StmtLine(s Stmt) int {
@@ -182,6 +220,10 @@ func ExprLine(e Expr) int {
 	case *NoneLit:
 		return v.Line
 	case *CallExpr:
+		return v.Line
+	case *UnaryExpr:
+		return v.Line
+	case *BinaryExpr:
 		return v.Line
 	default:
 		return 0

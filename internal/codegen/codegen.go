@@ -19,10 +19,11 @@
 // declaration site later. See scope.go's varRef for how a nullable `T?`
 // variable's companion "is this set?" flag is represented.
 //
-// Only enough is implemented so far to compile Steps 1-2: a single `main`
+// Only enough is implemented so far to compile Steps 1-3: a single `main`
 // function whose body is `let`/`const` declarations, scalar assignment, a
-// `print(...)` call, and `return`. Later steps extend genStmt/genValue one
-// feature at a time, the same way parser's grammar grows.
+// `print(...)` call, `return`, and arithmetic/comparison/logical operator
+// expressions (cascade_spec.md §6). Later steps extend genStmt/genValue
+// one feature at a time, the same way parser's grammar grows.
 package codegen
 
 import (
@@ -101,6 +102,15 @@ func (g *funcGen) emit(format string, args ...any) {
 // declareVar records a hoisted VAR for op.
 func (g *funcGen) declareVar(op, irType string) {
 	g.decls = append(g.decls, varDecl{Op: op, IRType: irType})
+}
+
+// newTemp declares a fresh hoisted variable of the given AMIVM-IR type to
+// hold an intermediate result (e.g. one operator's worth of a larger
+// expression) and returns its operand.
+func (g *funcGen) newTemp(irType string) string {
+	op := "%" + g.freshName("tmp")
+	g.declareVar(op, irType)
+	return op
 }
 
 // freshName mints an internal variable name for a `let`/`const` declared
@@ -257,9 +267,129 @@ func genValue(g *funcGen, e ast.Expr) (string, error) {
 			return "", fmt.Errorf("codegen: undefined name %q (sema bug)", v.Name)
 		}
 		return ref.ValOp, nil
+	case *ast.UnaryExpr:
+		return genUnary(g, v)
+	case *ast.BinaryExpr:
+		return genBinary(g, v)
+	case *ast.CallExpr:
+		return genCallValue(g, v)
 	default:
 		return "", fmt.Errorf("codegen: unsupported value expression %T", e)
 	}
+}
+
+// genCallValue compiles a call expression used as a value. Only the
+// `string()` builtin conversion (cascade_spec.md §13) is wired up so far
+// — see genExprStmt for calls used as a bare statement (print).
+func genCallValue(g *funcGen, call *ast.CallExpr) (string, error) {
+	switch call.Callee {
+	case "string":
+		return genStringConversion(g, call)
+	default:
+		return "", fmt.Errorf("codegen: unsupported call to %q as a value", call.Callee)
+	}
+}
+
+// genStringConversion compiles string(x) using call.ArgType (filled in by
+// sema.Check) to pick the right strconv function. Go's own string(v)
+// conversion is a rune conversion for numeric types — string(65) is "A",
+// not "65" — so strconv is required here, not a plain CALL-as-cast
+// (seed_implementation_notes.md §3).
+func genStringConversion(g *funcGen, call *ast.CallExpr) (string, error) {
+	x, err := genValue(g, call.Args[0])
+	if err != nil {
+		return "", err
+	}
+	tmp := g.newTemp("^string")
+	switch call.ArgType.Name {
+	case "int":
+		g.emit("\tCALL\t%s\t:\t?strconv.Itoa\t%s\n", tmp, x)
+	case "float":
+		g.emit("\tCALL\t%s\t:\t?strconv.FormatFloat\t%s\t'g'\t-1\t64\n", tmp, x)
+	case "bool":
+		g.emit("\tCALL\t%s\t:\t?strconv.FormatBool\t%s\n", tmp, x)
+	default:
+		return "", fmt.Errorf("codegen: string() does not support %s (sema bug)", call.ArgType.Name)
+	}
+	return tmp, nil
+}
+
+// genUnary compiles a unary "!"/"-" expression (cascade_spec.md §6) into a
+// fresh temp of ResultType (filled in by sema.Check). AMIVM-IR has no
+// unary-minus instruction, so "-x" is emitted as "SUB tmp 0 x"
+// (seed_implementation_notes.md §5.6's exact pattern for the same gap).
+func genUnary(g *funcGen, e *ast.UnaryExpr) (string, error) {
+	x, err := genValue(g, e.X)
+	if err != nil {
+		return "", err
+	}
+	irType, err := scalarTypeToIR(e.ResultType)
+	if err != nil {
+		return "", err
+	}
+	tmp := g.newTemp(irType)
+	switch e.Op {
+	case "!":
+		g.emit("\tNOT\t%s\t%s\n", tmp, x)
+	case "-":
+		g.emit("\tSUB\t%s\t0\t%s\n", tmp, x)
+	default:
+		return "", fmt.Errorf("codegen: unsupported unary operator %q", e.Op)
+	}
+	return tmp, nil
+}
+
+// binaryOpInstr maps every ast.BinaryExpr.Op except "+" (see genBinary) to
+// its AMIVM-IR instruction (cascade_spec.md §6, amivm_spec.md §4.3/4.6/4.7).
+var binaryOpInstr = map[string]string{
+	"-":  "SUB",
+	"*":  "MUL",
+	"/":  "DIV",
+	"%":  "MOD",
+	"==": "EQ",
+	"!=": "NEQ",
+	"<":  "LT",
+	"<=": "LTE",
+	">":  "GT",
+	">=": "GTE",
+	"&&": "AND",
+	"||": "OR",
+}
+
+// genBinary compiles a binary expression (cascade_spec.md §6) into a fresh
+// temp of ResultType (filled in by sema.Check). "+" is special-cased: its
+// AMIVM-IR instruction depends on the (shared, sema-checked) operand type
+// — ADD for int/float, CONCAT for string — the same dispatch Seed's
+// codegen uses (seed/CLAUDE.md "確定した設計判断").
+func genBinary(g *funcGen, e *ast.BinaryExpr) (string, error) {
+	x, err := genValue(g, e.X)
+	if err != nil {
+		return "", err
+	}
+	y, err := genValue(g, e.Y)
+	if err != nil {
+		return "", err
+	}
+	irType, err := scalarTypeToIR(e.ResultType)
+	if err != nil {
+		return "", err
+	}
+	tmp := g.newTemp(irType)
+
+	if e.Op == "+" {
+		if e.ResultType.Name == "string" {
+			g.emit("\tCONCAT\t%s\t%s\t%s\n", tmp, x, y)
+		} else {
+			g.emit("\tADD\t%s\t%s\t%s\n", tmp, x, y)
+		}
+		return tmp, nil
+	}
+	instr, ok := binaryOpInstr[e.Op]
+	if !ok {
+		return "", fmt.Errorf("codegen: unsupported binary operator %q", e.Op)
+	}
+	g.emit("\t%s\t%s\t%s\t%s\n", instr, tmp, x, y)
+	return tmp, nil
 }
 
 // scalarTypeToIR maps a Cascade scalar type to its AMIVM-IR type token.
