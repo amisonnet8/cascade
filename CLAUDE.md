@@ -139,15 +139,11 @@ amivm <IRファイルパス> [-o|--output <出力ファイルパス>] [-v|--verb
 
 Seedと異なりCascadeは複数ファイル/パッケージ・null許容型・並行パイプラインという、Seedに無かった複雑さを持つ。以下は現時点で未確定の、最初に潰すべき設計課題。**[[Seed]]の「確定した設計判断」節(`seed/CLAUDE.md`)に倣い、決まったらここに確定内容として書き残すこと。仮説のまま放置しない。**
 
-### 1. null許容型(`T?`)の実装方式
-
-Seedは「値+`_isset`」ペアを全変数に持たせたが、Cascadeは`?`の無い型は`none`を取れないため、**`T?`が付いた変数だけ**が値+成否フラグのペアになる想定(2.3節)。`MGET`/`CHRECV`のcomma-ok形をそのまま`T?`の2オペランドへ書き込めないか(seed_implementation_notes.md §3)が有力候補。7節の型絞り込み(narrowing)はsemaがAST上でのみ扱い(絞り込み後の型をアノテーションする)、codegen側では追加のIR命令を必要としない見込み。
-
-### 2. レシーバー付き関数(8.2節)のコンパイル方針
+### 1. レシーバー付き関数(8.2節)のコンパイル方針
 
 Cascadeの構造体はGoの`struct`に素直に対応するが、レシーバー関数(`func (p: Point) magnitude(): float`)をGoのメソッドとして生成する必要は無いはず。**候補**: レシーバーを第一引数とする普通の`FUNC`(`!Point_magnitude`のような命名)として生成し、`obj.method(args)`という呼び出し構文を単なる`CALL !Point_magnitude obj args...`に脱糖する。`FNTYPE`+`FGET`(test_ir `16_method_call.ir`)によるメソッド値の動的取得は、`*os.File`のような**外部Goパッケージの型のメソッド**を呼ぶときにのみ必要になる想定(Cascade組み込み関数のGoランタイム実装で使う可能性はある)。値レシーバー/ポインタレシーバー間の自動アドレス取得・デリファレンス(8.2節)はsema/codegenが担う。
 
-### 3. パイプライン(9節)の並行実行モデル
+### 2. パイプライン(9節)の並行実行モデル
 
 最も設計コストが高い箇所。`amivm/test_ir/11_spawn_channel_sel.ir`を実装前に必ず読むこと。
 
@@ -161,11 +157,11 @@ Cascadeの構造体はGoの`struct`に素直に対応するが、レシーバー
 
 いずれも**実装したら`amivm`→`go build`→実行まで必ず確認する**(seed_implementation_notes.md §6.1の教訓)。並行処理はロジック上正しく見えても実地検証なしでは信用しない。
 
-### 4. `error`型(8.6節)の表現
+### 3. `error`型(8.6節)の表現
 
 `err.message`のようなフィールドアクセスが必要なため、Goの組み込み`error`インターフェースにマッピングするより、**`^error`という名前で`message: string`を1フィールド持つ`STTYPE`をCascadeコンパイラが自動定義する**案が有力(2.2節の説明「実体は`message: string`を1つ持つ構造体的な値」とも整合する)。後置`?`演算子(8.6節)はsemaが「戻り値の末尾が`error?`である呼び出し」を検出し、`IF`+`RET`による早期returnへ機械的に展開する(Seedのビルトイン脱糖と同じ発想)。
 
-### 5. パッケージ/モジュール解決(11節)
+### 4. パッケージ/モジュール解決(11節)
 
 Seedには存在しなかった、Cascade固有の追加コンパイル工程。`import`文の解決・循環import検出(11.5節)・パッケージ内の複数ファイル統合(11.1節)は、字句解析・構文解析より**前**、あるいはAST構築後・sema前の独立したフェーズ(パッケージローダー)として実装する必要がある。AMIVM-IRへ落とす際の識別子一意化(`パッケージ名_識別子`、11.6節)はcodegenの命名規則に組み込む。
 
@@ -188,6 +184,16 @@ Seedには存在しなかった、Cascade固有の追加コンパイル工程。
 ### `main`のコンパイル方針(Step 1で確定)
 
 Cascadeの`func main(): int`をamivmの`!main`へ直接対応させることはできない。Goの`func main()`は引数無し・戻り値無しを要求するが、Cascadeのエントリポイントは`int`を返す(12節)ため、そのまま`FUNC !main : ^int`として生成すると`go build`が`func main must have no arguments and no return values`で失敗する。**[[Seed]]の`main`/`seed_main`分離と全く同じ解決策を採る**: ユーザーの`main`は内部名`cascade_main`(`internal/sema`と`internal/codegen`の両方に同名の定数として定義。名前が一致している前提でコードが動くため、変更時は両方揃えて直すこと)としてコンパイルし、実際の`!main`は`cascade_main`を呼んで戻り値を`os.Exit()`に渡す薄いラッパーとして生成する。ユーザーが関数名として`cascade_main`を使うことはsemaがエラーにする(Seedの`seed_main`予約と同じ)。
+
+### `T?`の実装方式(Step 2で確定)
+
+想定通り、Seedの「値+`_isset`」ペアを**`T?`が付いた変数だけ**に適用する形で確定した(`?`の無い型はそもそも`none`を取れないため、フラグ自体を持たない)。
+
+- `internal/codegen/scope.go`の`varRef`が`ValOp`(値。常に存在)と`SetOp`(成否フラグ。`Type.Nullable`のときだけ存在。空文字列なら「フラグ無し」)を持つ
+- 通常の読み取り(`genValue`の`Ident`ケース)は`SetOp`を一切見ず`ValOp`をそのまま返す。GoのゼロValueがCascadeのベース値と全スカラー型で一致するため、これで常に正しい(Seedの`_isset`と同じ性質)
+- `none`の代入・初期化省略は「値をゼロ値にSET」+「フラグを`false`にSET」の2命令、それ以外の値の代入は「値をSET」+「フラグを`true`にSET」の2命令(`genInit`/`genResetToZero`)
+- `MGET`/`CHRECV`のcomma-ok形を直接使う案(seed_implementation_notes.md §3)は今回のスカラー変数では不要だった(単純な`SET`2命令で十分)。map(Step10)・チャネル(Step12)の`V?`/`T?`はcomma-ok形が自然に使える可能性が高く、そちらで改めて検証する
+- **`is none`/`is not none`(7節)の構文自体はStep 2では実装していない**。spec上この構文は`if`の条件式としてしか使用例が無く(7節)、絞り込み(narrowing)も`if`の分岐構造に依存するため、`if`が無い状態で先取り実装すると仕様に無い用法(独立したbool式としての使用)を勝手に決めてしまうリスクがあった。Step 5(制御構文)で`if`と同時に実装し、絞り込みはsemaがAST上でのみ扱う(絞り込み後の型をアノテーションする、codegen側は追加のIR命令不要)という方針は維持する
 
 ## 意味検証の責任分担(重要)
 
@@ -248,19 +254,19 @@ Seedは7〜8ステップ(git履歴上は「Step1: hello-worldパイプライン�
 | # | ステップ | 主な内容 | 実証する命令 | 解決するオープン課題 |
 |---|---|---|---|---|
 | 1 ✅ | ブートストラップ | lexer/parser/ast/codegen最小構成。`func main(): int { print("Hello, Cascade!") return 0 }`をamivm→go build→実行まで通す | `FUNC` `RET` `ENDFUNC` `CALL`(`print`) | `main`/`cascade_main`ブリッジ方針を新規に確定(上記「確定した設計判断」参照) |
-| 2 | 変数・スカラー型・null許容型 | `let`/`const`、`int`/`float`/`string`/`bool`、`T?`の値+成否フラグペア、`is none`/`is not none`(絞り込みは最小限) | `VAR` `GVAR` `SET` | 課題1(`T?`の実装方式)の一次決定 |
+| 2 ✅ | 変数・スカラー型・null許容型 | `let`/`const`、`int`/`float`/`string`/`bool`、`T?`の値+成否フラグペア(`is none`/`is not none`自体は`if`が無いと使い道が無いためStep5に先送り) | `VAR` `SET` | `T?`の実装方式を確定(下記「確定した設計判断」参照) |
 | 3 | 演算子(算術・比較・論理・文字列) | `+ - * / %`、`== != < <= > >=`、`&& \|\| !`、`string`連結、優先順位表(6節)の実地検証 | `ADD` `SUB` `MUL` `DIV` `MOD` `EQ` `NEQ` `LT` `LTE` `GT` `GTE` `AND` `OR` `NOT` `CONCAT` | — |
 | 4 | ビット演算・シフト演算 | `&` `\|` `^` `&^` `~`、`<<` `>>`(int専用、semaで型制約を検査) | `BAND` `BOR` `BXOR` `BCLEAR` `BNOT` `SHL` `SHR` | — |
 | 5 | 制御構文 | `if/elif/else`、`while`、`for-in`(range限定の単純ケース)、`switch`(タグ付き/タグなし)、`break/continue` | `LABEL` `GOTO` `IF` | goto/VAR巻き上げ問題(seed_implementation_notes.md §1)の再検証 |
 | 6 | リスト(`[]T`) | リテラル・`append`・添字読み書き・`for x in xs`・`range`/`len`組み込み | `SLTYPE` `SLMAKE` `ASET` `AGET`(`SLICE`の使い所も探る) | — |
 | 7 | 関数(通常関数・複数戻り値) | `func`定義、複数戻り値(8.1/8.5節)、`divmod`的サンプル | `FUNC` `RET` `CALL`の本格利用 | — |
-| 8 | 構造体・ポインタ・レシーバー関数 | `struct`定義・フィールドアクセス、`&x`/`*p`、値/ポインタレシーバーの自動変換 | `STTYPE` `FIELD` `ENDSTTYPE` `FSET` `FGET` `ADDR` `PGET` `PSET` | 課題2(レシーバー関数のコンパイル方針)の確定 |
+| 8 | 構造体・ポインタ・レシーバー関数 | `struct`定義・フィールドアクセス、`&x`/`*p`、値/ポインタレシーバーの自動変換 | `STTYPE` `FIELD` `ENDSTTYPE` `FSET` `FGET` `ADDR` `PGET` `PSET` | 課題1(レシーバー関数のコンパイル方針)の確定 |
 | 9 | クロージャー・高階関数 | クロージャーリテラル(8.3節)、`filter`/`map`/`reduce`(8.4節)、参照捕捉の実地検証 | `FNTYPE` `CLOS` `ENDCLOS` | — |
 | 10 | map(`map<K, V>`) | リテラル・`m[k]`(`V?`化)・`m[k]=v`・`delete` | `MPTYPE` `MPMAKE` `MSET` `MGET` | — |
-| 11 | エラー処理 | `error`型・`(T, error?)`規約・後置`?`のsema展開(8.6節) | (新規命令なし。`STTYPE`+`IF`+`RET`の組み合わせ) | 課題4(`error`型の表現)の確定 |
-| 12 | パイプライン基礎 | `source`/`stage`/`sink`、`chan<T>`、`send`、`for v in channel`、`\|>`連結(9.1/9.2節) | `CHTYPE` `CHMAKE` `CHSEND` `CHRECV` `SPAWN` | 課題3(並行実行モデル)の一次決定。`amivm/test_ir/11_spawn_channel_sel.ir`必読 |
-| 13 | パイプライン拡張(collect/abort/merge) | `collect`(9.3節)・`abort`(9.4節)・`merge`(9.5節) | `SEL` `CASESEND` `CASERECV` `DEFAULT` `ENDSEL` `DEFER` | 課題3の最終確定 |
-| 14 | パッケージ/複数ファイル | ディレクトリ=パッケージの統合(11.1節)、`import`/`pub`(11.2/11.3節)、循環import検出(11.5節)、識別子一意化(11.6節) | (新規命令なし。codegenの命名規則) | 課題5(パッケージ/モジュール解決)の確定 |
+| 11 | エラー処理 | `error`型・`(T, error?)`規約・後置`?`のsema展開(8.6節) | (新規命令なし。`STTYPE`+`IF`+`RET`の組み合わせ) | 課題3(`error`型の表現)の確定 |
+| 12 | パイプライン基礎 | `source`/`stage`/`sink`、`chan<T>`、`send`、`for v in channel`、`\|>`連結(9.1/9.2節) | `CHTYPE` `CHMAKE` `CHSEND` `CHRECV` `SPAWN` | 課題2(並行実行モデル)の一次決定。`amivm/test_ir/11_spawn_channel_sel.ir`必読 |
+| 13 | パイプライン拡張(collect/abort/merge) | `collect`(9.3節)・`abort`(9.4節)・`merge`(9.5節) | `SEL` `CASESEND` `CASERECV` `DEFAULT` `ENDSEL` `DEFER` | 課題2の最終確定 |
+| 14 | パッケージ/複数ファイル | ディレクトリ=パッケージの統合(11.1節)、`import`/`pub`(11.2/11.3節)、循環import検出(11.5節)、識別子一意化(11.6節) | (新規命令なし。codegenの命名規則) | 課題4(パッケージ/モジュール解決)の確定 |
 | 15 | CLI・配布 | `cascade build/run/emit-ir/emit-go/help`、`cascadert`の`go:embed`配布、README作成 | — | — |
 
 特にStep4(ビット演算)・Step8(ポインタ・構造体)・Step9(クロージャー)・Step10(map)・Step12/13(チャネル・SPAWN・SEL)はSeedで未実証だった命令なので、「ロジック上正しそうに見える」だけで次のステップへ進まないこと。上記「オープンな設計課題」の5項目は、対応するステップ着手時に方針を確定し、その節を書き換える(仮説のまま放置しない)。

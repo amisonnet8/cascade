@@ -8,6 +8,7 @@ const (
 	Newline
 	Ident
 	Int
+	Float
 	String
 
 	// structural keywords (cascade_spec.md §14). Not every keyword has a
@@ -58,6 +59,13 @@ const (
 	RBrace
 	Colon
 	Comma
+	Question
+
+	// operators (cascade_spec.md §6). Only "=" is lexed so far, for plain
+	// assignment (§5) and `let`/`const` initializers (§4.2) — the rest of
+	// §6's operator set lands in Step 3 (arithmetic/comparison/logical)
+	// and Step 4 (bitwise/shift).
+	Assign
 )
 
 // keywords holds Cascade's full reserved-word set (cascade_spec.md §14).

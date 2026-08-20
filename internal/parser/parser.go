@@ -5,12 +5,16 @@
 // The grammar implemented here is intentionally a small subset of
 // cascade_spec.md: a top-level func declaration with a scalar parameter
 // list and an optional single scalar return type, a block of statements
-// limited to a call-expression statement and return, and expressions
-// limited to string/int literals, identifiers, and calls — just enough for
-// Step 1 (bootstrap). Later development steps extend this grammar one
-// feature at a time; expressions in particular grow into a full
-// operator-precedence (Pratt) parser once Step 3 lands (cascade_spec.md
-// §6's precedence table).
+// limited to `let`/`const` declarations, a call-expression statement,
+// scalar assignment, and return, and expressions limited to literals
+// (including nullable-type `T?` declarations and the `none` literal),
+// identifiers, and calls — enough for Steps 1-2 (bootstrap; variables,
+// scalar types, and null semantics). Later development steps extend this
+// grammar one feature at a time; expressions in particular grow into a
+// full operator-precedence (Pratt) parser once Step 3 lands (cascade_spec.md
+// §6's precedence table), and `is none`/`is not none` (§7) is parsed
+// starting in Step 5, the only place the spec actually uses it (as an
+// `if` condition).
 package parser
 
 import (
@@ -155,16 +159,21 @@ func (p *parser) parseParam() (ast.Param, error) {
 	return ast.Param{Type: typ, Name: name.Literal}, nil
 }
 
-// parseType parses a scalar type name (cascade_spec.md §2.1). The nullable
-// suffix (§2.3) and every non-scalar type form are parsed starting in the
-// step that introduces them.
+// parseType parses a scalar type name with an optional nullable suffix
+// (cascade_spec.md §2.1, §2.3: `int`, `int?`, ...). Every non-scalar type
+// form is parsed starting in the step that introduces it.
 func (p *parser) parseType() (ast.Type, error) {
 	name, ok := typeKeywords[p.cur().Kind]
 	if !ok {
 		return ast.Type{}, fmt.Errorf("line %d: expected a type, got %q", p.cur().Line, p.cur().Literal)
 	}
 	p.advance()
-	return ast.Type{Name: name}, nil
+	t := ast.Type{Name: name}
+	if p.cur().Kind == lexer.Question {
+		p.advance()
+		t.Nullable = true
+	}
+	return t, nil
 }
 
 func (p *parser) parseBlock() ([]ast.Stmt, error) {
@@ -192,6 +201,8 @@ func (p *parser) parseStmt() (ast.Stmt, error) {
 	switch p.cur().Kind {
 	case lexer.KwReturn:
 		return p.parseReturnStmt()
+	case lexer.KwLet, lexer.KwConst:
+		return p.parseLetDecl()
 	case lexer.Ident:
 		return p.parseIdentStmt()
 	default:
@@ -199,19 +210,63 @@ func (p *parser) parseStmt() (ast.Stmt, error) {
 	}
 }
 
-// parseIdentStmt parses a statement starting with an identifier. Only a
-// call expression (`f(...)`) is valid here so far; assignment lands in
-// Step 2.
-func (p *parser) parseIdentStmt() (ast.Stmt, error) {
-	name := p.advance() // Ident
-	if p.cur().Kind != lexer.LParen {
-		return nil, fmt.Errorf("line %d: expected '(' after %q", p.cur().Line, name.Literal)
-	}
-	call, err := p.parseCallExprFrom(name)
+// parseLetDecl parses a `let`/`const` declaration (cascade_spec.md §4.2):
+// `let name: Type`, `let name: Type = Init`, `let name = Init`, or the
+// `const` form (sema enforces that Init is required and no later
+// assignment is allowed — see internal/sema).
+func (p *parser) parseLetDecl() (ast.Stmt, error) {
+	kw := p.advance() // 'let' or 'const'
+	decl := &ast.LetDecl{Const: kw.Kind == lexer.KwConst, Line: kw.Line}
+
+	name, err := p.expect(lexer.Ident, "variable name")
 	if err != nil {
 		return nil, err
 	}
-	return &ast.ExprStmt{X: call, Line: call.Line}, nil
+	decl.Name = name.Literal
+
+	if p.cur().Kind == lexer.Colon {
+		p.advance()
+		typ, err := p.parseType()
+		if err != nil {
+			return nil, err
+		}
+		decl.Type = typ
+	}
+
+	if p.cur().Kind == lexer.Assign {
+		p.advance()
+		init, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		decl.Init = init
+	}
+
+	return decl, nil
+}
+
+// parseIdentStmt parses a statement starting with an identifier: a call
+// expression (`f(...)`) or a scalar assignment (`name = value`,
+// cascade_spec.md §5).
+func (p *parser) parseIdentStmt() (ast.Stmt, error) {
+	name := p.advance() // Ident
+	switch p.cur().Kind {
+	case lexer.LParen:
+		call, err := p.parseCallExprFrom(name)
+		if err != nil {
+			return nil, err
+		}
+		return &ast.ExprStmt{X: call, Line: call.Line}, nil
+	case lexer.Assign:
+		p.advance()
+		val, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &ast.AssignStmt{Name: name.Literal, Value: val, Line: name.Line}, nil
+	default:
+		return nil, fmt.Errorf("line %d: expected '(' or '=' after %q", p.cur().Line, name.Literal)
+	}
 }
 
 func (p *parser) parseReturnStmt() (ast.Stmt, error) {
@@ -250,6 +305,22 @@ func (p *parser) parseExpr() (ast.Expr, error) {
 			return nil, fmt.Errorf("line %d: invalid integer literal %q", tok.Line, tok.Literal)
 		}
 		return &ast.IntLit{Value: v, Line: tok.Line}, nil
+	case lexer.Float:
+		p.advance()
+		v, err := strconv.ParseFloat(tok.Literal, 64)
+		if err != nil {
+			return nil, fmt.Errorf("line %d: invalid float literal %q", tok.Line, tok.Literal)
+		}
+		return &ast.FloatLit{Value: v, Line: tok.Line}, nil
+	case lexer.KwTrue:
+		p.advance()
+		return &ast.BoolLit{Value: true, Line: tok.Line}, nil
+	case lexer.KwFalse:
+		p.advance()
+		return &ast.BoolLit{Value: false, Line: tok.Line}, nil
+	case lexer.KwNone:
+		p.advance()
+		return &ast.NoneLit{Line: tok.Line}, nil
 	case lexer.Ident:
 		name := p.advance()
 		if p.cur().Kind == lexer.LParen {

@@ -1,0 +1,17 @@
+func main(): int {
+    let greeting: string = "Hello, Cascade!"
+    print(greeting)
+
+    let name: string? = "Cascade"
+    name = none
+
+    const version: string = "0.1.0"
+    print(version)
+
+    let count = 3
+    let pi: float = 3.14
+    let ready: bool = true
+    let empty: int?
+
+    return 0
+}

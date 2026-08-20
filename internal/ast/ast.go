@@ -57,6 +57,37 @@ type ReturnStmt struct {
 
 func (*ReturnStmt) stmtNode() {}
 
+// LetDecl is a `let`/`const` declaration (cascade_spec.md §4.2): `let name:
+// Type`, `let name: Type = Init`, `let name = Init` (Type is the zero Type
+// when omitted — inferred from Init), or the `const` form (Init required,
+// no reassignment; enforced by sema, not represented here).
+//
+// ResolvedType is filled in by sema.Check with Type itself (if given) or
+// the type inferred from Init (if not), so codegen never has to re-derive
+// it — the same ast-annotation pattern Seed's BinaryExpr.ResultType uses
+// (see seed_implementation_notes.md §7).
+type LetDecl struct {
+	Name         string
+	Type         Type
+	Const        bool
+	Init         Expr // nil when omitted
+	Line         int
+	ResolvedType Type
+}
+
+func (*LetDecl) stmtNode() {}
+
+// AssignStmt is a scalar assignment (cascade_spec.md §5): `name = Value`.
+// The struct-field/list-element/pointer-deref/map-element forms are added
+// once the steps that introduce those types land.
+type AssignStmt struct {
+	Name  string
+	Value Expr
+	Line  int
+}
+
+func (*AssignStmt) stmtNode() {}
+
 // Expr is implemented by every expression node.
 type Expr interface{ exprNode() }
 
@@ -84,6 +115,32 @@ type IntLit struct {
 
 func (*IntLit) exprNode() {}
 
+// FloatLit is a floating-point literal.
+type FloatLit struct {
+	Value float64
+	Line  int
+}
+
+func (*FloatLit) exprNode() {}
+
+// BoolLit is a `true`/`false` literal.
+type BoolLit struct {
+	Value bool
+	Line  int
+}
+
+func (*BoolLit) exprNode() {}
+
+// NoneLit is the `none` literal (cascade_spec.md §2.3). Its type is
+// whatever nullable type it's being assigned into — it has no type of its
+// own, so sema rejects it wherever that context is missing (e.g. `let x =
+// none` with no explicit `: T?`).
+type NoneLit struct {
+	Line int
+}
+
+func (*NoneLit) exprNode() {}
+
 // CallExpr is a function call, e.g. print("hello").
 type CallExpr struct {
 	Callee string
@@ -92,3 +149,41 @@ type CallExpr struct {
 }
 
 func (*CallExpr) exprNode() {}
+
+// StmtLine returns the source line a statement node was parsed from.
+func StmtLine(s Stmt) int {
+	switch v := s.(type) {
+	case *ExprStmt:
+		return v.Line
+	case *ReturnStmt:
+		return v.Line
+	case *LetDecl:
+		return v.Line
+	case *AssignStmt:
+		return v.Line
+	default:
+		return 0
+	}
+}
+
+// ExprLine returns the source line an expression node was parsed from.
+func ExprLine(e Expr) int {
+	switch v := e.(type) {
+	case *Ident:
+		return v.Line
+	case *StringLit:
+		return v.Line
+	case *IntLit:
+		return v.Line
+	case *FloatLit:
+		return v.Line
+	case *BoolLit:
+		return v.Line
+	case *NoneLit:
+		return v.Line
+	case *CallExpr:
+		return v.Line
+	default:
+		return 0
+	}
+}

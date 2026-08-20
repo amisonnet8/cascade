@@ -2,9 +2,10 @@
 // cascade_spec.md §1: newlines are significant statement terminators, and
 // "//" starts a line comment.
 //
-// Only the punctuation Step 1 (bootstrap) needs is lexed as an operator so
-// far — "(", ")", "{", "}", ":", "," — since cascade_spec.md §6's full
-// operator set belongs to Step 3 (arithmetic/comparison/logical) and Step 4
+// Only the punctuation Steps 1-2 need is lexed as an operator so far —
+// "(", ")", "{", "}", ":", ",", "?" (nullable-type suffix, §2.3), and "="
+// (plain assignment, §5) — since cascade_spec.md §6's full operator set
+// belongs to Step 3 (arithmetic/comparison/logical) and Step 4
 // (bitwise/shift). The full keyword set (§14) is already reserved from the
 // start (see token.go), since adding a keyword later is free but an
 // identifier silently becoming a keyword out from under existing code is
@@ -150,14 +151,28 @@ func (l *Lexer) lexIdent(line int) Token {
 	return Token{Kind: Ident, Literal: lit, Line: line}
 }
 
-// lexNumber scans an integer literal. Float literals (cascade_spec.md §3)
-// are lexed starting in the step that introduces the float type.
+// lexNumber scans an integer or floating-point literal (cascade_spec.md
+// §3). Unary minus is not part of the literal itself — `-1234` lexes as
+// Minus followed by Int/Float, the same as any other unary expression
+// (§6) — but that operator isn't lexed until Step 3.
 func (l *Lexer) lexNumber(line int) (Token, error) {
 	start := l.pos
 	for l.pos < len(l.src) && isDigit(l.peekRune()) {
 		l.pos++
 	}
-	return Token{Kind: Int, Literal: string(l.src[start:l.pos]), Line: line}, nil
+	isFloat := false
+	if l.peekRune() == '.' && isDigit(l.peekRuneAt(1)) {
+		isFloat = true
+		l.pos++ // consume '.'
+		for l.pos < len(l.src) && isDigit(l.peekRune()) {
+			l.pos++
+		}
+	}
+	lit := string(l.src[start:l.pos])
+	if isFloat {
+		return Token{Kind: Float, Literal: lit, Line: line}, nil
+	}
+	return Token{Kind: Int, Literal: lit, Line: line}, nil
 }
 
 func (l *Lexer) lexString(line int) (Token, error) {
@@ -197,6 +212,10 @@ func (l *Lexer) lexOperator(line int) (Token, error) {
 		return Token{Kind: Colon, Literal: ":", Line: line}, nil
 	case ',':
 		return Token{Kind: Comma, Literal: ",", Line: line}, nil
+	case '?':
+		return Token{Kind: Question, Literal: "?", Line: line}, nil
+	case '=':
+		return Token{Kind: Assign, Literal: "=", Line: line}, nil
 	}
 	return Token{}, fmt.Errorf("line %d: unexpected character %q", line, r)
 }
