@@ -291,11 +291,10 @@ func (p *parser) parseReturnStmt() (ast.Stmt, error) {
 
 // parseExpr parses a full expression, following cascade_spec.md §6's
 // precedence table (lowest to highest so far): ||, &&, ==/!=, </<=/>/>=,
-// +/-, */%, unary !/-, then primaries. Bitwise/shift levels (§6 priorities
-// 5-7) are inserted between parseComparison and parseAdditive once Step 4
-// lands; postfix "?" (§8.6, Step 11), "."/"[]" (Steps 6/8), and the "|>"
-// pipeline operator (Step 12) extend parsePrimary/parseExpr further in
-// their own steps.
+// | (and ^ as XOR), & (and &^), <</>>, +/-, */%, unary !/-/~, then
+// primaries. Postfix "?" (§8.6, Step 11), "."/"[]" (Steps 6/8), and the
+// "|>" pipeline operator (Step 12) extend parsePrimary/parseExpr further
+// in their own steps.
 func (p *parser) parseExpr() (ast.Expr, error) {
 	return p.parseOr()
 }
@@ -311,6 +310,12 @@ var binOpNames = map[lexer.Kind]string{
 	lexer.Lte:     "<=",
 	lexer.Gt:      ">",
 	lexer.Gte:     ">=",
+	lexer.Pipe:    "|",
+	lexer.Caret:   "^",
+	lexer.Amp:     "&",
+	lexer.AndNot:  "&^",
+	lexer.Shl:     "<<",
+	lexer.Shr:     ">>",
 	lexer.Plus:    "+",
 	lexer.Minus:   "-",
 	lexer.Star:    "*",
@@ -358,10 +363,23 @@ func (p *parser) parseEquality() (ast.Expr, error) {
 	return p.parseBinaryLevel(p.parseComparison, lexer.Eq, lexer.Neq)
 }
 
-// parseComparison calls parseAdditive directly, skipping §6's shift/bitwise
-// levels (priorities 5-7) until Step 4 inserts them here.
 func (p *parser) parseComparison() (ast.Expr, error) {
-	return p.parseBinaryLevel(p.parseAdditive, lexer.Lt, lexer.Lte, lexer.Gt, lexer.Gte)
+	return p.parseBinaryLevel(p.parseBitOr, lexer.Lt, lexer.Lte, lexer.Gt, lexer.Gte)
+}
+
+// parseBitOr folds "|" and "^" (bitwise XOR — binary only; unary bit-flip
+// is "~", parsed in parseUnary) at the same precedence (§6 priority 7).
+func (p *parser) parseBitOr() (ast.Expr, error) {
+	return p.parseBinaryLevel(p.parseBitAnd, lexer.Pipe, lexer.Caret)
+}
+
+// parseBitAnd folds "&" and "&^" at the same precedence (§6 priority 6).
+func (p *parser) parseBitAnd() (ast.Expr, error) {
+	return p.parseBinaryLevel(p.parseShift, lexer.Amp, lexer.AndNot)
+}
+
+func (p *parser) parseShift() (ast.Expr, error) {
+	return p.parseBinaryLevel(p.parseAdditive, lexer.Shl, lexer.Shr)
 }
 
 func (p *parser) parseAdditive() (ast.Expr, error) {
@@ -372,18 +390,20 @@ func (p *parser) parseMultiplicative() (ast.Expr, error) {
 	return p.parseBinaryLevel(p.parseUnary, lexer.Star, lexer.Slash, lexer.Percent)
 }
 
-// parseUnary parses a prefix "!"/"-" (§6 priority 2). "*"/"&"/"~" join
-// once pointers (Step 8) and bitwise ops (Step 4) land.
+// unaryOpNames maps a prefix unary operator token to its ast.UnaryExpr Op
+// string (§6 priority 2). "*"/"&" (pointers) join once Step 8 lands.
+var unaryOpNames = map[lexer.Kind]string{
+	lexer.Not:   "!",
+	lexer.Minus: "-",
+	lexer.Tilde: "~",
+}
+
 func (p *parser) parseUnary() (ast.Expr, error) {
-	if p.cur().Kind == lexer.Not || p.cur().Kind == lexer.Minus {
+	if op, ok := unaryOpNames[p.cur().Kind]; ok {
 		opTok := p.advance()
 		x, err := p.parseUnary()
 		if err != nil {
 			return nil, err
-		}
-		op := "!"
-		if opTok.Kind == lexer.Minus {
-			op = "-"
 		}
 		return &ast.UnaryExpr{Op: op, X: x, Line: opTok.Line}, nil
 	}

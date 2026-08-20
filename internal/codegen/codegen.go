@@ -19,11 +19,12 @@
 // declaration site later. See scope.go's varRef for how a nullable `T?`
 // variable's companion "is this set?" flag is represented.
 //
-// Only enough is implemented so far to compile Steps 1-3: a single `main`
+// Only enough is implemented so far to compile Steps 1-4: a single `main`
 // function whose body is `let`/`const` declarations, scalar assignment, a
-// `print(...)` call, `return`, and arithmetic/comparison/logical operator
-// expressions (cascade_spec.md §6). Later steps extend genStmt/genValue
-// one feature at a time, the same way parser's grammar grows.
+// `print(...)` call, `return`, and arithmetic/comparison/logical/bitwise/
+// shift operator expressions (cascade_spec.md §6). Later steps extend
+// genStmt/genValue one feature at a time, the same way parser's grammar
+// grows.
 package codegen
 
 import (
@@ -314,10 +315,12 @@ func genStringConversion(g *funcGen, call *ast.CallExpr) (string, error) {
 	return tmp, nil
 }
 
-// genUnary compiles a unary "!"/"-" expression (cascade_spec.md §6) into a
-// fresh temp of ResultType (filled in by sema.Check). AMIVM-IR has no
-// unary-minus instruction, so "-x" is emitted as "SUB tmp 0 x"
-// (seed_implementation_notes.md §5.6's exact pattern for the same gap).
+// genUnary compiles a unary "!"/"-"/"~" expression (cascade_spec.md §6)
+// into a fresh temp of ResultType (filled in by sema.Check). AMIVM-IR has
+// no unary-minus instruction, so "-x" is emitted as "SUB tmp 0 x"
+// (seed_implementation_notes.md §5.6's exact pattern for the same gap);
+// "~x" (bitwise NOT) has its own instruction, BNOT, so it needs no such
+// workaround.
 func genUnary(g *funcGen, e *ast.UnaryExpr) (string, error) {
 	x, err := genValue(g, e.X)
 	if err != nil {
@@ -333,6 +336,8 @@ func genUnary(g *funcGen, e *ast.UnaryExpr) (string, error) {
 		g.emit("\tNOT\t%s\t%s\n", tmp, x)
 	case "-":
 		g.emit("\tSUB\t%s\t0\t%s\n", tmp, x)
+	case "~":
+		g.emit("\tBNOT\t%s\t%s\n", tmp, x)
 	default:
 		return "", fmt.Errorf("codegen: unsupported unary operator %q", e.Op)
 	}
@@ -340,7 +345,7 @@ func genUnary(g *funcGen, e *ast.UnaryExpr) (string, error) {
 }
 
 // binaryOpInstr maps every ast.BinaryExpr.Op except "+" (see genBinary) to
-// its AMIVM-IR instruction (cascade_spec.md §6, amivm_spec.md §4.3/4.6/4.7).
+// its AMIVM-IR instruction (cascade_spec.md §6, amivm_spec.md §4.3-4.7).
 var binaryOpInstr = map[string]string{
 	"-":  "SUB",
 	"*":  "MUL",
@@ -354,6 +359,12 @@ var binaryOpInstr = map[string]string{
 	">=": "GTE",
 	"&&": "AND",
 	"||": "OR",
+	"&":  "BAND",
+	"|":  "BOR",
+	"^":  "BXOR",
+	"&^": "BCLEAR",
+	"<<": "SHL",
+	">>": "SHR",
 }
 
 // genBinary compiles a binary expression (cascade_spec.md §6) into a fresh

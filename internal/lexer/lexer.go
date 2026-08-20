@@ -2,15 +2,16 @@
 // cascade_spec.md §1: newlines are significant statement terminators, and
 // "//" starts a line comment.
 //
-// Only the punctuation/operators Steps 1-3 need are lexed so far — "(",
+// Only the punctuation/operators Steps 1-4 need are lexed so far — "(",
 // ")", "{", "}", ":", ",", "?" (nullable-type suffix, §2.3), "=" (plain
-// assignment, §5), and §6's arithmetic/comparison/logical operators ("+"
-// "-" "*" "/" "%" "==" "!=" "<" "<=" ">" ">=" "&&" "||" "!"). Bitwise/shift
-// (Step 4), unary "*"/"&"/"~" (Steps 4/8), postfix "?" (Step 11), and "|>"
-// (Step 12) are lexed starting in the steps that introduce them. The full
-// keyword set (§14) is already reserved from the start (see token.go),
-// since adding a keyword later is free but an identifier silently
-// becoming a keyword out from under existing code is not.
+// assignment, §5), §6's arithmetic/comparison/logical operators ("+" "-"
+// "*" "/" "%" "==" "!=" "<" "<=" ">" ">=" "&&" "||" "!"), and §6's bitwise/
+// shift operators ("&" "|" "^" "&^" "~" "<<" ">>"). Unary "*"/"&"
+// (pointers, Step 8), postfix "?" (Step 11), and "|>" (Step 12) are lexed
+// starting in the steps that introduce them. The full keyword set (§14)
+// is already reserved from the start (see token.go), since adding a
+// keyword later is free but an identifier silently becoming a keyword out
+// from under existing code is not.
 package lexer
 
 import (
@@ -241,21 +242,48 @@ func (l *Lexer) lexOperator(line int) (Token, error) {
 	case '!':
 		return two('=', Neq, Not), nil
 	case '<':
-		return two('=', Lte, Lt), nil
+		if l.peekRune() == '=' {
+			l.pos++
+			return Token{Kind: Lte, Literal: "<=", Line: line}, nil
+		}
+		if l.peekRune() == '<' {
+			l.pos++
+			return Token{Kind: Shl, Literal: "<<", Line: line}, nil
+		}
+		return Token{Kind: Lt, Literal: "<", Line: line}, nil
 	case '>':
-		return two('=', Gte, Gt), nil
+		if l.peekRune() == '=' {
+			l.pos++
+			return Token{Kind: Gte, Literal: ">=", Line: line}, nil
+		}
+		if l.peekRune() == '>' {
+			l.pos++
+			return Token{Kind: Shr, Literal: ">>", Line: line}, nil
+		}
+		return Token{Kind: Gt, Literal: ">", Line: line}, nil
 	case '&':
 		if l.peekRune() == '&' {
 			l.pos++
 			return Token{Kind: AndAnd, Literal: "&&", Line: line}, nil
 		}
-		// a lone '&' (bitwise AND / address-of) isn't lexed until Step 4/8
+		if l.peekRune() == '^' {
+			l.pos++
+			return Token{Kind: AndNot, Literal: "&^", Line: line}, nil
+		}
+		return Token{Kind: Amp, Literal: "&", Line: line}, nil
 	case '|':
 		if l.peekRune() == '|' {
 			l.pos++
 			return Token{Kind: OrOr, Literal: "||", Line: line}, nil
 		}
-		// a lone '|' (bitwise OR) isn't lexed until Step 4
+		// a lone '|' is bitwise OR (Pipe) here; once Step 12 adds "|>" it
+		// must be checked for at this same point, before falling through
+		// to Pipe.
+		return Token{Kind: Pipe, Literal: "|", Line: line}, nil
+	case '^':
+		return Token{Kind: Caret, Literal: "^", Line: line}, nil
+	case '~':
+		return Token{Kind: Tilde, Literal: "~", Line: line}, nil
 	}
 	return Token{}, fmt.Errorf("line %d: unexpected character %q", line, r)
 }

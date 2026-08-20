@@ -125,6 +125,12 @@ func TestGenerate_BinaryOperators(t *testing.T) {
 		{"gte", `let x = 1 >= 2`, "\tGTE\t"},
 		{"and", `let x = true && false`, "\tAND\t"},
 		{"or", `let x = true || false`, "\tOR\t"},
+		{"bitwise and", `let x = 1 & 2`, "\tBAND\t"},
+		{"bitwise or", `let x = 1 | 2`, "\tBOR\t"},
+		{"bitwise xor", `let x = 1 ^ 2`, "\tBXOR\t"},
+		{"bitwise and-not", `let x = 1 &^ 2`, "\tBCLEAR\t"},
+		{"shift left", `let x = 1 << 2`, "\tSHL\t"},
+		{"shift right", `let x = 1 >> 2`, "\tSHR\t"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -159,6 +165,52 @@ func main(): int {
 `)
 	if !strings.Contains(ir, "\tNOT\t") {
 		t.Fatalf("expected unary '!' to emit NOT; got:\n%s", ir)
+	}
+
+	ir = generate(t, `
+func main(): int {
+	let x = 5
+	let y = ~x
+	return 0
+}
+`)
+	if !strings.Contains(ir, "\tBNOT\t") {
+		t.Fatalf("expected unary '~' to emit BNOT; got:\n%s", ir)
+	}
+}
+
+// TestGenerate_ShiftPrecedenceLooserThanAdditive locks in
+// cascade_spec.md §6's precedence table, which (unlike C/Go) places
+// shift (priority 5) *looser* than +/- (priority 4): "4 << 1 + 1" must
+// parse as "4 << (1 + 1)", so ADD must be emitted before SHL.
+func TestGenerate_ShiftPrecedenceLooserThanAdditive(t *testing.T) {
+	ir := generate(t, `
+func main(): int {
+	let x = 4 << 1 + 1
+	return 0
+}
+`)
+	addIdx := strings.Index(ir, "\tADD\t")
+	shlIdx := strings.Index(ir, "\tSHL\t")
+	if addIdx == -1 || shlIdx == -1 || addIdx > shlIdx {
+		t.Fatalf("expected ADD to be emitted before SHL (shift binds looser than +/-); got:\n%s", ir)
+	}
+}
+
+// TestGenerate_BitAndPrecedenceTighterThanBitOr locks in §6's grouping of
+// "&"/"&^" (priority 6) as tighter than "|"/"^" (priority 7): "1 | 2 & 3"
+// must parse as "1 | (2 & 3)", so BAND must be emitted before BOR.
+func TestGenerate_BitAndPrecedenceTighterThanBitOr(t *testing.T) {
+	ir := generate(t, `
+func main(): int {
+	let x = 1 | 2 & 3
+	return 0
+}
+`)
+	bandIdx := strings.Index(ir, "\tBAND\t")
+	borIdx := strings.Index(ir, "\tBOR\t")
+	if bandIdx == -1 || borIdx == -1 || bandIdx > borIdx {
+		t.Fatalf("expected BAND to be emitted before BOR (& binds tighter than |); got:\n%s", ir)
 	}
 }
 

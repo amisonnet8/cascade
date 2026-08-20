@@ -1,0 +1,19 @@
+func main(): int {
+    let a = 12 // 0b1100
+    let b = 10 // 0b1010
+
+    print("a & b = " + string(a & b))   // 0b1000 = 8
+    print("a | b = " + string(a | b))   // 0b1110 = 14
+    print("a ^ b = " + string(a ^ b))   // 0b0110 = 6
+    print("a &^ b = " + string(a &^ b)) // 0b0100 = 4
+    print("~a = " + string(~a))         // -13
+
+    let shifted = a << 2
+    let unshifted = shifted >> 2
+    print("a << 2 = " + string(shifted) + ", (a << 2) >> 2 = " + string(unshifted))
+
+    let mask = 255 & 300
+    print("255 & 300 = " + string(mask))
+
+    return 0
+}

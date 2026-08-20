@@ -1,11 +1,11 @@
 // Package sema performs semantic analysis on a Cascade ast.File, since
 // amivm delegates all type/scope checking to go/types and does not check
 // anything itself (see CLAUDE.md "意味検証の責任分担"). Only the checks
-// Steps 1-3 need are implemented so far: a single well-formed `main`,
+// Steps 1-4 need are implemented so far: a single well-formed `main`,
 // scope-resolved `let`/`const` declarations and scalar assignment,
 // nullable-type (`T?`) compatibility (cascade_spec.md §2.3, §4.2, §5), and
-// the arithmetic/comparison/logical operators (§6). Later steps add
-// control flow and everything past that.
+// the arithmetic/comparison/logical/bitwise/shift operators (§6). Later
+// steps add control flow and everything past that.
 package sema
 
 import (
@@ -258,9 +258,9 @@ func checkCallExprValue(sc *scope, call *ast.CallExpr) (ast.Type, error) {
 }
 
 // unaryResultType validates op's operand type and returns its result type
-// (cascade_spec.md §6): "!" needs bool, "-" needs int or float, and either
-// way the operand must be non-nullable (narrow with `is not none` first —
-// deferred to Step 5, see CLAUDE.md's "確定した設計判断").
+// (cascade_spec.md §6): "!" needs bool, "-"/"~" need int (or float for
+// "-"), and either way the operand must be non-nullable (narrow with `is
+// not none` first — deferred to Step 5, see CLAUDE.md's "確定した設計判断").
 func unaryResultType(op string, xt ast.Type, line int) (ast.Type, error) {
 	if xt.Nullable {
 		return ast.Type{}, fmt.Errorf("line %d: operator %q needs a non-nullable operand, got %s", line, op, typeString(xt))
@@ -274,6 +274,11 @@ func unaryResultType(op string, xt ast.Type, line int) (ast.Type, error) {
 	case "-":
 		if xt.Name != "int" && xt.Name != "float" {
 			return ast.Type{}, fmt.Errorf("line %d: unary - requires int or float, got %s", line, xt.Name)
+		}
+		return xt, nil
+	case "~":
+		if xt.Name != "int" {
+			return ast.Type{}, fmt.Errorf("line %d: unary ~ requires int, got %s", line, xt.Name)
 		}
 		return xt, nil
 	default:
@@ -311,6 +316,11 @@ func binaryResultType(op string, xt, yt ast.Type, line int) (ast.Type, error) {
 	case "%":
 		if xt.Name != "int" {
 			return ast.Type{}, fmt.Errorf("line %d: operator %% requires int operands, got %s", line, xt.Name)
+		}
+		return xt, nil
+	case "&", "|", "^", "&^", "<<", ">>":
+		if xt.Name != "int" {
+			return ast.Type{}, fmt.Errorf("line %d: operator %q requires int operands, got %s", line, op, xt.Name)
 		}
 		return xt, nil
 	case "<", "<=", ">", ">=":

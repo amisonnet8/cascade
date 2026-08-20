@@ -61,11 +61,11 @@ const (
 	Comma
 	Question
 
-	// operators (cascade_spec.md §6). "=" (Step 2) plus the arithmetic,
-	// comparison, and logical set below (Step 3). Bitwise/shift/unary-
-	// pointer/postfix-"?"/pipe operators are lexed starting in the steps
-	// that introduce them (see lexer.go's package doc) — in particular a
-	// lone "&" or "|" isn't lexed yet, only their doubled "&&"/"||" forms.
+	// operators (cascade_spec.md §6). "=" (Step 2), the arithmetic/
+	// comparison/logical set (Step 3), and the bitwise/shift set below
+	// (Step 4). Unary "*"/"&" (pointers, Step 8), postfix "?" (Step 11),
+	// and "|>" (Step 12) are lexed starting in the steps that introduce
+	// them (see lexer.go's package doc).
 	Assign
 	Plus
 	Minus
@@ -81,6 +81,13 @@ const (
 	AndAnd
 	OrOr
 	Not
+	Amp    // "&" (bitwise AND — binary; unary "&" (address-of) lands in Step 8)
+	Pipe   // "|" (bitwise OR)
+	Caret  // "^" (bitwise XOR — binary only; unary bit-flip is Tilde, not this)
+	AndNot // "&^" (bitwise AND NOT)
+	Tilde  // "~" (unary bitwise NOT)
+	Shl    // "<<"
+	Shr    // ">>"
 )
 
 // keywords holds Cascade's full reserved-word set (cascade_spec.md §14).

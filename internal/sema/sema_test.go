@@ -67,6 +67,98 @@ func main(): int {
 	}
 }
 
+func TestCheck_ValidBitwiseAndShiftOperators(t *testing.T) {
+	src := `
+func main(): int {
+	let a = 12
+	let b = 10
+	let and = a & b
+	let or = a | b
+	let xor = a ^ b
+	let andNot = a &^ b
+	let inverted = ~a
+	let shiftedLeft = a << 2
+	let shiftedRight = a >> 2
+	print(string(and) + string(or) + string(xor) + string(andNot) + string(inverted) + string(shiftedLeft) + string(shiftedRight))
+	return 0
+}
+`
+	if err := check(t, src); err != nil {
+		t.Fatalf("Check() = %v, want nil", err)
+	}
+}
+
+func TestCheck_BitwiseAndShiftErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		src     string
+		wantErr string
+	}{
+		{
+			name: "bitwise and requires int operands",
+			src: `
+func main(): int {
+	let x = 1.0 & 2.0
+	return 0
+}
+`,
+			wantErr: "operator \"&\" requires int operands",
+		},
+		{
+			name: "bitwise or rejects bool",
+			src: `
+func main(): int {
+	let x = true | false
+	return 0
+}
+`,
+			wantErr: "operator \"|\" requires int operands",
+		},
+		{
+			name: "shift left requires int operands",
+			src: `
+func main(): int {
+	let x = "a" << "b"
+	return 0
+}
+`,
+			wantErr: "operator \"<<\" requires int operands",
+		},
+		{
+			name: "and-not requires int operands",
+			src: `
+func main(): int {
+	let x = 1.5 &^ 2.5
+	return 0
+}
+`,
+			wantErr: "operator \"&^\" requires int operands",
+		},
+		{
+			name: "unary bitwise not requires int",
+			src: `
+func main(): int {
+	let x = ~1.5
+	return 0
+}
+`,
+			wantErr: "unary ~ requires int",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := check(t, tt.src)
+			if err == nil {
+				t.Fatalf("Check() = nil, want error containing %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Check() = %q, want error containing %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestCheck_OperatorErrors(t *testing.T) {
 	tests := []struct {
 		name    string
