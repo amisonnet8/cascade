@@ -1,0 +1,103 @@
+func main(): int {
+    // if / elif / else
+    let x = 15
+    if x < 10 {
+        print("small")
+    } elif x < 20 {
+        print("medium")
+    } else {
+        print("large")
+    }
+
+    // while + break/continue
+    let i = 0
+    let sum = 0
+    while i < 10 {
+        i += 1
+        if i % 2 == 0 {
+            continue
+        }
+        if i > 7 {
+            break
+        }
+        sum += i
+    }
+    print("sum=" + string(sum)) // 1+3+5+7 = 16
+
+    // switch (tagged)
+    let day = 3
+    switch day {
+    case 1, 7:
+        print("weekend")
+    case 2, 3, 4, 5, 6:
+        print("weekday")
+    default:
+        print("invalid")
+    }
+
+    // switch (untagged / condition enumeration)
+    let score = 85
+    switch {
+    case score >= 90:
+        print("A")
+    case score >= 70:
+        print("B")
+    default:
+        print("C")
+    }
+
+    // break inside switch exits only the switch, not the enclosing while
+    let n = 0
+    let count = 0
+    while n < 5 {
+        n++
+        switch n {
+        case 3:
+            break
+        default:
+            count += 1
+        }
+    }
+    print("count=" + string(count)) // n=1,2,4,5 -> 4 (n=3 breaks before count+=1)
+
+    // continue inside switch skips the switch and reaches the enclosing while
+    let m = 0
+    let oddCount = 0
+    let total = 0
+    while m < 6 {
+        m++
+        switch {
+        case m % 2 == 0:
+            continue
+        default:
+            oddCount += 1
+        }
+        total += m
+    }
+    print("oddCount=" + string(oddCount) + " total=" + string(total)) // 3, 1+3+5=9
+
+    // null narrowing: post-if (if x is none { <exit> } ... x is T after)
+    let maybeName: string? = "Cascade"
+    if maybeName is none {
+        return 1
+    }
+    print("name=" + maybeName)
+
+    // null narrowing: within the clause whose own condition is "is not none"
+    let maybeAge: int? = 30
+    if maybeAge is not none {
+        print("age=" + string(maybeAge))
+    } else {
+        print("no age")
+    }
+
+    // null narrowing: within the else of a lone "is none" condition
+    let maybeCity: string? = none
+    if maybeCity is none {
+        print("no city")
+    } else {
+        print("city=" + maybeCity)
+    }
+
+    return 0
+}

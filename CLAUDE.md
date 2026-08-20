@@ -207,6 +207,23 @@ Cascadeの`func main(): int`をamivmの`!main`へ直接対応させることは�
 
 **唯一の非自明点は文法(命令ではなく`cascade_spec.md`側)にあった**: 6節の優先順位表は`<<`/`>>`(優先度5)を`+`/`-`(優先度4)より**低い**優先度に置いている。C/Go系言語の直感(シフトは加減算より高優先度)とは逆の並びで、`4 << 1 + 1`は`4 << (1+1) = 16`と解釈される(`(4 << 1) + 1 = 9`ではない)。手書き再帰下降パーサでは`parseShift`が`parseAdditive`を「より結合力の強い次の階層」として呼ぶ形になるため実装自体は素直だが、テストコード(`codegen_test.go`の`TestGenerate_ShiftPrecedenceLooserThanAdditive`)で明示的に固定していないと将来の変更で見逃されるリスクがあった。`amivm`→`go build`→実行(`examples/04_bitwise.cas`)でも数値レベルで検証済み。
 
+### goto/VAR巻き上げ問題の実地検証結果、および制御構文の設計(Step 5)
+
+**seed_implementation_notes.md §1の懸念(goto/VAR巻き上げ)は、Cascadeでも実際に起こりうる形で確認され、Step2で先取りしていた対策がそのまま機能した。** `internal/codegen/codegen.go`の`funcGen.decls`(全`VAR`をフラットにホイストし、`SET`だけを元の位置に残す仕組み)はStep2の時点で導入済みだったため、Step5で`if`/`elif`/`else`/`while`/`switch`を実装した際にコード変更は不要だった。`genBlock`(Seedと同名・同役割)が各ブロックにcodegen側スコープを与え、変数解決(シャドーイング)を扱う一方、Go側の変数配置は常にフラットなまま。単体テスト`TestGenerate_VarHoistingAcrossIfElifElse`(`elif`/`else`節内の`let`が全て関数先頭に来ることを検証)と、`examples/05_control_flow.cas`の`amivm`→`go build`→実行で二重に確認した。
+
+制御構文のcodegenパターンは[[Seed]]の`genIfStmt`/`genWhileStmt`(`seed/internal/codegen/stmt.go`)をほぼそのまま踏襲した(条件评価直後に`IF`、無条件`GOTO`で後続をスキップ、というelif連鎖の作り方)。Seedに無かった要素は以下の2点:
+
+- **`switch`の`break`/`continue`分離**: 7節「`switch`自体はループではない」という規定により、`break`はswitchとループの両方から抜けられるが、`continue`はswitchを素通りして囲むループにしか効かない。`funcGen`に`breakStack`(while**と**switchが積む)と`continueStack`(whileのみが積む)を別々に持たせることで実現した。単体テスト`TestGenerate_ContinueInSwitchTargetsEnclosingLoop`で、switch内の`continue`がwhileの開始ラベルへ直接ジャンプすることを確認済み
+- **タグ付き/タグなしswitchの共通コード生成**: どちらも「各case値についてIF→ラベル」という同じ構造だが、タグ付きは`EQ`比較を挟み、タグなしはcase値(bool式)をそのまま`IF`条件に使う。AST(`SwitchCase.Values`)は共通のまま、codegen側の1箇所(`genSwitchStmt`)で`stmt.Tag != nil`分岐するだけで両対応できた
+
+**`is none`/`is not none`と型絞り込み(narrowing、2.3節)をStep2からの持ち越しとして実装した。** 絞り込みは事前の想定通り**semaのみ**で完結し、codegen側の変更は一切不要だった(`is not none`の読み取りは既存の`_isset`フラグを返すだけ、`is none`はそれを`NOT`で反転するだけ)。sema側は3パターンを実装:
+
+1. 各clause自身の本体内: 条件が`X is not none`ならそのclauseの子スコープでXを非null型にshadow
+2. `else`節内: ifが単一clauseで条件が`X is none`のとき、elseの子スコープでXを非null型にshadow(条件の否定として自明)
+3. if文全体の後: 単一clause・条件が`X is none`・本体が`return`/`break`/`continue`で終わる場合のみ、囲むスコープ自体にXを非null型でshadowし、以降の文に効かせる
+
+いずれも新設した`scope.shadow`(既存宣言があっても強制上書きする、`declareLocal`とは別の内部用メソッド)で実現。3パターンとも`examples/05_control_flow.cas`で実行時に値レベルで確認済み(else節の絞り込みはnoneでない値を渡す追加確認も実施)。仕様が直接例示していない組み合わせ(elif節での絞り込み一般化、switch内での絞り込みなど)は実装していない。
+
 ## 意味検証の責任分担(重要)
 
 型の整合性・未定義識別子・関数シグネチャの不一致・メソッドの存在チェックなどは、**amivm側では検証せず`go/types`に全面的に委ねている。** amivmが保証するのは「構文的に妥当なGoコードを出力すること」だけ。
@@ -269,7 +286,7 @@ Seedは7〜8ステップ(git履歴上は「Step1: hello-worldパイプライン�
 | 2 ✅ | 変数・スカラー型・null許容型 | `let`/`const`、`int`/`float`/`string`/`bool`、`T?`の値+成否フラグペア(`is none`/`is not none`自体は`if`が無いと使い道が無いためStep5に先送り) | `VAR` `SET` | `T?`の実装方式を確定(下記「確定した設計判断」参照) |
 | 3 ✅ | 演算子(算術・比較・論理・文字列) | `+ - * / %`、`== != < <= > >=`、`&& \|\| !`、`string`連結、優先順位表(6節)の実地検証。観測用に組み込み変換`string()`(13節)も先取り実装 | `ADD` `SUB` `MUL` `DIV` `MOD` `EQ` `NEQ` `LT` `LTE` `GT` `GTE` `AND` `OR` `NOT` `CONCAT` | — |
 | 4 ✅ | ビット演算・シフト演算 | `&` `\|` `^` `&^` `~`、`<<` `>>`(int専用、semaで型制約を検査)。優先順位表(シフトが`+`/`-`より低優先度という非直感的な並び)も実地検証 | `BAND` `BOR` `BXOR` `BCLEAR` `BNOT` `SHL` `SHR` | — |
-| 5 | 制御構文 | `if/elif/else`、`while`、`for-in`(range限定の単純ケース)、`switch`(タグ付き/タグなし)、`break/continue` | `LABEL` `GOTO` `IF` | goto/VAR巻き上げ問題(seed_implementation_notes.md §1)の再検証 |
+| 5 ✅ | 制御構文 | `if/elif/else`、`while`、`switch`(タグ付き/タグなし)、`break/continue`、`is none`/`is not none`と型絞り込み(Step2から持ち越し)。`+=`等の複合代入・`++`/`--`も前倒し実装。`for-in`は`[]T`(Step6)に依存するためStep6へ移動 | `LABEL` `GOTO` `IF` | goto/VAR巻き上げ問題(seed_implementation_notes.md §1)の再検証(下記「確定した設計判断」参照) |
 | 6 | リスト(`[]T`) | リテラル・`append`・添字読み書き・`for x in xs`・`range`/`len`組み込み | `SLTYPE` `SLMAKE` `ASET` `AGET`(`SLICE`の使い所も探る) | — |
 | 7 | 関数(通常関数・複数戻り値) | `func`定義、複数戻り値(8.1/8.5節)、`divmod`的サンプル | `FUNC` `RET` `CALL`の本格利用 | — |
 | 8 | 構造体・ポインタ・レシーバー関数 | `struct`定義・フィールドアクセス、`&x`/`*p`、値/ポインタレシーバーの自動変換 | `STTYPE` `FIELD` `ENDSTTYPE` `FSET` `FGET` `ADDR` `PGET` `PSET` | 課題1(レシーバー関数のコンパイル方針)の確定 |

@@ -1,11 +1,12 @@
 // Package sema performs semantic analysis on a Cascade ast.File, since
 // amivm delegates all type/scope checking to go/types and does not check
 // anything itself (see CLAUDE.md "意味検証の責任分担"). Only the checks
-// Steps 1-4 need are implemented so far: a single well-formed `main`,
-// scope-resolved `let`/`const` declarations and scalar assignment,
-// nullable-type (`T?`) compatibility (cascade_spec.md §2.3, §4.2, §5), and
-// the arithmetic/comparison/logical/bitwise/shift operators (§6). Later
-// steps add control flow and everything past that.
+// Steps 1-5 need are implemented so far: a single well-formed `main`,
+// scope-resolved `let`/`const` declarations and scalar/compound
+// assignment, nullable-type (`T?`) compatibility and narrowing
+// (cascade_spec.md §2.3, §4.2, §5, §7), the full operator set (§6), and
+// control flow (if/elif/else, while, switch, break/continue). Later steps
+// add lists, functions, structs, and everything past that.
 package sema
 
 import (
@@ -48,7 +49,7 @@ func Check(f *ast.File) error {
 
 	sc := newScope(nil)
 	for _, stmt := range main.Body {
-		if err := checkStmt(sc, stmt, main.Results); err != nil {
+		if err := checkStmt(sc, stmt, main.Results, 0, 0); err != nil {
 			return err
 		}
 	}
@@ -57,19 +58,249 @@ func Check(f *ast.File) error {
 
 // checkStmt dispatches to one statement's own check function. want is the
 // enclosing function's declared return types, needed by ReturnStmt.
-func checkStmt(sc *scope, stmt ast.Stmt, want []ast.Type) error {
+// loopDepth counts enclosing while loops (continue requires loopDepth >
+// 0); breakDepth counts enclosing while loops *and* switches (break
+// requires breakDepth > 0) — cascade_spec.md §7: break exits the
+// innermost loop or switch, but continue always skips over an enclosing
+// switch to reach the innermost loop, since "switch自体はループではない".
+func checkStmt(sc *scope, stmt ast.Stmt, want []ast.Type, loopDepth, breakDepth int) error {
 	switch s := stmt.(type) {
 	case *ast.LetDecl:
 		return checkLetDecl(sc, s)
 	case *ast.AssignStmt:
 		return checkAssignStmt(sc, s)
+	case *ast.CompoundAssignStmt:
+		return checkCompoundAssignStmt(sc, s)
+	case *ast.IncDecStmt:
+		return checkIncDecStmt(sc, s)
 	case *ast.ExprStmt:
 		return checkExprStmt(sc, s)
 	case *ast.ReturnStmt:
 		return checkReturnStmt(sc, s, want)
+	case *ast.IfStmt:
+		return checkIfStmt(sc, s, want, loopDepth, breakDepth)
+	case *ast.WhileStmt:
+		return checkWhileStmt(sc, s, want, loopDepth, breakDepth)
+	case *ast.SwitchStmt:
+		return checkSwitchStmt(sc, s, want, loopDepth, breakDepth)
+	case *ast.BreakStmt:
+		if breakDepth == 0 {
+			return fmt.Errorf("line %d: break outside of a loop or switch", s.Line)
+		}
+		return nil
+	case *ast.ContinueStmt:
+		if loopDepth == 0 {
+			return fmt.Errorf("line %d: continue outside of a loop", s.Line)
+		}
+		return nil
 	default:
 		return fmt.Errorf("line %d: unsupported statement %T", ast.StmtLine(stmt), stmt)
 	}
+}
+
+// checkBlock checks stmts in a fresh child scope of sc (cascade_spec.md
+// §10: every `{ }` block gets its own scope).
+func checkBlock(sc *scope, stmts []ast.Stmt, want []ast.Type, loopDepth, breakDepth int) error {
+	return checkStmtsIn(newScope(sc), stmts, want, loopDepth, breakDepth)
+}
+
+// checkStmtsIn checks stmts directly in sc, with no new scope pushed —
+// used where the caller already created (and possibly narrowed, see
+// checkIfStmt) the scope stmts should run in.
+func checkStmtsIn(sc *scope, stmts []ast.Stmt, want []ast.Type, loopDepth, breakDepth int) error {
+	for _, stmt := range stmts {
+		if err := checkStmt(sc, stmt, want, loopDepth, breakDepth); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkIfStmt checks an if/elif/else chain (cascade_spec.md §7): every
+// condition must be a non-nullable bool, and each clause/else body is
+// checked in its own scope with §2.3's null-narrowing applied where it
+// can be determined statically from the clause's own condition (see
+// narrowedVarInfo) — and, for the single-clause `if x is none { ... }`
+// shape whose body always exits, propagated into sc itself for the rest
+// of the enclosing block (cascade_spec.md §2.3's own example).
+func checkIfStmt(sc *scope, stmt *ast.IfStmt, want []ast.Type, loopDepth, breakDepth int) error {
+	for _, clause := range stmt.Clauses {
+		ct, err := exprType(sc, clause.Cond)
+		if err != nil {
+			return err
+		}
+		if ct.Name != "bool" || ct.Nullable {
+			return fmt.Errorf("line %d: if condition must be bool, got %s", ast.ExprLine(clause.Cond), typeString(ct))
+		}
+
+		inner := newScope(sc)
+		if name, info, ok := narrowedVarInfo(sc, clause.Cond, true); ok {
+			inner.shadow(name, info)
+		}
+		if err := checkStmtsIn(inner, clause.Body, want, loopDepth, breakDepth); err != nil {
+			return err
+		}
+	}
+
+	if stmt.Else != nil {
+		inner := newScope(sc)
+		if len(stmt.Clauses) == 1 {
+			if name, info, ok := narrowedVarInfo(sc, stmt.Clauses[0].Cond, false); ok {
+				inner.shadow(name, info)
+			}
+		}
+		if err := checkStmtsIn(inner, stmt.Else, want, loopDepth, breakDepth); err != nil {
+			return err
+		}
+	}
+
+	if len(stmt.Clauses) == 1 && stmt.Else == nil {
+		if name, info, ok := narrowedVarInfo(sc, stmt.Clauses[0].Cond, false); ok && endsInUnconditionalExit(stmt.Clauses[0].Body) {
+			sc.shadow(name, info)
+		}
+	}
+
+	return nil
+}
+
+// narrowedVarInfo returns the varInfo X would have if narrowed to
+// non-null, when cond is exactly `X is none`/`X is not none`
+// (cascade_spec.md §2.3, §7) on a plain identifier already declared (and
+// nullable) in sc — wantNot selects which of the two (true for "is not
+// none", false for "is none") cond must be for narrowing to apply.
+func narrowedVarInfo(sc *scope, cond ast.Expr, wantNot bool) (name string, info varInfo, ok bool) {
+	nc, isCheck := cond.(*ast.NullCheckExpr)
+	if !isCheck || nc.Not != wantNot {
+		return "", varInfo{}, false
+	}
+	id, isIdent := nc.X.(*ast.Ident)
+	if !isIdent {
+		return "", varInfo{}, false
+	}
+	orig, found := sc.lookup(id.Name)
+	if !found || !orig.Type.Nullable {
+		return "", varInfo{}, false
+	}
+	narrowed := orig
+	narrowed.Type = ast.Type{Name: orig.Type.Name, Nullable: false}
+	return id.Name, narrowed, true
+}
+
+// endsInUnconditionalExit reports whether body's last statement always
+// leaves it (cascade_spec.md §2.3's narrowing condition: "`return`/
+// `break`/`continue`で抜ける形になっている場合"). This is a syntactic
+// check on the last statement only, not full control-flow analysis —
+// matching the spec's own single-statement example (`if input is none {
+// return }`).
+func endsInUnconditionalExit(body []ast.Stmt) bool {
+	if len(body) == 0 {
+		return false
+	}
+	switch body[len(body)-1].(type) {
+	case *ast.ReturnStmt, *ast.BreakStmt, *ast.ContinueStmt:
+		return true
+	default:
+		return false
+	}
+}
+
+func checkWhileStmt(sc *scope, stmt *ast.WhileStmt, want []ast.Type, loopDepth, breakDepth int) error {
+	ct, err := exprType(sc, stmt.Cond)
+	if err != nil {
+		return err
+	}
+	if ct.Name != "bool" || ct.Nullable {
+		return fmt.Errorf("line %d: while condition must be bool, got %s", ast.ExprLine(stmt.Cond), typeString(ct))
+	}
+	return checkBlock(sc, stmt.Body, want, loopDepth+1, breakDepth+1)
+}
+
+// checkSwitchStmt checks a tagged or untagged switch (cascade_spec.md
+// §7). Tagged: each case value must match the tag's type exactly (no
+// implicit conversion, same rule as every other comparison). Untagged:
+// each case value is itself a bool condition. Every case/default body is
+// checked in its own scope with breakDepth+1 (switch is not a loop, so
+// loopDepth is unchanged — see checkStmt's doc).
+func checkSwitchStmt(sc *scope, stmt *ast.SwitchStmt, want []ast.Type, loopDepth, breakDepth int) error {
+	var tagType ast.Type
+	if stmt.Tag != nil {
+		t, err := exprType(sc, stmt.Tag)
+		if err != nil {
+			return err
+		}
+		if t.Nullable {
+			return fmt.Errorf("line %d: switch tag must be non-nullable, got %s", ast.ExprLine(stmt.Tag), typeString(t))
+		}
+		tagType = t
+	}
+
+	for _, c := range stmt.Cases {
+		for _, v := range c.Values {
+			vt, err := exprType(sc, v)
+			if err != nil {
+				return err
+			}
+			if stmt.Tag != nil {
+				if vt.Nullable || vt.Name != tagType.Name {
+					return fmt.Errorf("line %d: case value type %s does not match switch tag type %s", ast.ExprLine(v), typeString(vt), typeString(tagType))
+				}
+			} else if vt.Nullable || vt.Name != "bool" {
+				return fmt.Errorf("line %d: case condition must be bool, got %s", ast.ExprLine(v), typeString(vt))
+			}
+		}
+		if err := checkBlock(sc, c.Body, want, loopDepth, breakDepth+1); err != nil {
+			return err
+		}
+	}
+
+	if stmt.Default != nil {
+		if err := checkBlock(sc, stmt.Default, want, loopDepth, breakDepth+1); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkCompoundAssignStmt validates `name op= value` (cascade_spec.md
+// §5) by reusing binaryResultType as if it were `name = name op value` —
+// the same rules apply (e.g. `+=` on a string concatenates, `%=` requires
+// int), so there is no separate rule set to maintain.
+func checkCompoundAssignStmt(sc *scope, stmt *ast.CompoundAssignStmt) error {
+	info, ok := sc.lookup(stmt.Name)
+	if !ok {
+		return fmt.Errorf("line %d: undefined name %q", stmt.Line, stmt.Name)
+	}
+	if info.Const {
+		return fmt.Errorf("line %d: cannot assign to %q (declared const)", stmt.Line, stmt.Name)
+	}
+	vt, err := exprType(sc, stmt.Value)
+	if err != nil {
+		return err
+	}
+	rt, err := binaryResultType(stmt.Op, info.Type, vt, stmt.Line)
+	if err != nil {
+		return err
+	}
+	if rt.Name != info.Type.Name {
+		return fmt.Errorf("line %d: cannot assign %s to %s", stmt.Line, typeString(rt), typeString(info.Type))
+	}
+	return nil
+}
+
+// checkIncDecStmt validates `name++`/`name--` (cascade_spec.md §5): name
+// must be a non-nullable, non-const int or float.
+func checkIncDecStmt(sc *scope, stmt *ast.IncDecStmt) error {
+	info, ok := sc.lookup(stmt.Name)
+	if !ok {
+		return fmt.Errorf("line %d: undefined name %q", stmt.Line, stmt.Name)
+	}
+	if info.Const {
+		return fmt.Errorf("line %d: cannot assign to %q (declared const)", stmt.Line, stmt.Name)
+	}
+	if info.Type.Nullable || (info.Type.Name != "int" && info.Type.Name != "float") {
+		return fmt.Errorf("line %d: %s requires a non-nullable int or float, got %s", stmt.Line, stmt.Op, typeString(info.Type))
+	}
+	return nil
 }
 
 // checkLetDecl validates a `let`/`const` declaration (cascade_spec.md
@@ -227,6 +458,19 @@ func exprType(sc *scope, e ast.Expr) (ast.Type, error) {
 		}
 		v.ResultType = rt
 		return rt, nil
+	case *ast.NullCheckExpr:
+		xt, err := exprType(sc, v.X)
+		if err != nil {
+			return ast.Type{}, err
+		}
+		if !xt.Nullable {
+			desc := "is none"
+			if v.Not {
+				desc = "is not none"
+			}
+			return ast.Type{}, fmt.Errorf("line %d: '%s' requires a nullable type, got %s", v.Line, desc, typeString(xt))
+		}
+		return ast.Type{Name: "bool"}, nil
 	default:
 		return ast.Type{}, fmt.Errorf("line %d: cannot determine the type of this expression yet", ast.ExprLine(e))
 	}

@@ -12,19 +12,27 @@
 //
 // Every declared variable's `VAR` is hoisted to the top of its function,
 // with only the `SET` that actually assigns a value left at its original
-// position — even though Steps 1-2 have no branches yet to trip Go's
-// "goto jumps over variable declaration" rule, this is the exact shape
-// Step 5 (control flow) requires (seed_implementation_notes.md §1), and
-// getting funcGen's shape right once now avoids reworking every
-// declaration site later. See scope.go's varRef for how a nullable `T?`
-// variable's companion "is this set?" flag is represented.
+// position. AMIVM-IR's control flow is GOTO-based, not nested Go blocks
+// (see genIfStmt/genWhileStmt/genSwitchStmt), so without this a forward
+// jump — an `elif` chain skipping a later clause's body, a `break`
+// jumping past the rest of a loop — trips Go's "goto jumps over variable
+// declaration" rule the moment the skipped code declares anything
+// (seed_implementation_notes.md §1). genBlock gives every if/while/
+// switch-case body its own funcGen scope, even though every declaration
+// still ends up as one flat hoisted VAR in the enclosing function — that
+// scope is purely for name resolution (shadowing, cascade_spec.md §10),
+// not for Go block structure, which doesn't exist here. See scope.go's
+// varRef for how a nullable `T?` variable's companion "is this set?"
+// flag is represented, and funcGen's breakStack/continueStack for why
+// `break` (loop or switch) and `continue` (loop only, skipping over any
+// enclosing switch) need separate target stacks.
 //
-// Only enough is implemented so far to compile Steps 1-4: a single `main`
-// function whose body is `let`/`const` declarations, scalar assignment, a
-// `print(...)` call, `return`, and arithmetic/comparison/logical/bitwise/
-// shift operator expressions (cascade_spec.md §6). Later steps extend
-// genStmt/genValue one feature at a time, the same way parser's grammar
-// grows.
+// Only enough is implemented so far to compile Steps 1-5: a single `main`
+// function whose body is `let`/`const` declarations, scalar/compound
+// assignment, `print(...)`, `return`, the full operator set (cascade_spec.md
+// §6), and control flow (if/elif/else, while, switch, break/continue).
+// Later steps extend genStmt/genValue one feature at a time, the same way
+// parser's grammar grows.
 package codegen
 
 import (
@@ -90,10 +98,13 @@ type varDecl struct {
 // combined by Generate once generation finishes — so that every VAR ends
 // up hoisted before any control flow (see package doc).
 type funcGen struct {
-	decls []varDecl
-	b     strings.Builder
-	scope *scope
-	seq   int
+	decls         []varDecl
+	b             strings.Builder
+	scope         *scope
+	seq           int
+	labelSeq      int
+	breakStack    []string // break targets: pushed by both while and switch
+	continueStack []string // continue targets: pushed by while only (switch isn't a loop)
 }
 
 func (g *funcGen) emit(format string, args ...any) {
@@ -103,6 +114,33 @@ func (g *funcGen) emit(format string, args ...any) {
 // declareVar records a hoisted VAR for op.
 func (g *funcGen) declareVar(op, irType string) {
 	g.decls = append(g.decls, varDecl{Op: op, IRType: irType})
+}
+
+// newLabel mints a fresh label name, unique within this function. Go
+// scopes labels per-function, so a plain counter needs no further
+// qualification (unlike variable names — see freshName).
+func (g *funcGen) newLabel() string {
+	g.labelSeq++
+	return fmt.Sprintf("L%d", g.labelSeq)
+}
+
+func (g *funcGen) pushBreak(label string)    { g.breakStack = append(g.breakStack, label) }
+func (g *funcGen) popBreak()                 { g.breakStack = g.breakStack[:len(g.breakStack)-1] }
+func (g *funcGen) pushContinue(label string) { g.continueStack = append(g.continueStack, label) }
+func (g *funcGen) popContinue()              { g.continueStack = g.continueStack[:len(g.continueStack)-1] }
+
+func (g *funcGen) currentBreak() (string, bool) {
+	if len(g.breakStack) == 0 {
+		return "", false
+	}
+	return g.breakStack[len(g.breakStack)-1], true
+}
+
+func (g *funcGen) currentContinue() (string, bool) {
+	if len(g.continueStack) == 0 {
+		return "", false
+	}
+	return g.continueStack[len(g.continueStack)-1], true
 }
 
 // newTemp declares a fresh hoisted variable of the given AMIVM-IR type to
@@ -125,19 +163,277 @@ func (g *funcGen) freshName(base string) string {
 	return fmt.Sprintf("%s_%d", base, g.seq)
 }
 
+// genBlock compiles one `{ }` block's statements in a fresh child scope,
+// so its declarations don't leak into the enclosing block and may shadow
+// an outer variable (cascade_spec.md §10) — even though every declaration
+// still ends up as one flat hoisted VAR in the enclosing function (see
+// package doc). Used uniformly for every if/while/switch-case body.
+func genBlock(g *funcGen, stmts []ast.Stmt) error {
+	outer := g.scope
+	g.scope = newScope(outer)
+	defer func() { g.scope = outer }()
+	for _, stmt := range stmts {
+		if err := genStmt(g, stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func genStmt(g *funcGen, stmt ast.Stmt) error {
 	switch s := stmt.(type) {
 	case *ast.LetDecl:
 		return genLetDecl(g, s)
 	case *ast.AssignStmt:
 		return genAssignStmt(g, s)
+	case *ast.CompoundAssignStmt:
+		return genCompoundAssignStmt(g, s)
+	case *ast.IncDecStmt:
+		return genIncDecStmt(g, s)
 	case *ast.ExprStmt:
 		return genExprStmt(g, s)
 	case *ast.ReturnStmt:
 		return genReturnStmt(g, s)
+	case *ast.IfStmt:
+		return genIfStmt(g, s)
+	case *ast.WhileStmt:
+		return genWhileStmt(g, s)
+	case *ast.SwitchStmt:
+		return genSwitchStmt(g, s)
+	case *ast.BreakStmt:
+		return genBreakStmt(g, s)
+	case *ast.ContinueStmt:
+		return genContinueStmt(g, s)
 	default:
 		return fmt.Errorf("codegen: unsupported statement %T", stmt)
 	}
+}
+
+// genIfStmt compiles an if/elif/else chain to a sequence of conditional
+// jumps followed by the bodies themselves (mirrors Seed's identical
+// genIfStmt — see seed/internal/codegen/stmt.go). Each clause's condition
+// is evaluated immediately before its own IF, so a taken jump skips every
+// later condition's instructions entirely — giving the usual short-circuit
+// "elif conditions run only if earlier ones were false" behavior for free.
+//
+//	<cond1 instrs>; IF cond1 body1
+//	<cond2 instrs>; IF cond2 body2
+//	...
+//	GOTO else-or-end
+//	LABEL body1; ...; GOTO end
+//	LABEL body2; ...; GOTO end
+//	LABEL else; ...; GOTO end   (only if there's an `else`)
+//	LABEL end
+func genIfStmt(g *funcGen, stmt *ast.IfStmt) error {
+	endLabel := g.newLabel()
+	bodyLabels := make([]string, len(stmt.Clauses))
+
+	for i, clause := range stmt.Clauses {
+		cond, err := genValue(g, clause.Cond)
+		if err != nil {
+			return err
+		}
+		bodyLabels[i] = g.newLabel()
+		g.emit("\tIF\t%s\t#%s\n", cond, bodyLabels[i])
+	}
+
+	var elseLabel string
+	if stmt.Else != nil {
+		elseLabel = g.newLabel()
+		g.emit("\tGOTO\t#%s\n", elseLabel)
+	} else {
+		g.emit("\tGOTO\t#%s\n", endLabel)
+	}
+
+	for i, clause := range stmt.Clauses {
+		g.emit("\tLABEL\t#%s\n", bodyLabels[i])
+		if err := genBlock(g, clause.Body); err != nil {
+			return err
+		}
+		g.emit("\tGOTO\t#%s\n", endLabel)
+	}
+
+	if stmt.Else != nil {
+		g.emit("\tLABEL\t#%s\n", elseLabel)
+		if err := genBlock(g, stmt.Else); err != nil {
+			return err
+		}
+		g.emit("\tGOTO\t#%s\n", endLabel)
+	}
+
+	g.emit("\tLABEL\t#%s\n", endLabel)
+	return nil
+}
+
+// genWhileStmt compiles a while loop as: check the condition, jump into
+// the body if true or out past the loop if false, and jump back to the
+// check after the body runs (mirrors Seed's identical genWhileStmt).
+//
+//	LABEL start; <cond instrs>; IF cond body; GOTO end
+//	LABEL body; ...; GOTO start
+//	LABEL end
+//
+// `continue` targets start (re-check the condition) and `break` targets
+// end.
+func genWhileStmt(g *funcGen, stmt *ast.WhileStmt) error {
+	startLabel := g.newLabel()
+	bodyLabel := g.newLabel()
+	endLabel := g.newLabel()
+
+	g.emit("\tLABEL\t#%s\n", startLabel)
+	cond, err := genValue(g, stmt.Cond)
+	if err != nil {
+		return err
+	}
+	g.emit("\tIF\t%s\t#%s\n", cond, bodyLabel)
+	g.emit("\tGOTO\t#%s\n", endLabel)
+	g.emit("\tLABEL\t#%s\n", bodyLabel)
+
+	g.pushBreak(endLabel)
+	g.pushContinue(startLabel)
+	err = genBlock(g, stmt.Body)
+	g.popContinue()
+	g.popBreak()
+	if err != nil {
+		return err
+	}
+
+	g.emit("\tGOTO\t#%s\n", startLabel)
+	g.emit("\tLABEL\t#%s\n", endLabel)
+	return nil
+}
+
+// genSwitchStmt compiles a tagged or untagged switch (cascade_spec.md
+// §7) as a sequence of conditional jumps, one IF per case value, followed
+// by the case bodies themselves — the same "evaluate condition, jump to
+// body, fall through to the next condition" shape as genIfStmt. The tag
+// (if any) is evaluated exactly once, up front, and its resulting operand
+// reused for every case's EQ comparison. break targets end; switch is not
+// a loop, so it never touches the continue stack (see funcGen's doc).
+func genSwitchStmt(g *funcGen, stmt *ast.SwitchStmt) error {
+	var tagOp string
+	if stmt.Tag != nil {
+		v, err := genValue(g, stmt.Tag)
+		if err != nil {
+			return err
+		}
+		tagOp = v
+	}
+
+	endLabel := g.newLabel()
+	caseLabels := make([]string, len(stmt.Cases))
+
+	for i, c := range stmt.Cases {
+		caseLabels[i] = g.newLabel()
+		for _, val := range c.Values {
+			v, err := genValue(g, val)
+			if err != nil {
+				return err
+			}
+			if stmt.Tag != nil {
+				cmp := g.newTemp("^bool")
+				g.emit("\tEQ\t%s\t%s\t%s\n", cmp, tagOp, v)
+				g.emit("\tIF\t%s\t#%s\n", cmp, caseLabels[i])
+			} else {
+				g.emit("\tIF\t%s\t#%s\n", v, caseLabels[i])
+			}
+		}
+	}
+
+	var defaultLabel string
+	if stmt.Default != nil {
+		defaultLabel = g.newLabel()
+		g.emit("\tGOTO\t#%s\n", defaultLabel)
+	} else {
+		g.emit("\tGOTO\t#%s\n", endLabel)
+	}
+
+	g.pushBreak(endLabel)
+	for i, c := range stmt.Cases {
+		g.emit("\tLABEL\t#%s\n", caseLabels[i])
+		if err := genBlock(g, c.Body); err != nil {
+			g.popBreak()
+			return err
+		}
+		g.emit("\tGOTO\t#%s\n", endLabel)
+	}
+	if stmt.Default != nil {
+		g.emit("\tLABEL\t#%s\n", defaultLabel)
+		if err := genBlock(g, stmt.Default); err != nil {
+			g.popBreak()
+			return err
+		}
+		g.emit("\tGOTO\t#%s\n", endLabel)
+	}
+	g.popBreak()
+
+	g.emit("\tLABEL\t#%s\n", endLabel)
+	return nil
+}
+
+func genBreakStmt(g *funcGen, stmt *ast.BreakStmt) error {
+	label, ok := g.currentBreak()
+	if !ok {
+		return fmt.Errorf("codegen: break outside of a loop or switch (sema bug)")
+	}
+	g.emit("\tGOTO\t#%s\n", label)
+	return nil
+}
+
+func genContinueStmt(g *funcGen, stmt *ast.ContinueStmt) error {
+	label, ok := g.currentContinue()
+	if !ok {
+		return fmt.Errorf("codegen: continue outside of a loop (sema bug)")
+	}
+	g.emit("\tGOTO\t#%s\n", label)
+	return nil
+}
+
+// genCompoundAssignStmt emits `name op= value` in place (AMIVM-IR's
+// arithmetic/bitwise instructions allow the same variable as both
+// destination and source operand, e.g. `ADD x x y` -> Go's `x = x + y`;
+// mirrors Seed's identical genCompoundAssignStmt).
+func genCompoundAssignStmt(g *funcGen, stmt *ast.CompoundAssignStmt) error {
+	ref, ok := g.scope.lookup(stmt.Name)
+	if !ok {
+		return fmt.Errorf("codegen: undefined name %q (sema bug)", stmt.Name)
+	}
+	v, err := genValue(g, stmt.Value)
+	if err != nil {
+		return err
+	}
+	switch {
+	case stmt.Op == "+" && ref.Type.Name == "string":
+		g.emit("\tCONCAT\t%s\t%s\t%s\n", ref.ValOp, ref.ValOp, v)
+	case stmt.Op == "+":
+		g.emit("\tADD\t%s\t%s\t%s\n", ref.ValOp, ref.ValOp, v)
+	default:
+		instr, ok := binaryOpInstr[stmt.Op]
+		if !ok {
+			return fmt.Errorf("codegen: unsupported compound assignment operator %q", stmt.Op)
+		}
+		g.emit("\t%s\t%s\t%s\t%s\n", instr, ref.ValOp, ref.ValOp, v)
+	}
+	if ref.SetOp != "" {
+		g.emit("\tSET\t%s\ttrue\n", ref.SetOp)
+	}
+	return nil
+}
+
+func genIncDecStmt(g *funcGen, stmt *ast.IncDecStmt) error {
+	ref, ok := g.scope.lookup(stmt.Name)
+	if !ok {
+		return fmt.Errorf("codegen: undefined name %q (sema bug)", stmt.Name)
+	}
+	instr := "ADD"
+	if stmt.Op == "--" {
+		instr = "SUB"
+	}
+	g.emit("\t%s\t%s\t%s\t1\n", instr, ref.ValOp, ref.ValOp)
+	if ref.SetOp != "" {
+		g.emit("\tSET\t%s\ttrue\n", ref.SetOp)
+	}
+	return nil
 }
 
 // genLetDecl compiles a `let`/`const` declaration (cascade_spec.md §4.2).
@@ -274,9 +570,38 @@ func genValue(g *funcGen, e ast.Expr) (string, error) {
 		return genBinary(g, v)
 	case *ast.CallExpr:
 		return genCallValue(g, v)
+	case *ast.NullCheckExpr:
+		return genNullCheck(g, v)
 	default:
 		return "", fmt.Errorf("codegen: unsupported value expression %T", e)
 	}
+}
+
+// genNullCheck compiles `X is none`/`X is not none` (cascade_spec.md §7)
+// by reading X's own isset flag directly — sema.Check guarantees X is a
+// plain identifier with a nullable type (see ast.NullCheckExpr's doc), so
+// its varRef always has a SetOp (scope.go's varRef). "is not none" is the
+// flag itself; "is none" is its negation. No new AMIVM instruction is
+// needed, and narrowing (§2.3) itself is a sema-only concept — see
+// CLAUDE.md's "確定した設計判断" — so there is nothing further to do here.
+func genNullCheck(g *funcGen, e *ast.NullCheckExpr) (string, error) {
+	id, ok := e.X.(*ast.Ident)
+	if !ok {
+		return "", fmt.Errorf("codegen: null-check target must be an identifier (sema bug)")
+	}
+	ref, ok := g.scope.lookup(id.Name)
+	if !ok {
+		return "", fmt.Errorf("codegen: undefined name %q (sema bug)", id.Name)
+	}
+	if ref.SetOp == "" {
+		return "", fmt.Errorf("codegen: null-check on non-nullable %q (sema bug)", id.Name)
+	}
+	if e.Not {
+		return ref.SetOp, nil
+	}
+	tmp := g.newTemp("^bool")
+	g.emit("\tNOT\t%s\t%s\n", tmp, ref.SetOp)
+	return tmp, nil
 }
 
 // genCallValue compiles a call expression used as a value. Only the

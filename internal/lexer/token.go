@@ -61,11 +61,13 @@ const (
 	Comma
 	Question
 
-	// operators (cascade_spec.md §6). "=" (Step 2), the arithmetic/
-	// comparison/logical set (Step 3), and the bitwise/shift set below
-	// (Step 4). Unary "*"/"&" (pointers, Step 8), postfix "?" (Step 11),
-	// and "|>" (Step 12) are lexed starting in the steps that introduce
-	// them (see lexer.go's package doc).
+	// operators (cascade_spec.md §6, §5 for the compound-assignment/
+	// inc-dec set). "=" (Step 2), the arithmetic/comparison/logical set
+	// (Step 3), the bitwise/shift set (Step 4), and the compound-
+	// assignment/inc-dec set below (Step 5). Unary "*"/"&" (pointers,
+	// Step 8), postfix "?" (Step 11), and "|>" (Step 12) are lexed
+	// starting in the steps that introduce them (see lexer.go's package
+	// doc).
 	Assign
 	Plus
 	Minus
@@ -88,6 +90,13 @@ const (
 	Tilde  // "~" (unary bitwise NOT)
 	Shl    // "<<"
 	Shr    // ">>"
+	PlusAssign
+	MinusAssign
+	StarAssign
+	SlashAssign
+	PercentAssign
+	Inc // "++"
+	Dec // "--"
 )
 
 // keywords holds Cascade's full reserved-word set (cascade_spec.md §14).

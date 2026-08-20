@@ -2,16 +2,17 @@
 // cascade_spec.md §1: newlines are significant statement terminators, and
 // "//" starts a line comment.
 //
-// Only the punctuation/operators Steps 1-4 need are lexed so far — "(",
+// Only the punctuation/operators Steps 1-5 need are lexed so far — "(",
 // ")", "{", "}", ":", ",", "?" (nullable-type suffix, §2.3), "=" (plain
 // assignment, §5), §6's arithmetic/comparison/logical operators ("+" "-"
-// "*" "/" "%" "==" "!=" "<" "<=" ">" ">=" "&&" "||" "!"), and §6's bitwise/
-// shift operators ("&" "|" "^" "&^" "~" "<<" ">>"). Unary "*"/"&"
-// (pointers, Step 8), postfix "?" (Step 11), and "|>" (Step 12) are lexed
-// starting in the steps that introduce them. The full keyword set (§14)
-// is already reserved from the start (see token.go), since adding a
-// keyword later is free but an identifier silently becoming a keyword out
-// from under existing code is not.
+// "*" "/" "%" "==" "!=" "<" "<=" ">" ">=" "&&" "||" "!"), §6's bitwise/
+// shift operators ("&" "|" "^" "&^" "~" "<<" ">>"), and §5's compound-
+// assignment/inc-dec set ("+=" "-=" "*=" "/=" "%=" "++" "--"). Unary
+// "*"/"&" (pointers, Step 8), postfix "?" (Step 11), and "|>" (Step 12)
+// are lexed starting in the steps that introduce them. The full keyword
+// set (§14) is already reserved from the start (see token.go), since
+// adding a keyword later is free but an identifier silently becoming a
+// keyword out from under existing code is not.
 package lexer
 
 import (
@@ -228,15 +229,23 @@ func (l *Lexer) lexOperator(line int) (Token, error) {
 	case '?':
 		return Token{Kind: Question, Literal: "?", Line: line}, nil
 	case '+':
-		return Token{Kind: Plus, Literal: "+", Line: line}, nil
+		if l.peekRune() == '+' {
+			l.pos++
+			return Token{Kind: Inc, Literal: "++", Line: line}, nil
+		}
+		return two('=', PlusAssign, Plus), nil
 	case '-':
-		return Token{Kind: Minus, Literal: "-", Line: line}, nil
+		if l.peekRune() == '-' {
+			l.pos++
+			return Token{Kind: Dec, Literal: "--", Line: line}, nil
+		}
+		return two('=', MinusAssign, Minus), nil
 	case '*':
-		return Token{Kind: Star, Literal: "*", Line: line}, nil
+		return two('=', StarAssign, Star), nil
 	case '/':
-		return Token{Kind: Slash, Literal: "/", Line: line}, nil
+		return two('=', SlashAssign, Slash), nil
 	case '%':
-		return Token{Kind: Percent, Literal: "%", Line: line}, nil
+		return two('=', PercentAssign, Percent), nil
 	case '=':
 		return two('=', Eq, Assign), nil
 	case '!':

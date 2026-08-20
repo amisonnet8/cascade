@@ -2,19 +2,17 @@
 // hand-written recursive-descent parsing (see CLAUDE.md's "確定した設計判断"
 // for why no parser generator is used).
 //
-// The grammar implemented here is intentionally a small subset of
-// cascade_spec.md: a top-level func declaration with a scalar parameter
-// list and an optional single scalar return type, a block of statements
-// limited to `let`/`const` declarations, a call-expression statement,
-// scalar assignment, and return, and expressions limited to literals
-// (including nullable-type `T?` declarations and the `none` literal),
-// identifiers, and calls — enough for Steps 1-2 (bootstrap; variables,
-// scalar types, and null semantics). Later development steps extend this
-// grammar one feature at a time; expressions in particular grow into a
-// full operator-precedence (Pratt) parser once Step 3 lands (cascade_spec.md
-// §6's precedence table), and `is none`/`is not none` (§7) is parsed
-// starting in Step 5, the only place the spec actually uses it (as an
-// `if` condition).
+// The grammar implemented here is intentionally a subset of
+// cascade_spec.md: top-level func declarations; a block of statements
+// covering `let`/`const` declarations, a call-expression statement,
+// scalar/compound assignment, `++`/`--`, `return`, `if`/`elif`/`else`,
+// `while`, `switch` (tagged and untagged), and `break`/`continue`; and a
+// full operator-precedence expression grammar (§6), literals (including
+// nullable-type `T?` declarations and the `none` literal), variable
+// references, and `is none`/`is not none` (§7) directly on an atom (the
+// only place the spec actually uses it — as an `if`/`switch` condition).
+// Later development steps extend this grammar further (functions,
+// structs, closures, ...) one feature at a time.
 package parser
 
 import (
@@ -203,11 +201,167 @@ func (p *parser) parseStmt() (ast.Stmt, error) {
 		return p.parseReturnStmt()
 	case lexer.KwLet, lexer.KwConst:
 		return p.parseLetDecl()
+	case lexer.KwIf:
+		return p.parseIfStmt()
+	case lexer.KwWhile:
+		return p.parseWhileStmt()
+	case lexer.KwSwitch:
+		return p.parseSwitchStmt()
+	case lexer.KwBreak:
+		tok := p.advance()
+		return &ast.BreakStmt{Line: tok.Line}, nil
+	case lexer.KwContinue:
+		tok := p.advance()
+		return &ast.ContinueStmt{Line: tok.Line}, nil
 	case lexer.Ident:
 		return p.parseIdentStmt()
 	default:
 		return nil, fmt.Errorf("line %d: unexpected token %q", p.cur().Line, p.cur().Literal)
 	}
+}
+
+// parseIfStmt parses an if/elif/else chain. `elif`/`else` must follow the
+// previous block's closing '}' on the same line (no newline in between):
+// a newline there ends the if-statement, same as any other statement, so
+// a lone `elif`/`else` on its own line is correctly a syntax error rather
+// than silently chaining (mirrors Seed's identical if/elif/else parsing).
+func (p *parser) parseIfStmt() (ast.Stmt, error) {
+	kw := p.advance() // 'if'
+	stmt := &ast.IfStmt{Line: kw.Line}
+
+	clause, err := p.parseIfClause()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Clauses = append(stmt.Clauses, clause)
+
+	for p.cur().Kind == lexer.KwElif {
+		p.advance()
+		clause, err := p.parseIfClause()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Clauses = append(stmt.Clauses, clause)
+	}
+
+	if p.cur().Kind == lexer.KwElse {
+		p.advance()
+		body, err := p.parseBlock()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Else = body
+	}
+
+	return stmt, nil
+}
+
+func (p *parser) parseIfClause() (ast.IfClause, error) {
+	cond, err := p.parseExpr()
+	if err != nil {
+		return ast.IfClause{}, err
+	}
+	body, err := p.parseBlock()
+	if err != nil {
+		return ast.IfClause{}, err
+	}
+	return ast.IfClause{Cond: cond, Body: body}, nil
+}
+
+func (p *parser) parseWhileStmt() (ast.Stmt, error) {
+	kw := p.advance() // 'while'
+	cond, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	body, err := p.parseBlock()
+	if err != nil {
+		return nil, err
+	}
+	return &ast.WhileStmt{Cond: cond, Body: body, Line: kw.Line}, nil
+}
+
+// parseSwitchStmt parses both switch forms (cascade_spec.md §7): tagged
+// (`switch tag { case v1, v2: ... }`, immediately followed by '{') and
+// untagged (`switch { case cond: ... }`). Only the tagged form allows a
+// comma-separated case (the spec's untagged examples never show one —
+// see ast.SwitchCase's doc).
+func (p *parser) parseSwitchStmt() (ast.Stmt, error) {
+	kw := p.advance() // 'switch'
+	stmt := &ast.SwitchStmt{Line: kw.Line}
+
+	if p.cur().Kind != lexer.LBrace {
+		tag, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Tag = tag
+	}
+
+	if _, err := p.expect(lexer.LBrace, "'{'"); err != nil {
+		return nil, err
+	}
+	p.skipNewlines()
+
+	for p.cur().Kind == lexer.KwCase {
+		caseTok := p.advance()
+		var values []ast.Expr
+		for {
+			v, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			values = append(values, v)
+			if stmt.Tag == nil || p.cur().Kind != lexer.Comma {
+				break
+			}
+			p.advance()
+		}
+		if _, err := p.expect(lexer.Colon, "':'"); err != nil {
+			return nil, err
+		}
+		p.skipNewlines()
+		body, err := p.parseCaseBody()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Cases = append(stmt.Cases, ast.SwitchCase{Values: values, Body: body, Line: caseTok.Line})
+	}
+
+	if p.cur().Kind == lexer.KwDefault {
+		p.advance()
+		if _, err := p.expect(lexer.Colon, "':'"); err != nil {
+			return nil, err
+		}
+		p.skipNewlines()
+		body, err := p.parseCaseBody()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Default = body
+	}
+
+	if _, err := p.expect(lexer.RBrace, "'}'"); err != nil {
+		return nil, err
+	}
+	return stmt, nil
+}
+
+// parseCaseBody parses a `case`/`default` clause's statements. Unlike
+// every other block, a case body is not wrapped in its own '{' '}' (see
+// cascade_spec.md §7's examples) — it simply runs until the next `case`,
+// `default`, or the switch's closing '}'.
+func (p *parser) parseCaseBody() ([]ast.Stmt, error) {
+	var stmts []ast.Stmt
+	for p.cur().Kind != lexer.KwCase && p.cur().Kind != lexer.KwDefault && p.cur().Kind != lexer.RBrace {
+		stmt, err := p.parseStmt()
+		if err != nil {
+			return nil, err
+		}
+		stmts = append(stmts, stmt)
+		p.skipNewlines()
+	}
+	return stmts, nil
 }
 
 // parseLetDecl parses a `let`/`const` declaration (cascade_spec.md §4.2):
@@ -245,27 +399,49 @@ func (p *parser) parseLetDecl() (ast.Stmt, error) {
 	return decl, nil
 }
 
+// compoundAssignOps maps a compound-assignment token to its ast.Op string
+// (cascade_spec.md §5).
+var compoundAssignOps = map[lexer.Kind]string{
+	lexer.PlusAssign:    "+",
+	lexer.MinusAssign:   "-",
+	lexer.StarAssign:    "*",
+	lexer.SlashAssign:   "/",
+	lexer.PercentAssign: "%",
+}
+
 // parseIdentStmt parses a statement starting with an identifier: a call
-// expression (`f(...)`) or a scalar assignment (`name = value`,
-// cascade_spec.md §5).
+// expression (`f(...)`), a scalar assignment (`name = value`), a compound
+// assignment (`name += value` etc.), or `name++`/`name--`
+// (cascade_spec.md §5).
 func (p *parser) parseIdentStmt() (ast.Stmt, error) {
 	name := p.advance() // Ident
-	switch p.cur().Kind {
-	case lexer.LParen:
+	switch {
+	case p.cur().Kind == lexer.LParen:
 		call, err := p.parseCallExprFrom(name)
 		if err != nil {
 			return nil, err
 		}
 		return &ast.ExprStmt{X: call, Line: call.Line}, nil
-	case lexer.Assign:
+	case p.cur().Kind == lexer.Assign:
 		p.advance()
 		val, err := p.parseExpr()
 		if err != nil {
 			return nil, err
 		}
 		return &ast.AssignStmt{Name: name.Literal, Value: val, Line: name.Line}, nil
+	case compoundAssignOps[p.cur().Kind] != "":
+		op := compoundAssignOps[p.cur().Kind]
+		p.advance()
+		val, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &ast.CompoundAssignStmt{Name: name.Literal, Op: op, Value: val, Line: name.Line}, nil
+	case p.cur().Kind == lexer.Inc || p.cur().Kind == lexer.Dec:
+		opTok := p.advance()
+		return &ast.IncDecStmt{Name: name.Literal, Op: opTok.Literal, Line: name.Line}, nil
 	default:
-		return nil, fmt.Errorf("line %d: expected '(' or '=' after %q", p.cur().Line, name.Literal)
+		return nil, fmt.Errorf("line %d: expected '(', '=', a compound assignment, or '++'/'--' after %q", p.cur().Line, name.Literal)
 	}
 }
 
@@ -410,10 +586,40 @@ func (p *parser) parseUnary() (ast.Expr, error) {
 	return p.parsePrimary()
 }
 
-// parsePrimary parses a literal, identifier, call, or parenthesized
+// parsePrimary parses a primary atom, then wraps it in `is none`/`is not
+// none` (cascade_spec.md §7) if one directly follows — the tightest
+// binding possible, matching every spec example (always a bare
+// identifier immediately followed by `is`).
+func (p *parser) parsePrimary() (ast.Expr, error) {
+	x, err := p.parsePrimaryAtom()
+	if err != nil {
+		return nil, err
+	}
+	if p.cur().Kind == lexer.KwIs {
+		return p.parseNullCheck(x)
+	}
+	return x, nil
+}
+
+// parseNullCheck parses the `is none`/`is not none` suffix onto an
+// already-parsed atom x.
+func (p *parser) parseNullCheck(x ast.Expr) (ast.Expr, error) {
+	isTok := p.advance() // 'is'
+	not := false
+	if p.cur().Kind == lexer.KwNot {
+		p.advance()
+		not = true
+	}
+	if _, err := p.expect(lexer.KwNone, "'none'"); err != nil {
+		return nil, err
+	}
+	return &ast.NullCheckExpr{X: x, Not: not, Line: isTok.Line}, nil
+}
+
+// parsePrimaryAtom parses a literal, identifier, call, or parenthesized
 // expression (§6 priority 1's grouping form; ".", "[]", and postfix "?"
 // join in later steps).
-func (p *parser) parsePrimary() (ast.Expr, error) {
+func (p *parser) parsePrimaryAtom() (ast.Expr, error) {
 	tok := p.cur()
 	switch tok.Kind {
 	case lexer.LParen:

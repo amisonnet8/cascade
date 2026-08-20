@@ -1,6 +1,7 @@
 package codegen_test
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 
@@ -248,5 +249,218 @@ func TestGenerate_StringConversion(t *testing.T) {
 				t.Fatalf("expected IR to call %s; got:\n%s", tt.wantCall, ir)
 			}
 		})
+	}
+}
+
+// labelDefRe/labelRefRe/assertLabelsResolve check IR well-formedness at
+// the label level: every "#Lx" a GOTO/IF/CASE... jumps to must actually
+// be defined by a LABEL somewhere in the same IR. This is the kind of
+// mistake seed_implementation_notes.md §1 warns is easy to make and easy
+// to miss just by reading generated IR text.
+var (
+	labelDefRe = regexp.MustCompile(`(?m)^\tLABEL\t#(\w+)`)
+	labelRefRe = regexp.MustCompile(`#(\w+)`)
+)
+
+func assertLabelsResolve(t *testing.T, ir string) {
+	t.Helper()
+	defined := map[string]bool{}
+	for _, m := range labelDefRe.FindAllStringSubmatch(ir, -1) {
+		defined[m[1]] = true
+	}
+	for _, m := range labelRefRe.FindAllStringSubmatch(ir, -1) {
+		if !defined[m[1]] {
+			t.Fatalf("label #%s is referenced but never defined by a LABEL; IR:\n%s", m[1], ir)
+		}
+	}
+}
+
+// TestGenerate_VarHoistingAcrossIfElifElse is the direct regression test
+// for seed_implementation_notes.md §1: a `let` declared inside an elif/
+// else body must still be hoisted above every IF/GOTO/LABEL in the
+// function, or the generated Go fails with "goto jumps over variable
+// declaration" the moment an earlier IF's jump skips past its clause.
+func TestGenerate_VarHoistingAcrossIfElifElse(t *testing.T) {
+	ir := generate(t, `
+func main(): int {
+	let x = 1
+	if x == 1 {
+		let a = 10
+		print(string(a))
+	} elif x == 2 {
+		let b = 20
+		print(string(b))
+	} else {
+		let c = 30
+		print(string(c))
+	}
+	return 0
+}
+`)
+	mainBody := ir[:strings.Index(ir, "ENDFUNC")]
+	lastVar := strings.LastIndex(mainBody, "\tVAR\t")
+	firstControl := -1
+	for _, instr := range []string{"\tIF\t", "\tGOTO\t", "\tLABEL\t"} {
+		if i := strings.Index(mainBody, instr); i != -1 && (firstControl == -1 || i < firstControl) {
+			firstControl = i
+		}
+	}
+	if lastVar == -1 || firstControl == -1 || lastVar > firstControl {
+		t.Fatalf("expected every VAR (including ones declared inside if/elif/else bodies) to precede every IF/GOTO/LABEL; got:\n%s", ir)
+	}
+	assertLabelsResolve(t, ir)
+}
+
+// TestGenerate_ControlFlowLabelsResolve is a broad well-formedness check
+// across if/elif/else, while, switch (tagged and untagged), break, and
+// continue together — every jump target must be defined.
+func TestGenerate_ControlFlowLabelsResolve(t *testing.T) {
+	ir := generate(t, `
+func main(): int {
+	let i = 0
+	while i < 10 {
+		i++
+		if i == 3 {
+			continue
+		}
+		if i == 5 {
+			break
+		}
+		switch i {
+		case 1, 2:
+			print("low")
+		default:
+			print("other")
+		}
+		switch {
+		case i > 7:
+			print("high")
+		default:
+			print("mid")
+		}
+	}
+	return 0
+}
+`)
+	assertLabelsResolve(t, ir)
+}
+
+// TestGenerate_BreakInSwitchDoesNotTargetEnclosingLoop locks in
+// funcGen's separate break/continue stacks (cascade_spec.md §7: break
+// exits the innermost loop *or* switch; continue always skips over a
+// switch to reach the innermost loop). A switch pushes only a break
+// target, never a continue target, so `continue` inside a switch must
+// still resolve to the while's start label, not fail to compile.
+func TestGenerate_ContinueInSwitchTargetsEnclosingLoop(t *testing.T) {
+	ir := generate(t, `
+func main(): int {
+	let i = 0
+	while i < 5 {
+		i++
+		switch {
+		case i == 2:
+			continue
+		}
+	}
+	return 0
+}
+`)
+	assertLabelsResolve(t, ir)
+	// The while loop's start label is the very first LABEL emitted.
+	m := labelDefRe.FindStringSubmatch(ir)
+	if m == nil {
+		t.Fatalf("expected at least one LABEL in IR:\n%s", ir)
+	}
+	startLabel := m[1]
+	if !strings.Contains(ir, "GOTO\t#"+startLabel+"\n") {
+		t.Fatalf("expected continue (inside the switch) to GOTO the while's start label #%s; got:\n%s", startLabel, ir)
+	}
+}
+
+func TestGenerate_NullCheck(t *testing.T) {
+	// "is not none" reads the isset flag directly, with no extra
+	// instruction.
+	ir := generate(t, `
+func main(): int {
+	let x: int? = 1
+	let ok = x is not none
+	return 0
+}
+`)
+	if !strings.Contains(ir, "SET\t%ok_2\t%x_1_isset\n") {
+		t.Fatalf("expected 'is not none' to read the isset flag directly; got:\n%s", ir)
+	}
+
+	// "is none" negates it via NOT.
+	ir = generate(t, `
+func main(): int {
+	let x: int? = 1
+	let ok = x is none
+	return 0
+}
+`)
+	if !strings.Contains(ir, "\tNOT\t") {
+		t.Fatalf("expected 'is none' to emit NOT over the isset flag; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_SwitchTaggedComparesWithEQ(t *testing.T) {
+	ir := generate(t, `
+func main(): int {
+	let day = 3
+	switch day {
+	case 1, 7:
+		print("weekend")
+	default:
+		print("weekday")
+	}
+	return 0
+}
+`)
+	if !strings.Contains(ir, "\tEQ\t") {
+		t.Fatalf("expected a tagged switch to compare case values with EQ; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_SwitchUntaggedDoesNotCompareWithEQ(t *testing.T) {
+	ir := generate(t, `
+func main(): int {
+	let score = 85
+	switch {
+	case score >= 90:
+		print("A")
+	default:
+		print("B")
+	}
+	return 0
+}
+`)
+	if strings.Contains(ir, "\tEQ\t") {
+		t.Fatalf("expected an untagged switch to use its case conditions directly, not EQ; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "\tGTE\t") {
+		t.Fatalf("expected the '>=' case condition to emit GTE; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_CompoundAssignAndIncDec(t *testing.T) {
+	ir := generate(t, `
+func main(): int {
+	let x = 1
+	x += 2
+	x++
+	let s = "a"
+	s += "b"
+	return 0
+}
+`)
+	if !strings.Contains(ir, "ADD\t%x_1\t%x_1\t2\n") {
+		t.Fatalf("expected 'x += 2' to emit ADD with the target reused as both operands; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "ADD\t%x_1\t%x_1\t1\n") {
+		t.Fatalf("expected 'x++' to emit ADD x x 1; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "CONCAT\t%s_2\t%s_2\t\"b\"\n") {
+		t.Fatalf("expected 's += \"b\"' on a string to emit CONCAT, not ADD; got:\n%s", ir)
 	}
 }

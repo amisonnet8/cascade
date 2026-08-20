@@ -88,6 +88,96 @@ type AssignStmt struct {
 
 func (*AssignStmt) stmtNode() {}
 
+// CompoundAssignStmt is a compound assignment (cascade_spec.md §5): `name
+// op= Value` where op is one of + - * / %. Like `++`/`--`, this only
+// exists as a statement, never inside an expression.
+type CompoundAssignStmt struct {
+	Name  string
+	Op    string // "+", "-", "*", "/", "%"
+	Value Expr
+	Line  int
+}
+
+func (*CompoundAssignStmt) stmtNode() {}
+
+// IncDecStmt is a postfix `name++` or `name--` statement (cascade_spec.md
+// §5).
+type IncDecStmt struct {
+	Name string
+	Op   string // "++" or "--"
+	Line int
+}
+
+func (*IncDecStmt) stmtNode() {}
+
+// IfClause is one `if`/`elif` condition-and-body pair.
+type IfClause struct {
+	Cond Expr
+	Body []Stmt
+}
+
+// IfStmt is an if/elif/else chain (cascade_spec.md §7). Clauses holds the
+// `if` clause followed by zero or more `elif` clauses, in source order.
+// Else is nil when there is no `else` clause.
+type IfStmt struct {
+	Clauses []IfClause
+	Else    []Stmt
+	Line    int
+}
+
+func (*IfStmt) stmtNode() {}
+
+// WhileStmt is a `while` loop (cascade_spec.md §7).
+type WhileStmt struct {
+	Cond Expr
+	Body []Stmt
+	Line int
+}
+
+func (*WhileStmt) stmtNode() {}
+
+// BreakStmt exits the innermost enclosing loop or switch (cascade_spec.md
+// §7).
+type BreakStmt struct {
+	Line int
+}
+
+func (*BreakStmt) stmtNode() {}
+
+// ContinueStmt advances the innermost enclosing loop to its next
+// iteration, skipping over any enclosing switch (cascade_spec.md §7:
+// "`switch`自体はループではない").
+type ContinueStmt struct {
+	Line int
+}
+
+func (*ContinueStmt) stmtNode() {}
+
+// SwitchCase is one `case` clause (cascade_spec.md §7). Values holds one
+// or more comma-separated candidate values for a tagged switch (compared
+// for equality against SwitchStmt.Tag), or exactly one boolean condition
+// for an untagged switch (the spec's own examples never show a
+// comma-separated untagged case, so the parser only allows one there).
+type SwitchCase struct {
+	Values []Expr
+	Body   []Stmt
+	Line   int
+}
+
+// SwitchStmt is a `switch` statement (cascade_spec.md §7), tagged (Tag
+// non-nil, each case's Values compared for equality against it) or
+// untagged (Tag nil, each case's Values[0] is itself a boolean condition,
+// evaluated top to bottom). Default is nil when there is no `default`
+// clause.
+type SwitchStmt struct {
+	Tag     Expr
+	Cases   []SwitchCase
+	Default []Stmt
+	Line    int
+}
+
+func (*SwitchStmt) stmtNode() {}
+
 // Expr is implemented by every expression node.
 type Expr interface{ exprNode() }
 
@@ -159,11 +249,11 @@ type CallExpr struct {
 
 func (*CallExpr) exprNode() {}
 
-// UnaryExpr is a prefix unary operator (cascade_spec.md §6): "!" or "-" so
-// far — "*"/"&"/"~" are added once pointers (Step 8) and bitwise ops
-// (Step 4) land. ResultType is filled in by sema.Check; codegen relies on
-// it to pick the right AMIVM-IR type for the temporary holding the result
-// (the same ast-annotation pattern LetDecl.ResolvedType uses).
+// UnaryExpr is a prefix unary operator (cascade_spec.md §6): "!", "-", or
+// "~" so far — "*"/"&" join once pointers land (Step 8). ResultType is
+// filled in by sema.Check; codegen relies on it to pick the right
+// AMIVM-IR type for the temporary holding the result (the same
+// ast-annotation pattern LetDecl.ResolvedType uses).
 type UnaryExpr struct {
 	Op         string
 	X          Expr
@@ -174,11 +264,10 @@ type UnaryExpr struct {
 func (*UnaryExpr) exprNode() {}
 
 // BinaryExpr is a binary operator expression (cascade_spec.md §6): the
-// arithmetic ("+" "-" "*" "/" "%"), comparison ("==" "!=" "<" "<=" ">"
-// ">="), and logical ("&&" "||") operators so far — bitwise/shift land in
-// Step 4. ResultType is filled in by sema.Check; codegen relies on it both
-// to pick the right AMIVM-IR type for the temporary holding the result,
-// and to disambiguate "+" (ADD for int/float, CONCAT for string).
+// arithmetic, comparison, logical, and bitwise/shift operators.
+// ResultType is filled in by sema.Check; codegen relies on it both to
+// pick the right AMIVM-IR type for the temporary holding the result, and
+// to disambiguate "+" (ADD for int/float, CONCAT for string).
 type BinaryExpr struct {
 	Op         string
 	X, Y       Expr
@@ -187,6 +276,19 @@ type BinaryExpr struct {
 }
 
 func (*BinaryExpr) exprNode() {}
+
+// NullCheckExpr is `X is none` (Not=false) or `X is not none` (Not=true),
+// cascade_spec.md §7. It binds at parsePrimary's precedence (tighter than
+// any operator), directly wrapping the atom it applies to — the spec only
+// ever shows it applied to a bare identifier, which sema.Check enforces
+// (see CLAUDE.md's "確定した設計判断" for why only this shape is supported).
+type NullCheckExpr struct {
+	X    Expr
+	Not  bool
+	Line int
+}
+
+func (*NullCheckExpr) exprNode() {}
 
 // StmtLine returns the source line a statement node was parsed from.
 func StmtLine(s Stmt) int {
@@ -198,6 +300,20 @@ func StmtLine(s Stmt) int {
 	case *LetDecl:
 		return v.Line
 	case *AssignStmt:
+		return v.Line
+	case *CompoundAssignStmt:
+		return v.Line
+	case *IncDecStmt:
+		return v.Line
+	case *IfStmt:
+		return v.Line
+	case *WhileStmt:
+		return v.Line
+	case *BreakStmt:
+		return v.Line
+	case *ContinueStmt:
+		return v.Line
+	case *SwitchStmt:
 		return v.Line
 	default:
 		return 0
@@ -224,6 +340,8 @@ func ExprLine(e Expr) int {
 	case *UnaryExpr:
 		return v.Line
 	case *BinaryExpr:
+		return v.Line
+	case *NullCheckExpr:
 		return v.Line
 	default:
 		return 0

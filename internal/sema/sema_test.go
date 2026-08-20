@@ -435,3 +435,208 @@ func main(): int {
 		})
 	}
 }
+
+func TestCheck_ValidControlFlow(t *testing.T) {
+	src := `
+func main(): int {
+	let x = 15
+	if x < 10 {
+		print("small")
+	} elif x < 20 {
+		print("medium")
+	} else {
+		print("large")
+	}
+
+	let i = 0
+	while i < 10 {
+		i += 1
+		if i % 2 == 0 {
+			continue
+		}
+		if i > 7 {
+			break
+		}
+	}
+
+	let day = 3
+	switch day {
+	case 1, 7:
+		print("weekend")
+	case 2, 3, 4, 5, 6:
+		print("weekday")
+	default:
+		print("invalid")
+	}
+
+	switch {
+	case day >= 5:
+		print("late")
+	default:
+		print("early")
+	}
+
+	let maybeName: string? = "Cascade"
+	if maybeName is none {
+		return 1
+	}
+	print("name=" + maybeName)
+
+	let maybeAge: int? = 30
+	if maybeAge is not none {
+		print("age=" + string(maybeAge))
+	} else {
+		print("no age")
+	}
+
+	return 0
+}
+`
+	if err := check(t, src); err != nil {
+		t.Fatalf("Check() = %v, want nil", err)
+	}
+}
+
+func TestCheck_ControlFlowErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		src     string
+		wantErr string
+	}{
+		{
+			name: "if condition must be bool",
+			src: `
+func main(): int {
+	if 1 {
+		return 0
+	}
+	return 0
+}
+`,
+			wantErr: "if condition must be bool, got int",
+		},
+		{
+			name: "while condition must be bool",
+			src: `
+func main(): int {
+	while 1 {
+		return 0
+	}
+	return 0
+}
+`,
+			wantErr: "while condition must be bool, got int",
+		},
+		{
+			name: "break outside a loop or switch",
+			src: `
+func main(): int {
+	break
+	return 0
+}
+`,
+			wantErr: "break outside of a loop or switch",
+		},
+		{
+			name: "continue outside a loop",
+			src: `
+func main(): int {
+	continue
+	return 0
+}
+`,
+			wantErr: "continue outside of a loop",
+		},
+		{
+			name: "continue inside a switch but outside any loop is still invalid",
+			src: `
+func main(): int {
+	switch {
+	case true:
+		continue
+	}
+	return 0
+}
+`,
+			wantErr: "continue outside of a loop",
+		},
+		{
+			name: "tagged switch case type must match the tag",
+			src: `
+func main(): int {
+	switch 1 {
+	case "a":
+		return 0
+	}
+	return 0
+}
+`,
+			wantErr: "case value type string does not match switch tag type int",
+		},
+		{
+			name: "untagged switch case must be bool",
+			src: `
+func main(): int {
+	switch {
+	case 1:
+		return 0
+	}
+	return 0
+}
+`,
+			wantErr: "case condition must be bool, got int",
+		},
+		{
+			name: "is none requires a nullable type",
+			src: `
+func main(): int {
+	let x = 1
+	if x is none {
+		return 0
+	}
+	return 0
+}
+`,
+			wantErr: "'is none' requires a nullable type, got int",
+		},
+		{
+			name: "variable declared inside an if body does not leak out",
+			src: `
+func main(): int {
+	if true {
+		let y = 1
+	}
+	let z = y
+	return 0
+}
+`,
+			wantErr: "undefined name \"y\"",
+		},
+		{
+			name: "narrowing does not apply without an unconditional exit",
+			src: `
+func main(): int {
+	let x: string? = "hi"
+	if x is none {
+		print("none")
+	}
+	print(x)
+	return 0
+}
+`,
+			wantErr: "print expects string, got string?",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := check(t, tt.src)
+			if err == nil {
+				t.Fatalf("Check() = nil, want error containing %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Check() = %q, want error containing %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}

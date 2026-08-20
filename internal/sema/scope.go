@@ -12,10 +12,9 @@ type varInfo struct {
 }
 
 // scope resolves names to varInfo within one nesting level. Every block
-// (cascade_spec.md §10) gets its own scope once Step 5 introduces nested
-// blocks (if/while/for); Steps 1-2 only ever have the single top-level
-// scope a function body starts with, but declareLocal/lookup are already
-// scope-chain-aware so that step needs no rework here.
+// (cascade_spec.md §10) gets its own scope — if/while/switch-case bodies
+// via checkBlock, and each if/elif/else clause additionally via
+// applyNarrowing (see sema.go) for cascade_spec.md §2.3's null-narrowing.
 type scope struct {
 	parent *scope
 	vars   map[string]varInfo
@@ -36,6 +35,15 @@ func (s *scope) declareLocal(name string, info varInfo) bool {
 	}
 	s.vars[name] = info
 	return true
+}
+
+// shadow unconditionally overwrites (or adds) name in s itself. Unlike
+// declareLocal, it never rejects an existing entry — it's for the
+// compiler's own null-narrowing overlay (cascade_spec.md §2.3), not a
+// user-facing `let`/`const` declaration, so the "already declared" check
+// that protects those doesn't apply here.
+func (s *scope) shadow(name string, info varInfo) {
+	s.vars[name] = info
 }
 
 // lookup resolves name by walking outward from s through parent scopes.
