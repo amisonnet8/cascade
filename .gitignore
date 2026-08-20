@@ -1,0 +1,18 @@
+# ビルド成果物
+/cascade
+
+# 参照用ローカルクローン(Cascadeリポジトリの一部ではない。CLAUDE.md参照)
+/seed/
+/amivm/
+
+# サンプル(.cascade)をコンパイルした際に生成される中間・出力ファイル(.cascade → .ir → .go)
+examples/**/*.ir
+examples/**/*.go
+testdata/**/*.ir
+testdata/**/*.go
+
+# エディタ・OS由来
+.DS_Store
+
+# 一時ファイル
+*.tmp
