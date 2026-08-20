@@ -1306,3 +1306,140 @@ func main(): int {
 	}
 	assertLabelsResolve(t, ir)
 }
+
+func TestGenerate_ChanTypeEmitsCHTYPE(t *testing.T) {
+	ir := generate(t, `
+source numbers(output: chan<int>) {
+	send(output, 1)
+}
+sink printAll(input: chan<int>) {
+	for n in input {
+		print(string(n))
+	}
+}
+func main(): int {
+	numbers |> printAll
+	return 0
+}
+`)
+	if !strings.Contains(ir, "CHTYPE\t^ChanType1\t^int\n") {
+		t.Fatalf("expected chan<int> to emit a top-level CHTYPE; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_SendCompilesToCHSEND(t *testing.T) {
+	ir := generate(t, `
+source numbers(output: chan<int>) {
+	send(output, 42)
+}
+sink printAll(input: chan<int>) {
+	for n in input {
+		print(string(n))
+	}
+}
+func main(): int {
+	numbers |> printAll
+	return 0
+}
+`)
+	if !strings.Contains(ir, "CHSEND\t$1\t42\n") {
+		t.Fatalf("expected send(output, 42) inside 'numbers' to compile to CHSEND $1 42; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_SourceAndStageDeferCloseTheirOutput(t *testing.T) {
+	ir := generate(t, `
+source numbers(output: chan<int>) {
+	send(output, 1)
+}
+stage double(input: chan<int>, output: chan<int>) {
+	for n in input {
+		send(output, n * 2)
+	}
+}
+sink printAll(input: chan<int>) {
+	for n in input {
+		print(string(n))
+	}
+}
+func main(): int {
+	numbers |> double |> printAll
+	return 0
+}
+`)
+	if !strings.Contains(ir, "FUNC\t!numbers\t^ChanType1\t:\n\tDEFER\t?close\t$1\n") {
+		t.Fatalf("expected 'numbers' (a source) to DEFER-close its own single (output) parameter as the first body instruction; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "FUNC\t!double\t^ChanType1\t^ChanType1\t:\n") || !strings.Contains(ir, "DEFER\t?close\t$2\n") {
+		t.Fatalf("expected 'double' (a stage) to DEFER-close its second (output) parameter; got:\n%s", ir)
+	}
+	if strings.Contains(ir, "FUNC\t!printAll") && strings.Contains(ir[strings.Index(ir, "FUNC\t!printAll"):], "DEFER") {
+		t.Fatalf("a sink has no output channel and must not emit any DEFER ?close; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_ForInChannelUsesCHRECVCommaOk(t *testing.T) {
+	ir := generate(t, `
+source numbers(output: chan<int>) {
+	send(output, 1)
+}
+sink printAll(input: chan<int>) {
+	for n in input {
+		print(string(n))
+	}
+}
+func main(): int {
+	numbers |> printAll
+	return 0
+}
+`)
+	printAllIR := ir[strings.Index(ir, "FUNC\t!printAll"):]
+	if !strings.Contains(printAllIR, "CHRECV\t%n_1\t%tmp_2\t$1\n") {
+		t.Fatalf("expected 'for n in input' to compile to a comma-ok CHRECV; got:\n%s", printAllIR)
+	}
+	if !strings.Contains(printAllIR, "IF\t%tmp_2\t#") {
+		t.Fatalf("expected the CHRECV's ok flag to drive the loop's IF; got:\n%s", printAllIR)
+	}
+	if strings.Contains(printAllIR, "AGET") {
+		t.Fatalf("a channel for-in must not use AGET (that's the list form); got:\n%s", printAllIR)
+	}
+	assertLabelsResolve(t, ir)
+}
+
+func TestGenerate_PipelineStmtSpawnsAllButTheSinkAndCallsSinkSynchronously(t *testing.T) {
+	ir := generate(t, `
+source numbers(output: chan<int>) {
+	send(output, 1)
+}
+stage double(input: chan<int>, output: chan<int>) {
+	for n in input {
+		send(output, n * 2)
+	}
+}
+sink printAll(input: chan<int>) {
+	for n in input {
+		print(string(n))
+	}
+}
+func main(): int {
+	numbers |> double |> printAll
+	return 0
+}
+`)
+	mainIR := ir[:strings.Index(ir, "ENDFUNC")]
+	if !strings.Contains(mainIR, "CHMAKE\t%tmp_1\t^ChanType1\t0\n") || !strings.Contains(mainIR, "CHMAKE\t%tmp_2\t^ChanType1\t0\n") {
+		t.Fatalf("expected one CHMAKE per inter-stage channel; got:\n%s", mainIR)
+	}
+	if !strings.Contains(mainIR, "SPAWN\t!numbers\t%tmp_1\n") {
+		t.Fatalf("expected the source to be SPAWNed against the first channel; got:\n%s", mainIR)
+	}
+	if !strings.Contains(mainIR, "SPAWN\t!double\t%tmp_1\t%tmp_2\n") {
+		t.Fatalf("expected the middle stage to be SPAWNed between both channels; got:\n%s", mainIR)
+	}
+	if !strings.Contains(mainIR, "CALL\t:\t!printAll\t%tmp_2\n") {
+		t.Fatalf("expected the sink to be called synchronously (not SPAWNed), blocking until the pipeline drains; got:\n%s", mainIR)
+	}
+	if strings.Contains(mainIR, "SPAWN\t!printAll") {
+		t.Fatalf("the sink must never be SPAWNed — the statement's own synchronous completion depends on calling it directly; got:\n%s", mainIR)
+	}
+}

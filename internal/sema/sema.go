@@ -1,7 +1,7 @@
 // Package sema performs semantic analysis on a Cascade ast.File, since
 // amivm delegates all type/scope checking to go/types and does not check
 // anything itself (see CLAUDE.md "意味検証の責任分担"). Only the checks
-// Steps 1-11 need are implemented so far: a single well-formed `main`
+// Steps 1-12 need are implemented so far: a single well-formed `main`
 // plus any number of other functions (§8.1) — including multi-value
 // returns (§8.5) — scope-resolved `let`/`const` declarations and scalar/
 // list-element/map-element/struct-field/compound assignment,
@@ -18,11 +18,14 @@
 // variable, and the filter/map/reduce builtins), maps (§2.2, §4.5 —
 // `map<K, V>` with a non-nullable scalar key and non-nullable value,
 // literals, `m[k]` returning `V?`, `m[k] = v`, `delete`, and the
-// two-variable `for k, v in m` form), and error handling (§8.6 — the
+// two-variable `for k, v in m` form), error handling (§8.6 — the
 // built-in `error` type, nullable return types in general (any function/
 // closure result may now be nullable, not just `error?`), and postfix
-// `expr?` propagation). Later steps add channels/pipelines and
-// everything past that.
+// `expr?` propagation), and pipeline basics (§9.1, §9.2 — `source`/
+// `stage`/`sink` declarations with chan<T> parameters, `send`, `for v in
+// channel`, and a `|>`-chained pipeline statement ending in a sink;
+// `collect`/`abort`/`merge`, §9.3-§9.5, are Step 13). Later steps add
+// packages and everything past that.
 //
 // A function whose non-void body doesn't obviously return on every path
 // isn't checked here (no control-flow reachability analysis is
@@ -53,6 +56,20 @@ type funcSig struct {
 	Results []ast.Type
 }
 
+// stageSig is one declared source/stage/sink's channel shape
+// (cascade_spec.md §9.1): the element type it receives on (HasInput) and/
+// or sends on (HasOutput) — a source has only an output, a sink only an
+// input, a stage both. checkPipelineStmt uses this to verify §9.2's
+// "隣り合うステージの出力型・入力型が一致" rule without re-walking each
+// stage's declared parameters every time a pipeline references it.
+type stageSig struct {
+	Kind       ast.StageKind
+	InputElem  ast.Type
+	HasInput   bool
+	OutputElem ast.Type
+	HasOutput  bool
+}
+
 // methodSig is one receiver function's signature (cascade_spec.md §8.2):
 // like funcSig, plus the receiver's own declared type (Name for a value
 // receiver, Ptr set for a pointer receiver — see receiverStructName).
@@ -76,6 +93,7 @@ type checker struct {
 	sigs    map[string]funcSig
 	structs map[string]*ast.StructDecl
 	methods map[string]map[string]methodSig // struct name -> method name -> sig
+	stages  map[string]stageSig             // source/stage/sink name -> channel shape
 
 	// closureDepth counts enclosing closure-literal bodies currently being
 	// checked (0 outside any closure). amivm's CLOS cannot itself contain
@@ -141,6 +159,7 @@ func Check(f *ast.File) error {
 		sigs:    map[string]funcSig{},
 		structs: map[string]*ast.StructDecl{"error": errorStructDecl},
 		methods: map[string]map[string]methodSig{},
+		stages:  map[string]stageSig{},
 	}
 
 	// Structs are registered in their own pass, before any field's type is
@@ -231,8 +250,40 @@ func Check(f *ast.File) error {
 		c.methods[structName][fn.Name] = methodSig{RecvType: fn.Receiver.Type, Params: params, Results: fn.Results}
 	}
 
+	// source/stage/sink names share c.sigs's own namespace (rather than a
+	// per-kind one, unlike methods — cascade_spec.md never shows a stage
+	// and a function sharing a name, and allowing it would make a
+	// pipeline reference like `numbers |> ...` ambiguous with a
+	// same-named plain function) — so a duplicate against an existing
+	// function (main included) is rejected the same way a duplicate
+	// function name already is.
+	for _, sd := range f.Stages {
+		if sd.Name == mainInternalName {
+			return fmt.Errorf("line %d: %q is a reserved name and cannot be used as a source/stage/sink name", sd.Line, mainInternalName)
+		}
+		if reservedBuiltinNames[sd.Name] {
+			return fmt.Errorf("line %d: %q is a builtin function name and cannot be redefined", sd.Line, sd.Name)
+		}
+		if _, exists := c.sigs[sd.Name]; exists {
+			return fmt.Errorf("line %d: %q is already declared as a function", sd.Line, sd.Name)
+		}
+		if _, exists := c.stages[sd.Name]; exists {
+			return fmt.Errorf("line %d: duplicate source/stage/sink %q", sd.Line, sd.Name)
+		}
+		sig, err := c.checkStageSig(sd)
+		if err != nil {
+			return err
+		}
+		c.stages[sd.Name] = sig
+	}
+
 	for _, fn := range f.Funcs {
 		if err := c.checkFuncBody(fn); err != nil {
+			return err
+		}
+	}
+	for _, sd := range f.Stages {
+		if err := c.checkStageBody(sd); err != nil {
 			return err
 		}
 	}
@@ -312,6 +363,127 @@ func (c *checker) checkFuncBody(fn *ast.FuncDecl) error {
 	return nil
 }
 
+// checkStageSig validates sd's declared parameter shape (cascade_spec.md
+// §9.1): a source takes exactly one channel parameter (its output), a
+// stage exactly two (input then output, positionally — see
+// ast.StageDecl's doc), a sink exactly one (its input) — and returns the
+// resulting stageSig for checkPipelineStmt to use later. Every parameter
+// must itself be a valid channel type (see validateChanParamType, the
+// one place chan<T> is actually allowed).
+func (c *checker) checkStageSig(sd *ast.StageDecl) (stageSig, error) {
+	switch sd.Kind {
+	case ast.SourceStage:
+		if len(sd.Params) != 1 {
+			return stageSig{}, fmt.Errorf("line %d: source %q must take exactly 1 parameter (its output channel), got %d", sd.Line, sd.Name, len(sd.Params))
+		}
+		elem, err := c.validateChanParamType(sd.Params[0].Type, sd.Params[0].Line)
+		if err != nil {
+			return stageSig{}, err
+		}
+		return stageSig{Kind: sd.Kind, OutputElem: elem, HasOutput: true}, nil
+	case ast.MiddleStage:
+		if len(sd.Params) != 2 {
+			return stageSig{}, fmt.Errorf("line %d: stage %q must take exactly 2 parameters (input then output channel), got %d", sd.Line, sd.Name, len(sd.Params))
+		}
+		inElem, err := c.validateChanParamType(sd.Params[0].Type, sd.Params[0].Line)
+		if err != nil {
+			return stageSig{}, err
+		}
+		outElem, err := c.validateChanParamType(sd.Params[1].Type, sd.Params[1].Line)
+		if err != nil {
+			return stageSig{}, err
+		}
+		return stageSig{Kind: sd.Kind, InputElem: inElem, HasInput: true, OutputElem: outElem, HasOutput: true}, nil
+	default: // ast.SinkStage
+		if len(sd.Params) != 1 {
+			return stageSig{}, fmt.Errorf("line %d: sink %q must take exactly 1 parameter (its input channel), got %d", sd.Line, sd.Name, len(sd.Params))
+		}
+		elem, err := c.validateChanParamType(sd.Params[0].Type, sd.Params[0].Line)
+		if err != nil {
+			return stageSig{}, err
+		}
+		return stageSig{Kind: sd.Kind, InputElem: elem, HasInput: true}, nil
+	}
+}
+
+// validateChanParamType validates one source/stage/sink parameter's type
+// (cascade_spec.md §9.1): it must be chan<T> — a channel type is
+// exclusively a pipeline parameter type, never a general-purpose one (see
+// ast.Type's doc for Chan, and validateType's own rejection of Chan
+// everywhere else) — with T itself a valid, non-channel type (validateType
+// recursing into T re-triggers that same Chan rejection if T is itself
+// chan<U>, so no separate check is needed here for that). Returns T.
+func (c *checker) validateChanParamType(t ast.Type, line int) (ast.Type, error) {
+	if t.Chan == nil {
+		return ast.Type{}, fmt.Errorf("line %d: source/stage/sink parameters must have a channel type (chan<T>), got %s", line, typeString(t))
+	}
+	if err := c.validateType(*t.Chan, line); err != nil {
+		return ast.Type{}, err
+	}
+	return *t.Chan, nil
+}
+
+// checkStageBody checks sd's body in a fresh scope pre-populated with its
+// parameters (cascade_spec.md §9.1) — mirrors checkFuncBody, except a
+// source/stage/sink never returns a value (want is nil, so a bare
+// `return` is the only form checkReturnStmt will accept) and has no
+// receiver.
+func (c *checker) checkStageBody(sd *ast.StageDecl) error {
+	sc := newScope(nil)
+	for _, p := range sd.Params {
+		if !sc.declareLocal(p.Name, varInfo{Type: p.Type}) {
+			return fmt.Errorf("line %d: duplicate parameter name %q", p.Line, p.Name)
+		}
+	}
+	c.currentFuncResults = nil
+	for _, stmt := range sd.Body {
+		if err := c.checkStmt(sc, stmt, nil, 0, 0); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkPipelineStmt validates a `|>`-chained pipeline statement
+// (cascade_spec.md §9.2): the first name must be a declared source, the
+// last a declared sink, every name in between a declared stage, and each
+// adjacent pair's channel element types must match exactly (Cascade never
+// does implicit conversion — the same rule every other type check in this
+// compiler follows). The value-producing `collect` terminal (§9.3) is
+// rejected outright here with an explicit "not implemented yet" error
+// (see ast.PipelineStmt's doc) rather than silently mistyped as an
+// undefined sink.
+func (c *checker) checkPipelineStmt(stmt *ast.PipelineStmt) error {
+	if len(stmt.Stages) < 2 {
+		return fmt.Errorf("line %d: a pipeline needs at least a source and a sink", stmt.Line)
+	}
+	for i, ref := range stmt.Stages {
+		if ref.Name == "collect" {
+			return fmt.Errorf("line %d: 'collect' is not implemented yet (Step 13)", ref.Line)
+		}
+		sig, ok := c.stages[ref.Name]
+		if !ok {
+			return fmt.Errorf("line %d: undefined source/stage/sink %q", ref.Line, ref.Name)
+		}
+		switch {
+		case i == 0 && sig.Kind != ast.SourceStage:
+			return fmt.Errorf("line %d: a pipeline must begin with a source, got %q", ref.Line, ref.Name)
+		case i == len(stmt.Stages)-1 && sig.Kind != ast.SinkStage:
+			return fmt.Errorf("line %d: a pipeline used as a statement must end with a sink (%q is not one) — use 'collect' to receive a value instead (not yet implemented, Step 13)", ref.Line, ref.Name)
+		case i > 0 && i < len(stmt.Stages)-1 && sig.Kind != ast.MiddleStage:
+			return fmt.Errorf("line %d: only a stage may appear in the middle of a pipeline, got %q", ref.Line, ref.Name)
+		}
+		if i > 0 {
+			prev := stmt.Stages[i-1]
+			prevSig := c.stages[prev.Name]
+			if !typeShapeEqual(prevSig.OutputElem, sig.InputElem) {
+				return fmt.Errorf("line %d: pipeline type mismatch: %q outputs chan<%s> but %q expects chan<%s>", ref.Line, prev.Name, typeString(prevSig.OutputElem), ref.Name, typeString(sig.InputElem))
+			}
+		}
+	}
+	return nil
+}
+
 // validateType reports whether t names a type sema recognizes: a builtin
 // scalar (int/float/string/bool), a list of a valid type, a pointer to a
 // valid type, a function type whose every parameter/result is itself
@@ -351,6 +523,9 @@ func (c *checker) validateType(t ast.Type, line int) error {
 			return fmt.Errorf("line %d: map value type cannot itself be nullable (m[k] already returns V?)", line)
 		}
 		return nil
+	}
+	if t.Chan != nil {
+		return fmt.Errorf("line %d: channel types (chan<T>) can only be used as a source/stage/sink parameter (cascade_spec.md §9.1)", line)
 	}
 	switch t.Name {
 	case "int", "float", "string", "bool":
@@ -441,6 +616,8 @@ func (c *checker) checkStmt(sc *scope, stmt ast.Stmt, want []ast.Type, loopDepth
 		return c.checkSwitchStmt(sc, s, want, loopDepth, breakDepth)
 	case *ast.ForInStmt:
 		return c.checkForInStmt(sc, s, want, loopDepth, breakDepth)
+	case *ast.PipelineStmt:
+		return c.checkPipelineStmt(s)
 	case *ast.BreakStmt:
 		if breakDepth == 0 {
 			return fmt.Errorf("line %d: break outside of a loop or switch", s.Line)
@@ -635,19 +812,19 @@ func (c *checker) checkSwitchStmt(sc *scope, stmt *ast.SwitchStmt, want []ast.Ty
 	return nil
 }
 
-// checkForInStmt checks `for x in List { ... }` over a list, or `for k,
-// v in M { ... }` over a map when ValueVarName is set (cascade_spec.md
-// §7): List/M must be non-nullable, and the loop variable(s) are
-// declared with their element (or key/value) type(s) in a fresh scope
-// wrapping the body (loopDepth+1, breakDepth+1, same as while — see
-// checkStmt's doc).
+// checkForInStmt checks `for x in List { ... }` over a list or a channel
+// (cascade_spec.md §7, §9.1), or `for k, v in M { ... }` over a map when
+// ValueVarName is set (§7): List/M must be non-nullable, and the loop
+// variable(s) are declared with their element (or key/value, or channel-
+// carried) type(s) in a fresh scope wrapping the body (loopDepth+1,
+// breakDepth+1, same as while — see checkStmt's doc).
 func (c *checker) checkForInStmt(sc *scope, stmt *ast.ForInStmt, want []ast.Type, loopDepth, breakDepth int) error {
 	t, err := c.exprType(sc, stmt.List)
 	if err != nil {
 		return err
 	}
 	if t.Nullable {
-		return fmt.Errorf("line %d: for-in requires a list or map, got %s", ast.ExprLine(stmt.List), typeString(t))
+		return fmt.Errorf("line %d: for-in requires a list, map, or channel, got %s", ast.ExprLine(stmt.List), typeString(t))
 	}
 
 	if stmt.ValueVarName != "" {
@@ -666,8 +843,18 @@ func (c *checker) checkForInStmt(sc *scope, stmt *ast.ForInStmt, want []ast.Type
 		return c.checkStmtsIn(inner, stmt.Body, want, loopDepth+1, breakDepth+1)
 	}
 
+	if t.Chan != nil {
+		stmt.ElemType = *t.Chan
+		stmt.IsChannel = true
+		inner := newScope(sc)
+		if !inner.declareLocal(stmt.VarName, varInfo{Type: stmt.ElemType}) {
+			return fmt.Errorf("line %d: %q is already declared in this scope (cascade_spec.md §10)", stmt.Line, stmt.VarName)
+		}
+		return c.checkStmtsIn(inner, stmt.Body, want, loopDepth+1, breakDepth+1)
+	}
+
 	if t.Elem == nil {
-		return fmt.Errorf("line %d: for-in requires a list, got %s", ast.ExprLine(stmt.List), typeString(t))
+		return fmt.Errorf("line %d: for-in requires a list, map, or channel, got %s", ast.ExprLine(stmt.List), typeString(t))
 	}
 	stmt.ElemType = *t.Elem
 
@@ -901,6 +1088,18 @@ func (c *checker) checkExprStmt(sc *scope, stmt *ast.ExprStmt) error {
 			return fmt.Errorf("line %d: print expects string, got %s", call.Line, typeString(t))
 		}
 		return nil
+	case "send":
+		if len(call.Args) != 2 {
+			return fmt.Errorf("line %d: send() expects exactly 2 arguments, got %d", call.Line, len(call.Args))
+		}
+		ct, err := c.exprType(sc, call.Args[0])
+		if err != nil {
+			return err
+		}
+		if ct.Chan == nil {
+			return fmt.Errorf("line %d: send() expects a channel as its first argument, got %s", ast.ExprLine(call.Args[0]), typeString(ct))
+		}
+		return c.checkAssignable(sc, *ct.Chan, call.Args[1])
 	case "delete":
 		if len(call.Args) != 2 {
 			return fmt.Errorf("line %d: delete() expects exactly 2 arguments, got %d", call.Line, len(call.Args))
@@ -1333,6 +1532,12 @@ func typeShapeEqual(a, b ast.Type) bool {
 	}
 	if a.Map != nil {
 		return typeShapeEqual(a.Map.Key, b.Map.Key) && typeShapeEqual(a.Map.Value, b.Map.Value)
+	}
+	if (a.Chan == nil) != (b.Chan == nil) {
+		return false
+	}
+	if a.Chan != nil {
+		return typeShapeEqual(*a.Chan, *b.Chan)
 	}
 	return a.Name == b.Name
 }
@@ -1849,6 +2054,9 @@ func typeString(t ast.Type) string {
 			return base + "?"
 		}
 		return base
+	}
+	if t.Chan != nil {
+		return "chan<" + typeString(*t.Chan) + ">"
 	}
 	if t.Nullable {
 		return t.Name + "?"

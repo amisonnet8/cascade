@@ -133,20 +133,16 @@ amivm <IRファイルパス> [-o|--output <出力ファイルパス>] [-v|--verb
 | `CHTYPE` `CHMAKE` `CHSEND` `CHRECV` | `chan<T>`・`send()`・`for v in someChannel`(9節) | 確定 |
 | `SPAWN` | `source`/`stage`/`sink`を`|>`で連結した際の各段の並行実行(9.2節) | 確定 |
 | `SEL` `CASESEND` `CASERECV` `DEFAULT` | `merge()`のファンイン実装(9.5節)。2チャネルのどちらか先に来た方を受け取るselect相当 | 確定(実装方針は下記オープン課題参照) |
-| `DEFER` | ユーザー向け構文としては存在しない。**候補**: `source`/`stage`本体の生成コード先頭で`DEFER : ?close 出力チャネル`し、関数(=ステージ)終了時に出力チャネルを自動closeして下流の`for-in`を終了させる、というコード生成側の内部利用 | **要検討**(下記オープン課題参照) |
+| `DEFER` | ユーザー向け構文としては存在しない。`source`/`stage`のFUNC本体先頭で`DEFER ?close $N`(出力チャネル)を無条件に発行し、関数(=ステージ)がどの経路で終了しても出力チャネルを自動closeして下流の`for-in`を終了させる、というコード生成側の内部利用。Step 12で実装・実地検証済み(下記「確定した設計判断」参照) | 確定 |
 
 ## オープンな設計課題(実装前に方針を確定させ、確定次第この節を書き換える)
 
 Seedと異なりCascadeは複数ファイル/パッケージ・null許容型・並行パイプラインという、Seedに無かった複雑さを持つ。以下は現時点で未確定の、最初に潰すべき設計課題。**[[Seed]]の「確定した設計判断」節(`seed/CLAUDE.md`)に倣い、決まったらここに確定内容として書き残すこと。仮説のまま放置しない。**
 
-### 1. パイプライン(9節)の並行実行モデル
+### 1. パイプライン(9節)の並行実行モデル(collect/abort/mergeのみ残課題)
 
-最も設計コストが高い箇所。`amivm/test_ir/11_spawn_channel_sel.ir`を実装前に必ず読むこと。
+最も設計コストが高い箇所。基礎部分(source/stage/sink・`|>`連結・send・for-inでのチャネル走査)はStep 12で確定・実装済み(下記「確定した設計判断」参照)。残るのは以下の3つ(Step 13で確定させる)。`amivm/test_ir/11_spawn_channel_sel.ir`を実装前に必ず読むこと。
 
-- `source`/`stage`/`sink`は各`SPAWN`されるgoroutine(`FUNC`)として生成
-- 段間の`chan<T>`は`CHTYPE`+`CHMAKE`
-- `for v in input`は`CHRECV`のcomma-ok形をループ条件に使い、`ok == false`(チャネルclose)でループを抜ける形になる見込み
-- 各段が処理を終えたら出力チャネルをcloseして下流に伝播させる必要がある(`DEFER : ?close 出力チャネル`が候補。上記命令使用ゴール表参照)
 - `collect`(9.3節): 終端チャネルを受信し続けて`[]T`に溜め込む専用のcollector goroutineを内部生成し、結果を`main`側が別チャネル経由で同期的に受け取る、という形が候補
 - `abort`(9.4節): 全ステージを即座に止める必要がある。**候補**: closeすることが一度きりの安全なブロードキャストになるGoの性質を使い、専用の`chan<bool>`(またはstring)をcloseすることで中断を通知し、各ステージの`for-in`ループを`SEL`(`CASERECV input` vs `CASERECV abortChan`)に変える
 - `merge`(9.5節): 2入力チャネルを`SEL`の`CASERECV`×2でファンインする専用goroutineとして実装する候補
@@ -308,6 +304,20 @@ Cascadeの`func main(): int`をamivmの`!main`へ直接対応させることは�
 
 `examples/11_errors.cas`(`divide`/`loadAndDouble`/`saveResult`/`process`/`mustBePositive`という値の伝播・式位置の`?`・文位置の`?`(戻り値破棄)・単一`error?`結果・クロージャーの`(T, error?)`という組み合わせ)で`amivm`→`go build`→実行まで確認済み。
 
+### パイプライン基礎(source/stage/sink・`|>`・send・チャネルfor-in)の設計(Step 12)
+
+**並行実行モデルは、オープン課題1で候補に挙げていた通りの形で確定した: `source`/`stage`/`sink`はそれぞれ独立した(通常の関数と同じ名前空間を共有する)トップレベル`FUNC`として生成し、`|>`で連結された際に先頭の`source`と間の`stage`群を`SPAWN`、末尾の`sink`だけを普通の`CALL`で同期的に呼び出す。** これにより、パイプライン文(`numbers |> double |> toString |> printAll`)全体はGoの「プロデューサをgoroutineとして起動し、最終コンシューマは呼び出し元のgoroutineで直接走らせる」という定番パターンに帰着し、`sink`の`CALL`が返るまで文全体が自然にブロックする(sinkの`for v in input`ループは、上流の全段が終了して出力チャネルをcloseし終えるまで戻らないため)。段間のチャネルは各接続ごとに新しく`CHMAKE`(バッファサイズ`0`、素朴な非バッファチャネルで正しさ上は十分——正しさはバッファ有無に依存せず、スループットのみに影響するため今回は最小の`0`を選んだ)。
+
+**「各段が処理を終えたら出力チャネルをcloseして下流に伝播させる」という命令使用ゴール表の`DEFER`候補が、想定通りそのまま実装できた。** `source`/`stage`のFUNC本体は、パラメータの巻き上げ(VAR hoisting)が終わった直後・ユーザー本体の最初の文より前に、無条件で`DEFER ?close $N`(`source`なら`$1`、`stage`なら`$2`——どちらも「自分の出力チャネル」)を発行する。Goの`defer`はどの経路で関数を抜けても(正常終了・早期`return`いずれでも)実行されるため、ユーザーが一切意識することなく「自分の仕事が終わったら出力チャネルを閉じる」が保証される。これが`for v in input`(下流のチャネルfor-in)が終了できる唯一の手がかりになる。`sink`は出力チャネルを持たないため、この`DEFER`は一切発行しない。
+
+**`for v in input`(チャネルの走査)は`CHRECV`のcomma-ok形をループ条件とループ本体の値取得の両方に使う、リスト/mapのfor-inとは全く異なる形になった。** リストfor-in(Step 6)・mapのfor-in(Step 10)はどちらも「インデックスカウンタ+`AGET`/`MGET`」という明示的なカウントループだったが、チャネルには「残り件数」という概念がそもそも無い——`CHRECV`自体が「値を受信できたか(`ok`)」を返すため、`ok`が`false`になった時点(=チャネルがcloseされ、かつバッファが空になった時点)がそのままループ終了条件になる。結果として`continue`は(リスト/map形のような専用の「インクリメント直前」ラベルを経由せず)`while`ループの`continue`と全く同じ形で、次の`CHRECV`を発行する先頭ラベルへ直接ジャンプするだけで済んだ——インデックス変数もその増分ステップも存在しないため。`ast.ForInStmt`に新設した`IsChannel bool`(sema.Checkが設定)がこの3つ目の形をcodegen側で選び分ける——`ValueVarName`(map形の判別に使う既存フィールド)だけでは「単一変数だが実はチャネル」というリスト形との違いを表現できないため、`IndexExpr.ResultType.Nullable`(map読み取りとリスト読み取りを1フィールドで判別する、Step 10の既存パターン)のような転用ができず、素直に専用の bool フィールドを追加した。
+
+**`chan<T>`型はパイプライン専用の型として、`sema.validateType`が一般の型出現位置(構造体フィールド・通常関数の引数/戻り値・`let`宣言等)では明示的に拒否し、`source`/`stage`/`sink`のパラメータ位置(`validateChanParamType`)でのみ許可する形にした。** 2.2節の「`chan<T>`...(単独では宣言しない)」という注記を、素朴に「初期化式が無い宣言(ゼロ値が必要な文脈)だけ禁止する」ではなく、より踏み込んで「チャネル型そのものがパイプライン以外の場所に一切出現できない」という制約として解釈した——現時点でチャネル型を返す唯一の手段(`merge`)も、代入先(通常の値としての利用)もStep 13以前には存在しないため、今使われない自由度を先取りして持たせるより、実際に必要になった時点(`merge`実装時)で`let x: chan<int> = merge(...)`のような「初期化式ありの`let`」だけを個別に許可する方が、CLAUDE.mdの一貫した方針(仕様に無い組み合わせは先送りし、曖昧な動作にしない)に沿うと判断した。コード生成側(`typeToIR`)は`chan<T>`のTがスカラー・構造体はもちろんリスト・map・関数型など任意の妥当な型でも動くよう、`useFuncType`/`useMapType`と全く同じ「形状で重複排除するレジストリ+合成した`^ChanTypeN`という名前」という設計にした(`useChan`)——リストの`^intlist`のような要素名由来の命名ができない(要素型がスカラーとは限らないため)ことを除けば、既存の2つの命令使用パターンをそのまま踏襲しただけで済んだ。
+
+**`send`は仕様上`chan/collect/error`等と同じくlexerの予約語(`KwSend`)であるため、`print`のような「識別子ベースの組み込み関数」の脱糖経路(`parseIdentStmt`)を素通りできず、`parseStmt`に専用の分岐(`case lexer.KwSend`)を追加する必要があった。** 実装時にこの点(spec上の「予約語一覧」にsendが載っている事実)を見落としかけたが、`reservedBuiltinNames`のコメントが「`send`/`chan`/`collect`/`error`はキーワードなのでエントリ不要」と既にStep 11時点で書き残していたため(将来の実装者への申し送りとして機能した)、発見・対応は早かった。パース後は`ast.CallExpr{Callee: "send", ...}`という通常の呼び出し式として扱われ(`p.parseCallExprFrom`に合成トークンを渡すだけ)、sema/codegenの`checkExprStmt`/`genExprStmt`は`print`/`delete`と同列の`case "send":`分岐が1つ増えるだけで済んだ——構文的な入口だけが特殊で、それ以降のパイプライン全体は既存の「組み込み関数はCallee名で分岐する」という仕組みにそのまま乗った。
+
+`examples/12_pipelines.cas`(`numbers`/`double`/`toString`/`printAll`という4段パイプライン——`source`→`stage`→`stage`→`sink`——を`|>`で連結、`range`で生成した`[]int`を`send`で流し込み、`SPAWN`された3段と同期呼び出しされる`sink`が実際に協調動作することを実行時に確認)で`amivm`→`go build`→実行まで確認済み。
+
 ## 意味検証の責任分担(重要)
 
 型の整合性・未定義識別子・関数シグネチャの不一致・メソッドの存在チェックなどは、**amivm側では検証せず`go/types`に全面的に委ねている。** amivmが保証するのは「構文的に妥当なGoコードを出力すること」だけ。
@@ -379,12 +389,12 @@ Seedは7〜8ステップ(git履歴上は「Step1: hello-worldパイプライン�
 | 9 ✅ | クロージャー・高階関数 | クロージャーリテラル(8.3節)、`filter`/`map`/`reduce`(8.4節)、参照捕捉の実地検証 | `FNTYPE` `CLOS` `ENDCLOS` | — |
 | 10 ✅ | map(`map<K, V>`) | リテラル・`m[k]`(`V?`化)・`m[k]=v`・`delete`・`for k, v in m` | `MPTYPE` `MPMAKE` `MSET` `MGET` | `cascadert`ランタイムの初回導入(下記「確定した設計判断」参照) |
 | 11 ✅ | エラー処理 | `error`型・`(T, error?)`規約・後置`?`のsema展開(8.6節) | (新規命令なし。`STTYPE`+`IF`+`RET`の組み合わせ) | `error`型の表現を確定(下記「確定した設計判断」参照。旧「オープンな設計課題」課題2) |
-| 12 | パイプライン基礎 | `source`/`stage`/`sink`、`chan<T>`、`send`、`for v in channel`、`\|>`連結(9.1/9.2節) | `CHTYPE` `CHMAKE` `CHSEND` `CHRECV` `SPAWN` | 課題1(並行実行モデル)の一次決定。`amivm/test_ir/11_spawn_channel_sel.ir`必読 |
+| 12 ✅ | パイプライン基礎 | `source`/`stage`/`sink`、`chan<T>`、`send`、`for v in channel`、`\|>`連結(9.1/9.2節) | `CHTYPE` `CHMAKE` `CHSEND` `CHRECV` `SPAWN` `DEFER` | 課題1(並行実行モデル)の一次決定。基礎部分を確定・実装(下記「確定した設計判断」参照。collect/abort/mergeはStep 13へ) |
 | 13 | パイプライン拡張(collect/abort/merge) | `collect`(9.3節)・`abort`(9.4節)・`merge`(9.5節) | `SEL` `CASESEND` `CASERECV` `DEFAULT` `ENDSEL` `DEFER` | 課題1の最終確定 |
 | 14 | パッケージ/複数ファイル | ディレクトリ=パッケージの統合(11.1節)、`import`/`pub`(11.2/11.3節)、循環import検出(11.5節)、識別子一意化(11.6節) | (新規命令なし。codegenの命名規則) | 課題2(パッケージ/モジュール解決)の確定 |
 | 15 | CLI・配布 | `cascade build/run/emit-ir/emit-go/help`、`cascadert`の`go:embed`配布、README作成 | — | — |
 
-特にStep4(ビット演算)・Step8(ポインタ・構造体)・Step9(クロージャー)・Step10(map)・Step12/13(チャネル・SPAWN・SEL)はSeedで未実証だった命令なので、「ロジック上正しそうに見える」だけで次のステップへ進まないこと。上記「オープンな設計課題」の5項目は、対応するステップ着手時に方針を確定し、その節を書き換える(仮説のまま放置しない)。
+特にStep4(ビット演算)・Step8(ポインタ・構造体)・Step9(クロージャー)・Step10(map)・Step12/13(チャネル・SPAWN・SEL)はSeedで未実証だった命令なので、「ロジック上正しそうに見える」だけで次のステップへ進まないこと。上記「オープンな設計課題」の各項目は、対応するステップ着手時に方針を確定し、その節を書き換える(仮説のまま放置しない)。
 
 ## 開発の進め方
 

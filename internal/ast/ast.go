@@ -25,6 +25,14 @@ package ast
 // `collect`'s `[]string?` result (§9.3); see CLAUDE.md's "確定した設計判断"
 // for why the alternative reading was rejected. A list's own element type
 // is therefore never itself nullable through this grammar.
+// Chan is `chan<T>` (cascade_spec.md §2.2, §9.1) — a pipeline-only type;
+// unlike every other compound type it has no general-purpose use, so
+// sema's validateType rejects it wherever it shows up outside a
+// source/stage/sink parameter (see validateChanParamType, the one place
+// that unwraps it). Never Nullable — the spec lists no zero value for it
+// at all ("単独では宣言しない"): a channel value only ever comes from a
+// stage's own parameter binding or (Step 13) `merge`, never a bare
+// declaration needing a base value.
 type Type struct {
 	Name     string
 	Nullable bool
@@ -32,6 +40,7 @@ type Type struct {
 	Ptr      *Type
 	Func     *FuncType
 	Map      *MapType
+	Chan     *Type
 }
 
 // MapType is a map type's key/value shape (cascade_spec.md §2.2, §4.5):
@@ -93,10 +102,63 @@ type StructDecl struct {
 	Line   int
 }
 
+// StageKind distinguishes which of the three pipeline-stage shapes a
+// StageDecl declares (cascade_spec.md §9.1).
+type StageKind int
+
+const (
+	SourceStage StageKind = iota
+	MiddleStage
+	SinkStage
+)
+
+// StageDecl is a top-level `source`/`stage`/`sink` declaration
+// (cascade_spec.md §9.1): each compiles to its own goroutine (see
+// codegen's genStageDecl), connected to its neighbors via chan<T>
+// parameters. Params holds exactly one channel (the output) for a
+// source, exactly two (input then output, positionally — see
+// cascade_spec.md §9.1's own note that the conventional "input"/"output"
+// parameter names carry no special meaning to the grammar) for a stage,
+// or exactly one (the input) for a sink — sema's checkStageSig enforces
+// the count and channel-ness of each.
+type StageDecl struct {
+	Kind   StageKind
+	Name   string
+	Params []Param
+	Body   []Stmt
+	Line   int
+}
+
+// PipelineStageRef is one name in a `|>`-chained pipeline (cascade_spec.md
+// §9.2) — a source/stage/sink's own declared Name, kept with its own
+// source line for precise error messages (see sema's checkPipelineStmt).
+type PipelineStageRef struct {
+	Name string
+	Line int
+}
+
+// PipelineStmt is a `|>`-chained pipeline used as a statement
+// (cascade_spec.md §9.2): `source |> stage1 |> ... |> sink`. Stages holds
+// every name in source order, beginning with the source and ending with
+// the sink. The value-producing form ending in the built-in `collect`
+// (§9.3) is grammatically accepted here too (see parser's
+// parsePipelineTail) but sema.Check's checkPipelineStmt rejects it with an
+// explicit "not implemented until Step 13" error — collect only makes
+// sense as an expression (`let x = ... |> collect`), which this
+// statement-only node can't represent; that form lands once Step 13
+// implements collect itself (see CLAUDE.md's step plan).
+type PipelineStmt struct {
+	Stages []PipelineStageRef
+	Line   int
+}
+
+func (*PipelineStmt) stmtNode() {}
+
 // File is the root node of a parsed Cascade source file.
 type File struct {
 	Structs []*StructDecl
 	Funcs   []*FuncDecl
+	Stages  []*StageDecl
 }
 
 // Stmt is implemented by every statement node.
@@ -255,22 +317,33 @@ type ContinueStmt struct {
 
 func (*ContinueStmt) stmtNode() {}
 
-// ForInStmt is `for x in List { ... }` over a list, or `for k, v in M {
-// ... }` over a map (cascade_spec.md §7 — ValueVarName non-empty selects
-// this second, map-only form).
+// ForInStmt is `for x in List { ... }` over a list or a channel
+// (cascade_spec.md §7, §9.1), or `for k, v in M { ... }` over a map (§7 —
+// ValueVarName non-empty selects this third, map-only form).
 //
-// ElemType is filled in by sema.Check with the list's element type (or,
-// in the map form, the map's key type), and ValueType with the map's
-// value type (map form only), so codegen doesn't have to re-derive
-// either (the same ast-annotation pattern LetDecl.ResolvedType uses).
+// ElemType is filled in by sema.Check with the list's element type, the
+// channel's carried type, or (in the map form) the map's key type, and
+// ValueType with the map's value type (map form only), so codegen doesn't
+// have to re-derive either (the same ast-annotation pattern
+// LetDecl.ResolvedType uses). IsChannel (also filled in by sema.Check)
+// distinguishes the channel form from the list form — both are
+// single-variable, so ValueVarName alone can't tell them apart the way it
+// tells the map form from the other two; codegen needs this to choose
+// between an index-counted AGET loop (list) and a CHRECV-comma-ok loop
+// (channel, see codegen/pipeline.go's genForInChannelStmt) — mirrors how
+// IndexExpr.ResultType.Nullable discriminates a list read from a map read
+// (see IndexExpr's doc) without a dedicated field, except here there's no
+// single pre-existing field that already carries the distinction, hence
+// the explicit bool.
 type ForInStmt struct {
 	VarName      string
 	ValueVarName string // non-empty for the two-variable map form
-	List         Expr   // the list or map being iterated
+	List         Expr   // the list, map, or channel being iterated
 	Body         []Stmt
 	Line         int
 	ElemType     Type
 	ValueType    Type // map form only
+	IsChannel    bool
 }
 
 func (*ForInStmt) stmtNode() {}
@@ -587,6 +660,8 @@ func StmtLine(s Stmt) int {
 	case *SwitchStmt:
 		return v.Line
 	case *ForInStmt:
+		return v.Line
+	case *PipelineStmt:
 		return v.Line
 	default:
 		return 0

@@ -11,11 +11,11 @@
 // §5's compound-assignment/inc-dec set ("+=" "-=" "*=" "/=" "%=" "++"
 // "--"). "&"/"*" double as unary address-of/dereference (§6) — the parser
 // disambiguates by position, not the lexer (see parser's unaryOpNames).
-// Postfix "?" (Step 11) and "|>" (Step 12) are lexed starting in the
-// steps that introduce them. The full keyword set (§14) is already
-// reserved from the start (see token.go), since adding a keyword later is
-// free but an identifier silently becoming a keyword out from under
-// existing code is not.
+// Postfix "?" (Step 11) and "|>" (Step 12, cascade_spec.md §9.2's
+// pipeline-connect operator) are now lexed too. The full keyword set
+// (§14) is already reserved from the start (see token.go), since adding a
+// keyword later is free but an identifier silently becoming a keyword out
+// from under existing code is not.
 package lexer
 
 import (
@@ -294,9 +294,10 @@ func (l *Lexer) lexOperator(line int) (Token, error) {
 			l.pos++
 			return Token{Kind: OrOr, Literal: "||", Line: line}, nil
 		}
-		// a lone '|' is bitwise OR (Pipe) here; once Step 12 adds "|>" it
-		// must be checked for at this same point, before falling through
-		// to Pipe.
+		if l.peekRune() == '>' {
+			l.pos++
+			return Token{Kind: PipeArrow, Literal: "|>", Line: line}, nil
+		}
 		return Token{Kind: Pipe, Literal: "|", Line: line}, nil
 	case '^':
 		return Token{Kind: Caret, Literal: "^", Line: line}, nil

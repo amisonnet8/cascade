@@ -1,0 +1,28 @@
+source numbers(output: chan<int>) {
+    for n in range(1, 7) {
+        send(output, n)
+    }
+}
+
+stage double(input: chan<int>, output: chan<int>) {
+    for n in input {
+        send(output, n * 2)
+    }
+}
+
+stage toString(input: chan<int>, output: chan<string>) {
+    for n in input {
+        send(output, string(n))
+    }
+}
+
+sink printAll(input: chan<string>) {
+    for s in input {
+        print(s)
+    }
+}
+
+func main(): int {
+    numbers |> double |> toString |> printAll
+    return 0
+}

@@ -86,13 +86,14 @@ const (
 	AndAnd
 	OrOr
 	Not
-	Amp    // "&" (bitwise AND — binary; unary "&" (address-of) lands in Step 8)
-	Pipe   // "|" (bitwise OR)
-	Caret  // "^" (bitwise XOR — binary only; unary bit-flip is Tilde, not this)
-	AndNot // "&^" (bitwise AND NOT)
-	Tilde  // "~" (unary bitwise NOT)
-	Shl    // "<<"
-	Shr    // ">>"
+	Amp       // "&" (bitwise AND — binary; unary "&" (address-of) lands in Step 8)
+	Pipe      // "|" (bitwise OR)
+	PipeArrow // "|>" (pipeline connect, Step 12 — cascade_spec.md §9.2)
+	Caret     // "^" (bitwise XOR — binary only; unary bit-flip is Tilde, not this)
+	AndNot    // "&^" (bitwise AND NOT)
+	Tilde     // "~" (unary bitwise NOT)
+	Shl       // "<<"
+	Shr       // ">>"
 	PlusAssign
 	MinusAssign
 	StarAssign

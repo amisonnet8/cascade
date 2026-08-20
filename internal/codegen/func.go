@@ -51,8 +51,8 @@ func funcAmivmName(name string) string {
 // way out (cascade_spec.md §8.6's `(T, error?)` convention, and any
 // other nullable result along with it — see needsIssetSlot and
 // genReturnStmt's matching expansion).
-func genFuncDecl(fn *ast.FuncDecl, types *typeRegistry, structs map[string]*ast.StructDecl, sigs map[string]funcSig, methods map[string]map[string]funcSig) (string, error) {
-	g := &funcGen{scope: newScope(nil), types: types, structs: structs, sigs: sigs, methods: methods}
+func genFuncDecl(fn *ast.FuncDecl, types *typeRegistry, structs map[string]*ast.StructDecl, sigs map[string]funcSig, methods map[string]map[string]funcSig, stages map[string]stageInfo) (string, error) {
+	g := &funcGen{scope: newScope(nil), types: types, structs: structs, sigs: sigs, methods: methods, stages: stages}
 
 	var paramIRTypes []string
 	argIdx := 0

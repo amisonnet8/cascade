@@ -755,7 +755,7 @@ func main(): int {
 	return 0
 }
 `,
-			wantErr: "for-in requires a list, got int",
+			wantErr: "for-in requires a list, map, or channel, got int",
 		},
 		{
 			name: "append requires a list first argument",
@@ -1889,6 +1889,201 @@ func main(): int {
 }
 `,
 			wantErr: "'?' does not support a nullable success type yet",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := check(t, tt.src)
+			if err == nil {
+				t.Fatalf("Check() = nil, want error containing %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Check() = %q, want error containing %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestCheck_ValidPipeline(t *testing.T) {
+	src := `
+source numbers(output: chan<int>) {
+	for n in range(1, 4) {
+		send(output, n)
+	}
+}
+
+stage double(input: chan<int>, output: chan<int>) {
+	for n in input {
+		send(output, n * 2)
+	}
+}
+
+sink printAll(input: chan<int>) {
+	for n in input {
+		print(string(n))
+	}
+}
+
+func main(): int {
+	numbers |> double |> printAll
+	return 0
+}
+`
+	if err := check(t, src); err != nil {
+		t.Fatalf("Check() = %v, want nil", err)
+	}
+}
+
+func TestCheck_PipelineErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		src     string
+		wantErr string
+	}{
+		{
+			name: "source must take exactly 1 parameter",
+			src: `
+source numbers(a: chan<int>, b: chan<int>) {
+	send(a, 1)
+}
+func main(): int {
+	return 0
+}
+`,
+			wantErr: "source \"numbers\" must take exactly 1 parameter",
+		},
+		{
+			name: "stage must take exactly 2 parameters",
+			src: `
+stage double(input: chan<int>) {
+	for n in input {
+		print(string(n))
+	}
+}
+func main(): int {
+	return 0
+}
+`,
+			wantErr: "stage \"double\" must take exactly 2 parameters",
+		},
+		{
+			name: "sink must take exactly 1 parameter",
+			src: `
+sink printAll(input: chan<int>, extra: chan<int>) {
+	print("x")
+}
+func main(): int {
+	return 0
+}
+`,
+			wantErr: "sink \"printAll\" must take exactly 1 parameter",
+		},
+		{
+			name: "source/stage/sink parameters must be a channel type",
+			src: `
+source numbers(output: int) {
+	print("x")
+}
+func main(): int {
+	return 0
+}
+`,
+			wantErr: "source/stage/sink parameters must have a channel type",
+		},
+		{
+			name: "channel types cannot be used outside a source/stage/sink parameter",
+			src: `
+func f(c: chan<int>): int {
+	return 0
+}
+func main(): int {
+	return 0
+}
+`,
+			wantErr: "channel types (chan<T>) can only be used as a source/stage/sink parameter",
+		},
+		{
+			name: "pipeline must begin with a source",
+			src: `
+stage double(input: chan<int>, output: chan<int>) {
+	for n in input {
+		send(output, n * 2)
+	}
+}
+sink printAll(input: chan<int>) {
+	for n in input {
+		print(string(n))
+	}
+}
+func main(): int {
+	double |> printAll
+	return 0
+}
+`,
+			wantErr: "a pipeline must begin with a source",
+		},
+		{
+			name: "pipeline used as a statement must end with a sink",
+			src: `
+source numbers(output: chan<int>) {
+	send(output, 1)
+}
+stage double(input: chan<int>, output: chan<int>) {
+	for n in input {
+		send(output, n * 2)
+	}
+}
+func main(): int {
+	numbers |> double
+	return 0
+}
+`,
+			wantErr: "a pipeline used as a statement must end with a sink",
+		},
+		{
+			name: "pipeline type mismatch between adjacent stages",
+			src: `
+source numbers(output: chan<int>) {
+	send(output, 1)
+}
+sink printStrings(input: chan<string>) {
+	for s in input {
+		print(s)
+	}
+}
+func main(): int {
+	numbers |> printStrings
+	return 0
+}
+`,
+			wantErr: "pipeline type mismatch",
+		},
+		{
+			name: "collect is not implemented yet",
+			src: `
+source numbers(output: chan<int>) {
+	send(output, 1)
+}
+func main(): int {
+	numbers |> collect
+	return 0
+}
+`,
+			wantErr: "'collect' is not implemented yet (Step 13)",
+		},
+		{
+			name: "undefined source/stage/sink in a pipeline",
+			src: `
+source numbers(output: chan<int>) {
+	send(output, 1)
+}
+func main(): int {
+	numbers |> nope
+	return 0
+}
+`,
+			wantErr: "undefined source/stage/sink \"nope\"",
 		},
 	}
 

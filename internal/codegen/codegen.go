@@ -62,17 +62,21 @@ const mainInternalName = "cascade_main"
 // (list.go's typeRegistry.useFuncType — emitted after SLTYPE since a
 // function type may itself take/return a list, e.g. `func([]int): int`),
 // then a top-level MPTYPE for every distinct map key/value shape any
-// function uses (useMapType — emitted last among the TYPE declarations,
-// since a map's value type may itself be a struct/list/func), then every
-// function's own FUNC block (main's under mainInternalName, a receiver
-// function's under its qualified StructName_Method name, a closure
-// literal's own CLOS block nested inline inside whichever FUNC contains
-// it — see func.go's genFuncDecl and struct.go/closure.go), then the
-// generated `!main` wrapper that bridges to it. Every FUNC's own body is
-// compiled first, into a separate buffer, before this final assembly —
-// SLTYPE/FNTYPE/MPTYPE registration happens as a side effect of that
-// (typeToIR calls), so by the time this function's own loops run, every
-// type any function body needed is already known.
+// function uses (useMapType), then a top-level CHTYPE for every distinct
+// channel element shape any source/stage/sink parameter or pipeline
+// statement uses (useChan — emitted last among the TYPE declarations,
+// since a channel's element type may itself be a struct/list/func/map),
+// then every function's own FUNC block (main's under mainInternalName, a
+// receiver function's under its qualified StructName_Method name, a
+// closure literal's own CLOS block nested inline inside whichever FUNC
+// contains it — see func.go's genFuncDecl and struct.go/closure.go),
+// then every source/stage/sink's own FUNC block (pipeline.go's
+// genStageDecl), then the generated `!main` wrapper that bridges to
+// mainInternalName. Every FUNC's own body is compiled first, into a
+// separate buffer, before this final assembly — SLTYPE/FNTYPE/MPTYPE/
+// CHTYPE registration happens as a side effect of that (typeToIR calls),
+// so by the time this function's own loops run, every type any function
+// body needed is already known.
 func Generate(f *ast.File) (string, error) {
 	structs := map[string]*ast.StructDecl{"error": errorStructDecl}
 	for _, sd := range f.Structs {
@@ -104,6 +108,11 @@ func Generate(f *ast.File) (string, error) {
 		return "", fmt.Errorf("codegen: no main function (run sema.Check first)")
 	}
 
+	stages := map[string]stageInfo{}
+	for _, sd := range f.Stages {
+		stages[sd.Name] = buildStageInfo(sd)
+	}
+
 	types := &typeRegistry{used: map[string]bool{}}
 
 	var structsIR strings.Builder
@@ -118,7 +127,14 @@ func Generate(f *ast.File) (string, error) {
 
 	var funcsIR strings.Builder
 	for _, fn := range f.Funcs {
-		ir, err := genFuncDecl(fn, types, structs, sigs, methods)
+		ir, err := genFuncDecl(fn, types, structs, sigs, methods, stages)
+		if err != nil {
+			return "", err
+		}
+		funcsIR.WriteString(ir)
+	}
+	for _, sd := range f.Stages {
+		ir, err := genStageDecl(sd, types, structs, sigs, methods, stages)
 		if err != nil {
 			return "", err
 		}
@@ -139,6 +155,10 @@ func Generate(f *ast.File) (string, error) {
 		b.WriteString("\n")
 	}
 	for _, decl := range types.mapTypeDecls() {
+		b.WriteString(decl)
+		b.WriteString("\n")
+	}
+	for _, decl := range types.chanTypeDecls() {
 		b.WriteString(decl)
 		b.WriteString("\n")
 	}
@@ -174,6 +194,7 @@ type funcGen struct {
 	structs       map[string]*ast.StructDecl // struct name -> declaration, for struct.go's genStructZeroReset
 	sigs          map[string]funcSig
 	methods       map[string]map[string]funcSig // struct name -> method name -> sig, for struct.go's method-call codegen
+	stages        map[string]stageInfo          // source/stage/sink name -> channel shape, for pipeline.go's genPipelineStmt (§9.2)
 	results       []ast.Type                    // this FUNC/CLOS's own declared result types, for genReturnStmt's nullable-result expansion and error.go's genErrorProp (§8.6's postfix `?`)
 	seq           int
 	labelSeq      int
@@ -280,6 +301,8 @@ func genStmt(g *funcGen, stmt ast.Stmt) error {
 		return genSwitchStmt(g, s)
 	case *ast.ForInStmt:
 		return genForInStmt(g, s)
+	case *ast.PipelineStmt:
+		return genPipelineStmt(g, s)
 	case *ast.BreakStmt:
 		return genBreakStmt(g, s)
 	case *ast.ContinueStmt:
@@ -687,6 +710,8 @@ func genExprStmt(g *funcGen, stmt *ast.ExprStmt) error {
 		}
 		g.emit("\tCALL\t:\t?fmt.Println\t%s\n", v)
 		return nil
+	case "send":
+		return genSendCall(g, call)
 	case "delete":
 		return genDeleteCall(g, call)
 	default:

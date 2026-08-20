@@ -11,28 +11,35 @@
 // form), a call-expression statement (plain or `obj.method(...)`), a
 // dereferencing assignment `*ptr = value` (§4.4), scalar/list-element/
 // map-element/struct-field/compound assignment, `++`/`--`, `return`,
-// `if`/`elif`/`else`, `while`, `for x in list`/`for k, v in map`,
-// `switch` (tagged and untagged), and `break`/`continue`; and a full
+// `if`/`elif`/`else`, `while`, `for x in list`/`for k, v in map`/`for x in
+// channel`, `switch` (tagged and untagged), `break`/`continue`,
+// `send(output, value)` (§9.1's own keyword, not a plain builtin — see
+// parseSendStmt), and a `|>`-chained pipeline statement `source |>
+// stage1 |> ... |> sink` (§9.2, see parsePipelineTail — the
+// value-producing `collect`-terminated form, §9.3, is grammatically
+// accepted but rejected by sema until Step 13); and a full
 // operator-precedence expression grammar (§6, including unary `&`/`*`
 // for address-of/dereference, §4.4), literals (including nullable-type
 // `T?` declarations, pointer types `*T`, function types `func(T1, T2,
 // ...): R` (§2.2, §8.3), closure literals `func(name: Type, ...): R {
 // body }` in expression position, map types `map<K, V>` (§2.2, §4.5),
-// the `none` literal, list literals `[1, 2, 3]`/`[]`, map literals
-// `{"a": 1, "b": 2}`/`{}`, and struct literals `Name{field: value,
-// ...}`), variable references, function/method/closure calls, field
-// access `x.field`, list/map indexing `xs[i]`/`m[k]`, postfix error
-// propagation `expr?` on a call expression (§8.6, both in expression
-// position and as its own bare statement), and `is none`/`is not none`
-// (§7) directly on an atom (the only place the spec actually uses it —
-// as an `if`/`switch` condition). A struct or map literal is only
-// recognized where `{` cannot instead open a block (see
-// withStructLitForbidden/withStructLitAllowed — the same guard covers
-// both, despite the name), mirroring Go's identical restriction — a
-// closure literal needs no such guard, since seeing `func` in expression
-// position is never itself ambiguous with anything else. Later
-// development steps extend this grammar further (channels/pipelines,
-// ...) one feature at a time.
+// channel types `chan<T>` (§2.2, §9.1 — parseable anywhere a type is,
+// though sema restricts where one may actually appear), the `none`
+// literal, list literals `[1, 2, 3]`/`[]`, map literals `{"a": 1, "b":
+// 2}`/`{}`, and struct literals `Name{field: value, ...}`), variable
+// references, function/method/closure calls, field access `x.field`,
+// list/map indexing `xs[i]`/`m[k]`, postfix error propagation `expr?` on
+// a call expression (§8.6, both in expression position and as its own
+// bare statement), and `is none`/`is not none` (§7) directly on an atom
+// (the only place the spec actually uses it — as an `if`/`switch`
+// condition). A struct or map literal is only recognized where `{`
+// cannot instead open a block (see withStructLitForbidden/
+// withStructLitAllowed — the same guard covers both, despite the name),
+// mirroring Go's identical restriction — a closure literal needs no such
+// guard, since seeing `func` in expression position is never itself
+// ambiguous with anything else. Later development steps extend this
+// grammar further (pipeline extensions, packages, ...) one feature at a
+// time.
 package parser
 
 import (
@@ -142,8 +149,26 @@ func (p *parser) parseFile() (*ast.File, error) {
 				return nil, err
 			}
 			f.Structs = append(f.Structs, sd)
+		case lexer.KwSource:
+			sd, err := p.parseStageDecl(ast.SourceStage)
+			if err != nil {
+				return nil, err
+			}
+			f.Stages = append(f.Stages, sd)
+		case lexer.KwStage:
+			sd, err := p.parseStageDecl(ast.MiddleStage)
+			if err != nil {
+				return nil, err
+			}
+			f.Stages = append(f.Stages, sd)
+		case lexer.KwSink:
+			sd, err := p.parseStageDecl(ast.SinkStage)
+			if err != nil {
+				return nil, err
+			}
+			f.Stages = append(f.Stages, sd)
 		default:
-			return nil, fmt.Errorf("line %d: expected 'func' or 'struct' at top level, got %q", p.cur().Line, p.cur().Literal)
+			return nil, fmt.Errorf("line %d: expected 'func', 'struct', 'source', 'stage', or 'sink' at top level, got %q", p.cur().Line, p.cur().Literal)
 		}
 		p.skipNewlines()
 	}
@@ -185,6 +210,51 @@ func (p *parser) parseStructDecl() (*ast.StructDecl, error) {
 	if _, err := p.expect(lexer.RBrace, "'}'"); err != nil {
 		return nil, err
 	}
+	return sd, nil
+}
+
+// parseStageDecl parses a `source`/`stage`/`sink` declaration
+// (cascade_spec.md §9.1), all three syntactically identical apart from
+// their leading keyword (already identified by kind, consumed by the
+// caller's dispatch in parseFile — not here, since parseStageDecl needs
+// the keyword token's own line for StageDecl.Line): `name(param: Type,
+// ...) { body }`, reusing parseParam for each parameter exactly like
+// parseFuncDecl's own parameter list (a channel-typed parameter, `chan<T>`,
+// is parsed the same generic way via parseType/parseChanType — sema is
+// what actually restricts chan<T> to appearing only here, see
+// validateChanParamType).
+func (p *parser) parseStageDecl(kind ast.StageKind) (*ast.StageDecl, error) {
+	kw := p.advance() // 'source'/'stage'/'sink'
+	name, err := p.expect(lexer.Ident, "source/stage/sink name")
+	if err != nil {
+		return nil, err
+	}
+	sd := &ast.StageDecl{Kind: kind, Name: name.Literal, Line: kw.Line}
+
+	if _, err := p.expect(lexer.LParen, "'('"); err != nil {
+		return nil, err
+	}
+	for p.cur().Kind != lexer.RParen {
+		if len(sd.Params) > 0 {
+			if _, err := p.expect(lexer.Comma, "','"); err != nil {
+				return nil, err
+			}
+		}
+		param, err := p.parseParam()
+		if err != nil {
+			return nil, err
+		}
+		sd.Params = append(sd.Params, param)
+	}
+	if _, err := p.expect(lexer.RParen, "')'"); err != nil {
+		return nil, err
+	}
+
+	body, err := p.parseBlock()
+	if err != nil {
+		return nil, err
+	}
+	sd.Body = body
 	return sd, nil
 }
 
@@ -359,6 +429,9 @@ func (p *parser) parseTypeBase() (ast.Type, error) {
 	if p.cur().Kind == lexer.KwMap {
 		return p.parseMapType()
 	}
+	if p.cur().Kind == lexer.KwChan {
+		return p.parseChanType()
+	}
 	if name, ok := typeKeywords[p.cur().Kind]; ok {
 		p.advance()
 		return ast.Type{Name: name}, nil
@@ -440,6 +513,26 @@ func (p *parser) parseMapType() (ast.Type, error) {
 	return ast.Type{Map: &ast.MapType{Key: keyType, Value: valueType}}, nil
 }
 
+// parseChanType parses `chan<T>` (cascade_spec.md §2.2, §9.1) —
+// syntactically identical to parseMapType's single-type-parameter form.
+// Unlike a map, a channel's own zero value is never used (see ast.Type's
+// doc for Chan), so unlike parseMapType there's no Nullable question to
+// settle here either way.
+func (p *parser) parseChanType() (ast.Type, error) {
+	p.advance() // 'chan'
+	if _, err := p.expect(lexer.Lt, "'<'"); err != nil {
+		return ast.Type{}, err
+	}
+	elem, err := p.parseType()
+	if err != nil {
+		return ast.Type{}, err
+	}
+	if _, err := p.expect(lexer.Gt, "'>'"); err != nil {
+		return ast.Type{}, err
+	}
+	return ast.Type{Chan: &elem}, nil
+}
+
 func (p *parser) parseBlock() ([]ast.Stmt, error) {
 	if _, err := p.expect(lexer.LBrace, "'{'"); err != nil {
 		return nil, err
@@ -481,6 +574,8 @@ func (p *parser) parseStmt() (ast.Stmt, error) {
 	case lexer.KwContinue:
 		tok := p.advance()
 		return &ast.ContinueStmt{Line: tok.Line}, nil
+	case lexer.KwSend:
+		return p.parseSendStmt()
 	case lexer.Ident:
 		return p.parseIdentStmt()
 	case lexer.Star:
@@ -764,10 +859,58 @@ func (p *parser) exprStmtFromCall(call *ast.CallExpr) ast.Stmt {
 	return &ast.ExprStmt{X: x, Line: call.Line}
 }
 
+// parseSendStmt parses `send(output, value)` (cascade_spec.md §9.1,
+// §13). Unlike an ordinary builtin function name (print, len, ...),
+// "send" is its own lexer keyword (KwSend, so it can't collide with a
+// user identifier named "send" — see cascade_spec.md §9.1's own
+// admonition against naming a parameter "in" for the identical reason,
+// already structurally impossible here too since "in" is KwIn), so it
+// needs its own statement-level dispatch in parseStmt rather than
+// flowing through parseIdentStmt's Ident-only entry point. Still routed
+// through exprStmtFromCall for the same reason print is: uniform
+// handling, even though sema will reject a stray trailing `?` on it
+// (send returns nothing, not `(T, error?)`) exactly the way it already
+// does for print.
+func (p *parser) parseSendStmt() (ast.Stmt, error) {
+	kw := p.advance() // 'send'
+	call, err := p.parseCallExprFrom(lexer.Token{Literal: "send", Line: kw.Line})
+	if err != nil {
+		return nil, err
+	}
+	return p.exprStmtFromCall(call), nil
+}
+
+// parsePipelineTail parses the `|> name |> name ...` continuation of a
+// `|>`-chained pipeline statement (cascade_spec.md §9.2) whose first
+// stage's identifier token `first` has already been consumed by
+// parseIdentStmt. Each `|>` must be followed by another stage's name, or
+// the built-in `collect` keyword (§9.3) — accepted grammatically here
+// even though sema.Check's checkPipelineStmt currently rejects it with an
+// explicit "not implemented until Step 13" error (see ast.PipelineStmt's
+// doc), so the parser never has to be revisited once collect's
+// value-producing form lands.
+func (p *parser) parsePipelineTail(first lexer.Token) (ast.Stmt, error) {
+	stmt := &ast.PipelineStmt{Line: first.Line}
+	stmt.Stages = append(stmt.Stages, ast.PipelineStageRef{Name: first.Literal, Line: first.Line})
+	for p.cur().Kind == lexer.PipeArrow {
+		p.advance()
+		var nameTok lexer.Token
+		switch p.cur().Kind {
+		case lexer.Ident, lexer.KwCollect:
+			nameTok = p.advance()
+		default:
+			return nil, fmt.Errorf("line %d: expected a stage name or 'collect' after '|>', got %q", p.cur().Line, p.cur().Literal)
+		}
+		stmt.Stages = append(stmt.Stages, ast.PipelineStageRef{Name: nameTok.Literal, Line: nameTok.Line})
+	}
+	return stmt, nil
+}
+
 // parseIdentStmt parses a statement starting with an identifier: a call
 // expression (`f(...)`), a scalar or list-element assignment (`name =
 // value` / `name[Index] = value`), a compound assignment (`name +=
-// value` etc.), or `name++`/`name--` (cascade_spec.md §5).
+// value` etc.), `name++`/`name--` (cascade_spec.md §5), or the start of a
+// `|>`-chained pipeline statement (§9.2, see parsePipelineTail).
 func (p *parser) parseIdentStmt() (ast.Stmt, error) {
 	name := p.advance() // Ident
 	switch {
@@ -777,6 +920,8 @@ func (p *parser) parseIdentStmt() (ast.Stmt, error) {
 			return nil, err
 		}
 		return p.exprStmtFromCall(call), nil
+	case p.cur().Kind == lexer.PipeArrow:
+		return p.parsePipelineTail(name)
 	case p.cur().Kind == lexer.Dot:
 		return p.parseFieldOrMethodStmt(name)
 	case p.cur().Kind == lexer.LBracket:

@@ -24,6 +24,9 @@ type typeRegistry struct {
 
 	mapTypes    map[string]*mapTypeEntry // canonical shape key -> entry
 	mapTypeList []*mapTypeEntry          // first-seen order, for stable MPTYPE emission
+
+	chanTypes    map[string]*chanTypeEntry // canonical shape key -> entry
+	chanTypeList []*chanTypeEntry          // first-seen order, for stable CHTYPE emission
 }
 
 // use registers elemName (a scalar type name — nested list element types
@@ -141,6 +144,57 @@ func (r *typeRegistry) mapTypeDecls() []string {
 	return decls
 }
 
+// chanTypeEntry is one channel-type shape registered with useChan,
+// carrying its already-resolved element IR type token (needed to emit its
+// own CHTYPE line — see chanTypeDecls). Mirrors mapTypeEntry, keyed by
+// the element token alone rather than a Name (cascade_spec.md §2.2's
+// chan<T> is unnamed on the Cascade side, unlike a list's own elemName-
+// derived token — see listTypeToken — since a channel's element type
+// isn't restricted to a scalar/struct the way a list's is; typeToIR
+// resolves T generically first, so the same deduplication-by-shape
+// approach useFuncType/useMapType already use applies here unchanged).
+type chanTypeEntry struct {
+	Name string // deftype name, no leading `^`
+	Elem string
+}
+
+// useChan registers a channel-type shape — its already-resolved element
+// IR type token — as needing a top-level CHTYPE declaration,
+// deduplicating by shape so two Cascade chan<T> types with the same
+// actual element type share one deftype, and returns its AMIVM-IR type
+// token (a synthesized name, e.g. "^ChanType1" — mirrors useFuncType/
+// useMapType).
+func (r *typeRegistry) useChan(elemToken string) string {
+	if r.chanTypes == nil {
+		r.chanTypes = map[string]*chanTypeEntry{}
+	}
+	if e, ok := r.chanTypes[elemToken]; ok {
+		return "^" + e.Name
+	}
+	e := &chanTypeEntry{
+		Name: fmt.Sprintf("ChanType%d", len(r.chanTypeList)+1),
+		Elem: elemToken,
+	}
+	r.chanTypes[elemToken] = e
+	r.chanTypeList = append(r.chanTypeList, e)
+	return "^" + e.Name
+}
+
+// chanTypeDecls returns every registered channel-type shape's CHTYPE
+// declaration line, in first-seen order (stable, deterministic output).
+// Emitted last among Generate()'s TYPE-decl loops (after STTYPE/SLTYPE/
+// FNTYPE/MPTYPE) since a channel's element type may itself be any one of
+// those composite kinds — see typeToIR's Chan branch, which resolves T's
+// own token (registering whichever of those it needs) before calling
+// this.
+func (r *typeRegistry) chanTypeDecls() []string {
+	decls := make([]string, len(r.chanTypeList))
+	for i, e := range r.chanTypeList {
+		decls[i] = fmt.Sprintf("CHTYPE\t^%s\t%s", e.Name, e.Elem)
+	}
+	return decls
+}
+
 // listTypeToken is the AMIVM-IR type token for elemName's list form, e.g.
 // "int" -> "^intlist". Cascade lists compile to Go slices (SLTYPE+
 // SLMAKE), not Go's fixed-size array type — cascade_spec.md §4.3's `let
@@ -215,6 +269,13 @@ func typeToIR(reg *typeRegistry, t ast.Type) (string, error) {
 			return "", err
 		}
 		return reg.useMapType(keyTok, valTok), nil
+	}
+	if t.Chan != nil {
+		elemTok, err := typeToIR(reg, *t.Chan)
+		if err != nil {
+			return "", err
+		}
+		return reg.useChan(elemTok), nil
 	}
 	return scalarTypeToIR(t)
 }
@@ -422,6 +483,9 @@ func genAppendCall(g *funcGen, call *ast.CallExpr) (string, error) {
 func genForInStmt(g *funcGen, stmt *ast.ForInStmt) error {
 	if stmt.ValueVarName != "" {
 		return genForInMapStmt(g, stmt)
+	}
+	if stmt.IsChannel {
+		return genForInChannelStmt(g, stmt)
 	}
 	listOp, err := genValue(g, stmt.List)
 	if err != nil {
