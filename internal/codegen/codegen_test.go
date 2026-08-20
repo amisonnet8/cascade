@@ -750,3 +750,188 @@ func main(): int {
 	}
 	assertLabelsResolve(t, ir)
 }
+
+func TestGenerate_StructDeclEmitsSTTYPE(t *testing.T) {
+	ir := generate(t, `
+struct Point {
+	x: float
+	y: float
+}
+func main(): int {
+	let p = Point{x: 1.0, y: 2.0}
+	return 0
+}
+`)
+	if !strings.Contains(ir, "STTYPE\t^Point\nFIELD\t>x\t^float64\nFIELD\t>y\t^float64\nENDSTTYPE\n") {
+		t.Fatalf("expected a STTYPE/FIELD/ENDSTTYPE block for Point; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "STTYPE") || strings.Index(ir, "STTYPE") > strings.Index(ir, "FUNC") {
+		t.Fatalf("expected STTYPE to precede every FUNC block; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_StructLiteralUsesFSET(t *testing.T) {
+	ir := generate(t, `
+struct Point {
+	x: float
+	y: float
+}
+func main(): int {
+	let p = Point{x: 1.0, y: 2.0}
+	return 0
+}
+`)
+	if !strings.Contains(ir, "FSET\t%tmp_2\t>x\t1\n\tFSET\t%tmp_2\t>y\t2\n") {
+		t.Fatalf("expected the struct literal to FSET each field; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_FieldReadAndWrite(t *testing.T) {
+	ir := generate(t, `
+struct Point {
+	x: float
+	y: float
+}
+func main(): int {
+	let p = Point{x: 1.0, y: 2.0}
+	p.x = 5.0
+	let x = p.x
+	return 0
+}
+`)
+	if !strings.Contains(ir, "FSET\t%p_1\t>x\t5\n") {
+		t.Fatalf("expected p.x = 5.0 to compile to an FSET; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "FGET\t%tmp_4\t%p_1\t>x\n") {
+		t.Fatalf("expected p.x read to compile to an FGET; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_StructZeroResetIsRecursive(t *testing.T) {
+	// A bare `let ln: Line` (no initializer) must zero-reset every field,
+	// including a nested struct field, via FSET — there is no "zero
+	// struct literal" SET token (see struct.go's genStructZeroReset).
+	ir := generate(t, `
+struct Point {
+	x: float
+	y: float
+}
+struct Line {
+	start: Point
+	end: Point
+}
+func main(): int {
+	let ln: Line
+	return 0
+}
+`)
+	if !strings.Contains(ir, "FSET\t%tmp_2\t>x\t0\n\tFSET\t%tmp_2\t>y\t0\n\tFSET\t%ln_1\t>start\t%tmp_2\n") {
+		t.Fatalf("expected ln.start's own fields to be zero-reset into a temp and copied in via FSET; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_PointerAddrDerefAndPset(t *testing.T) {
+	ir := generate(t, `
+func main(): int {
+	let v: int = 100
+	let p: *int = &v
+	let copy: int = *p
+	*p = 200
+	return 0
+}
+`)
+	if !strings.Contains(ir, "ADDR\t%tmp_3\t%v_1\n\tSET\t%p_2\t%tmp_3\n") {
+		t.Fatalf("expected &v to compile to ADDR into a temp, then SET into p; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "PGET\t%tmp_5\t%p_2\n") {
+		t.Fatalf("expected *p read to compile to PGET; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "PSET\t%p_2\t200\n") {
+		t.Fatalf("expected *p = 200 to compile to PSET; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "VAR\t%p_2\t^*int\n") {
+		t.Fatalf("expected p's declared type to be ^*int; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_PointerNullCheckUsesEQNilNotIssetFlag(t *testing.T) {
+	// A pointer has no isset flag of its own (its nullability is native Go
+	// nil — see ast.Type's doc) — `is none`/`is not none` on one must
+	// compile to EQ/NEQ against the literal nil instead (see genNullCheck).
+	ir := generate(t, `
+func main(): int {
+	let p: *int = none
+	if p is none {
+		return 1
+	}
+	if p is not none {
+		return 2
+	}
+	return 0
+}
+`)
+	if !strings.Contains(ir, "EQ\t%tmp_2\t%p_1\tnil\n") {
+		t.Fatalf("expected 'p is none' to compile to EQ against nil; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "NEQ\t%tmp_3\t%p_1\tnil\n") {
+		t.Fatalf("expected 'p is not none' to compile to NEQ against nil; got:\n%s", ir)
+	}
+	if strings.Contains(ir, "_isset") {
+		t.Fatalf("a pointer variable must never get a companion isset flag; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_MethodCallValueReceiver(t *testing.T) {
+	ir := generate(t, `
+struct Point {
+	x: float
+	y: float
+}
+func (p: Point) sum(): float {
+	return p.x + p.y
+}
+func main(): int {
+	let pt = Point{x: 3.0, y: 4.0}
+	let s = pt.sum()
+	return 0
+}
+`)
+	if !strings.Contains(ir, "FUNC\t!Point_sum\t^Point\t:\t^float64\n") {
+		t.Fatalf("expected the method's own FUNC to be named !Point_sum with the receiver as its first param; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "!Point_sum\t%pt_1\n") {
+		t.Fatalf("expected the call site to pass pt directly (no ADDR/PGET needed for a matching value receiver); got:\n%s", ir)
+	}
+}
+
+func TestGenerate_MethodCallAutoAddrAndDeref(t *testing.T) {
+	// A value receiver's method called on a pointer variable must PGET
+	// first (auto-deref); a pointer receiver's method called on a plain
+	// variable must ADDR first (auto-address-of) — cascade_spec.md §8.2.
+	ir := generate(t, `
+struct Point {
+	x: float
+	y: float
+}
+func (p: Point) sum(): float {
+	return p.x + p.y
+}
+func (p: *Point) scale(factor: float) {
+	p.x = p.x * factor
+}
+func main(): int {
+	let pt = Point{x: 3.0, y: 4.0}
+	pt.scale(2.0)
+
+	let ptr: *Point = &pt
+	let s = ptr.sum()
+	return 0
+}
+`)
+	if !strings.Contains(ir, "ADDR\t%tmp_3\t%pt_1\n\tCALL\t:\t!Point_scale\t%tmp_3\t2\n") {
+		t.Fatalf("expected pt.scale(2.0) to auto-ADDR pt before the call; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "PGET\t%tmp_") || !strings.Contains(ir, "!Point_sum\t%tmp_") {
+		t.Fatalf("expected ptr.sum() to auto-PGET ptr before the call; got:\n%s", ir)
+	}
+}

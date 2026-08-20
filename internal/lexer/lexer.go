@@ -2,14 +2,16 @@
 // cascade_spec.md §1: newlines are significant statement terminators, and
 // "//" starts a line comment.
 //
-// Only the punctuation/operators Steps 1-6 need are lexed so far — "(",
-// ")", "{", "}", "[", "]" (list literals/indexing/types, §2.2/§3/§5), ":",
-// ",", "?" (nullable-type suffix, §2.3), "=" (plain assignment, §5), §6's
-// arithmetic/comparison/logical operators ("+" "-" "*" "/" "%" "==" "!="
-// "<" "<=" ">" ">=" "&&" "||" "!"), §6's bitwise/shift operators ("&" "|"
-// "^" "&^" "~" "<<" ">>"), and §5's compound-assignment/inc-dec set ("+="
-// "-=" "*=" "/=" "%=" "++" "--"). Unary "*"/"&" (pointers, Step 8),
-// postfix "?" (Step 11), and "|>" (Step 12) are lexed starting in the
+// Only the punctuation/operators Steps 1-8 need are lexed so far — "(",
+// ")", "{", "}", "[", "]" (list literals/indexing/types, §2.2/§3/§5), "."
+// (field/method access, §4.1/§8.2), ":", ",", "?" (nullable-type suffix,
+// §2.3), "=" (plain assignment, §5), §6's arithmetic/comparison/logical
+// operators ("+" "-" "*" "/" "%" "==" "!=" "<" "<=" ">" ">=" "&&" "||"
+// "!"), §6's bitwise/shift operators ("&" "|" "^" "&^" "~" "<<" ">>"), and
+// §5's compound-assignment/inc-dec set ("+=" "-=" "*=" "/=" "%=" "++"
+// "--"). "&"/"*" double as unary address-of/dereference (§6) — the parser
+// disambiguates by position, not the lexer (see parser's unaryOpNames).
+// Postfix "?" (Step 11) and "|>" (Step 12) are lexed starting in the
 // steps that introduce them. The full keyword set (§14) is already
 // reserved from the start (see token.go), since adding a keyword later is
 // free but an identifier silently becoming a keyword out from under
@@ -229,6 +231,8 @@ func (l *Lexer) lexOperator(line int) (Token, error) {
 		return Token{Kind: RBracket, Literal: "]", Line: line}, nil
 	case ':':
 		return Token{Kind: Colon, Literal: ":", Line: line}, nil
+	case '.':
+		return Token{Kind: Dot, Literal: ".", Line: line}, nil
 	case ',':
 		return Token{Kind: Comma, Literal: ",", Line: line}, nil
 	case '?':

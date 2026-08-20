@@ -62,6 +62,7 @@ const (
 	Colon
 	Comma
 	Question
+	Dot
 
 	// operators (cascade_spec.md §6, §5 for the compound-assignment/
 	// inc-dec set). "=" (Step 2), the arithmetic/comparison/logical set

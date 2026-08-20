@@ -42,16 +42,27 @@ func listTypeToken(elemName string) string {
 	return "^" + elemName + "list"
 }
 
-// typeToIR maps any Cascade type (scalar or list) to its AMIVM-IR type
-// token, registering the element type with reg if t is a list. Nested
-// list types (`[][]T`) aren't supported yet — cascade_spec.md never shows
-// one — so t.Elem itself being a list is an error here.
+// typeToIR maps any Cascade type (scalar, struct, list, or pointer) to
+// its AMIVM-IR type token, registering the element type with reg if t is
+// a list. Nested list types (`[][]T`) aren't supported yet —
+// cascade_spec.md never shows one — so t.Elem itself being a list is an
+// error here; likewise a pointer to a list or another pointer.
 func typeToIR(reg *sliceRegistry, t ast.Type) (string, error) {
 	if t.Elem != nil {
 		if t.Elem.Elem != nil {
 			return "", fmt.Errorf("codegen: nested list types are not supported yet")
 		}
 		return reg.use(t.Elem.Name), nil
+	}
+	if t.Ptr != nil {
+		if t.Ptr.Elem != nil || t.Ptr.Ptr != nil {
+			return "", fmt.Errorf("codegen: pointers to list/pointer types are not supported yet")
+		}
+		base, err := baseTypeName(*t.Ptr)
+		if err != nil {
+			return "", err
+		}
+		return "^*" + base, nil
 	}
 	return scalarTypeToIR(t)
 }

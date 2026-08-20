@@ -1,0 +1,53 @@
+struct Point {
+    x: float
+    y: float
+}
+
+struct Line {
+    start: Point
+    end: Point
+}
+
+// 値レシーバー: 呼び出し元のPointは変更されない
+func (p: Point) sum(): float {
+    return p.x + p.y
+}
+
+// ポインタレシーバー: 呼び出し元の構造体を書き換える
+func (p: *Point) scale(factor: float) {
+    p.x = p.x * factor
+    p.y = p.y * factor
+}
+
+func origin(): Point {
+    return Point{x: 0.0, y: 0.0}
+}
+
+func main(): int {
+    let pt: Point = Point{x: 3.0, y: 4.0}
+    print("sum=" + string(pt.sum()))
+
+    pt.scale(2.0)
+    print("x=" + string(pt.x) + " y=" + string(pt.y))
+
+    let p: *Point = &pt
+    print("via pointer, sum=" + string(p.sum()))
+    p.scale(0.5)
+    print("after pointer scale, x=" + string(pt.x))
+
+    let q: *Point = none
+    if q is none {
+        print("q is empty")
+    }
+    q = &pt
+    if q is not none {
+        print("q now points at pt")
+    }
+
+    let ln: Line
+    ln.start = origin()
+    ln.end = Point{x: 1.0, y: 1.0}
+    print("ln.end.x=" + string(ln.end.x))
+
+    return 0
+}

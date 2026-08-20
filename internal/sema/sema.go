@@ -1,14 +1,19 @@
 // Package sema performs semantic analysis on a Cascade ast.File, since
 // amivm delegates all type/scope checking to go/types and does not check
 // anything itself (see CLAUDE.md "意味検証の責任分担"). Only the checks
-// Steps 1-7 need are implemented so far: a single well-formed `main` plus
+// Steps 1-8 need are implemented so far: a single well-formed `main` plus
 // any number of other functions (§8.1) — including multi-value returns
 // (§8.5) — scope-resolved `let`/`const` declarations and scalar/list-
-// element/compound assignment, nullable-type (`T?`) compatibility and
-// narrowing (§2.3, §4.2, §5, §7), the full operator set (§6), control
-// flow (if/elif/else, while, for-in, switch, break/continue), and lists
-// (`[]T` — literals, indexing, append/range/len). Later steps add
-// structs, closures, and everything past that.
+// element/struct-field/compound assignment, nullable-type (`T?`)
+// compatibility and narrowing (§2.3, §4.2, §5, §7), the full operator set
+// (§6), control flow (if/elif/else, while, for-in, switch,
+// break/continue), lists (`[]T` — literals, indexing, append/range/len),
+// and structs/pointers/receiver functions (§4.1, §4.4, §8.2 — struct
+// declarations, struct literals requiring every field, field read/write
+// on a struct or a pointer to one, `&`/`*` address-of/dereference, and
+// method calls with automatic address-of/dereference between value and
+// pointer receivers). Later steps add closures, maps, channels/pipelines,
+// and everything past that.
 //
 // A function whose non-void body doesn't obviously return on every path
 // isn't checked here (no control-flow reachability analysis is
@@ -38,14 +43,29 @@ type funcSig struct {
 	Results []ast.Type
 }
 
-// checker carries state shared across every function body being checked
-// — currently just the signature table. This is the "小さな構造体
-// (checker)" seed_implementation_notes.md §7 recommends introducing once
-// program-wide (not just per-call-site) shared information is needed.
-// Scope, by contrast, changes with every nested block, so it stays an
-// explicit parameter throughout rather than becoming a checker field.
+// methodSig is one receiver function's signature (cascade_spec.md §8.2):
+// like funcSig, plus the receiver's own declared type (Name for a value
+// receiver, Ptr set for a pointer receiver — see receiverStructName).
+// Methods are looked up per struct name rather than through the flat
+// funcSig table, so a method and a plain function may freely share a
+// name, and so can two different structs' same-named methods.
+type methodSig struct {
+	RecvType ast.Type
+	Params   []ast.Type
+	Results  []ast.Type
+}
+
+// checker carries state shared across every function body being checked:
+// the signature table, the struct registry, and the method table. This is
+// the "小さな構造体(checker)" seed_implementation_notes.md §7 recommends
+// introducing once program-wide (not just per-call-site) shared
+// information is needed. Scope, by contrast, changes with every nested
+// block, so it stays an explicit parameter throughout rather than
+// becoming a checker field.
 type checker struct {
-	sigs map[string]funcSig
+	sigs    map[string]funcSig
+	structs map[string]*ast.StructDecl
+	methods map[string]map[string]methodSig // struct name -> method name -> sig
 }
 
 // reservedBuiltinNames are plain identifiers (not lexer keywords, unlike
@@ -71,10 +91,42 @@ var reservedBuiltinNames = map[string]bool{
 // table first, and then every function's body — main's and every other
 // one's — is checked against it.
 func Check(f *ast.File) error {
-	c := &checker{sigs: map[string]funcSig{}}
+	c := &checker{
+		sigs:    map[string]funcSig{},
+		structs: map[string]*ast.StructDecl{},
+		methods: map[string]map[string]methodSig{},
+	}
+
+	// Structs are registered in their own pass, before any field's type is
+	// validated, so a field may reference another struct regardless of
+	// declaration order — including its own struct (e.g. `next: *Node`).
+	for _, sd := range f.Structs {
+		if _, exists := c.structs[sd.Name]; exists {
+			return fmt.Errorf("line %d: duplicate struct %q", sd.Line, sd.Name)
+		}
+		c.structs[sd.Name] = sd
+	}
+	for _, sd := range f.Structs {
+		seen := map[string]bool{}
+		for _, field := range sd.Fields {
+			if seen[field.Name] {
+				return fmt.Errorf("line %d: struct %q: duplicate field %q", sd.Line, sd.Name, field.Name)
+			}
+			seen[field.Name] = true
+			if err := c.validateType(field.Type, sd.Line); err != nil {
+				return err
+			}
+			if field.Type.Nullable && field.Type.Ptr == nil {
+				return fmt.Errorf("line %d: struct %q: field %q: nullable non-pointer field types are not supported yet", sd.Line, sd.Name, field.Name)
+			}
+		}
+	}
 
 	var main *ast.FuncDecl
 	for _, fn := range f.Funcs {
+		if fn.Receiver != nil {
+			continue // registered into c.methods below, once every struct/plain-function name is known
+		}
 		if fn.Name == mainInternalName {
 			return fmt.Errorf("line %d: %q is a reserved name and cannot be used as a function name", fn.Line, mainInternalName)
 		}
@@ -84,7 +136,7 @@ func Check(f *ast.File) error {
 		if _, exists := c.sigs[fn.Name]; exists {
 			return fmt.Errorf("line %d: duplicate function %q", fn.Line, fn.Name)
 		}
-		if err := checkFuncSig(fn); err != nil {
+		if err := c.checkFuncSig(fn); err != nil {
 			return err
 		}
 		params := make([]ast.Type, len(fn.Params))
@@ -106,6 +158,33 @@ func Check(f *ast.File) error {
 		return fmt.Errorf("line %d: 'main' must return int (cascade_spec.md §12)", main.Line)
 	}
 
+	// Methods are namespaced per struct (see methodSig's doc), so a
+	// duplicate check here only rejects the same struct declaring the same
+	// method name twice, never a collision with c.sigs.
+	for _, fn := range f.Funcs {
+		if fn.Receiver == nil {
+			continue
+		}
+		structName, _, err := c.receiverStructName(*fn.Receiver)
+		if err != nil {
+			return err
+		}
+		if err := c.checkFuncSig(fn); err != nil {
+			return err
+		}
+		params := make([]ast.Type, len(fn.Params))
+		for i, p := range fn.Params {
+			params[i] = p.Type
+		}
+		if c.methods[structName] == nil {
+			c.methods[structName] = map[string]methodSig{}
+		}
+		if _, exists := c.methods[structName][fn.Name]; exists {
+			return fmt.Errorf("line %d: struct %q: duplicate method %q", fn.Line, structName, fn.Name)
+		}
+		c.methods[structName][fn.Name] = methodSig{RecvType: fn.Receiver.Type, Params: params, Results: fn.Results}
+	}
+
 	for _, fn := range f.Funcs {
 		if err := c.checkFuncBody(fn); err != nil {
 			return err
@@ -115,27 +194,65 @@ func Check(f *ast.File) error {
 }
 
 // checkFuncSig validates fn's declared signature on its own, before any
-// body is checked. Nullable return types would need a function's result
-// to carry a companion isset flag across the CALL/RET boundary — the
-// same 2-slot expansion codegen already does for a nullable *parameter*
-// (see codegen's genCallArgs) — but nothing through Step 7 demonstrates
-// it, and it's exactly what Step 11's `(T, error?)` convention needs, so
-// it's deliberately deferred there rather than half-built now.
-func checkFuncSig(fn *ast.FuncDecl) error {
+// body is checked: its receiver (if any) must name a known struct, and
+// every parameter/result type must be one validateType recognizes.
+// Nullable return types would need a function's result to carry a
+// companion isset flag across the CALL/RET boundary — the same 2-slot
+// expansion codegen already does for a nullable *parameter* (see
+// codegen's genCallArgs) — but nothing through Step 7 demonstrates it,
+// and it's exactly what Step 11's `(T, error?)` convention needs, so it's
+// deliberately deferred there rather than half-built now.
+func (c *checker) checkFuncSig(fn *ast.FuncDecl) error {
+	if fn.Receiver != nil {
+		if _, _, err := c.receiverStructName(*fn.Receiver); err != nil {
+			return err
+		}
+	}
+	for _, p := range fn.Params {
+		if err := c.validateType(p.Type, p.Line); err != nil {
+			return err
+		}
+	}
 	for _, r := range fn.Results {
 		if r.Nullable {
 			return fmt.Errorf("line %d: function %q: nullable return types are not supported yet", fn.Line, fn.Name)
+		}
+		if err := c.validateType(r, fn.Line); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
+// receiverStructName resolves a receiver's declared type to the struct
+// name it names (cascade_spec.md §8.2: either `Name` for a value receiver
+// or `*Name` for a pointer receiver — nothing else is valid there).
+func (c *checker) receiverStructName(p ast.Param) (name string, isPtr bool, err error) {
+	t := p.Type
+	if t.Ptr != nil {
+		t = *t.Ptr
+		isPtr = true
+	}
+	if t.Elem != nil || t.Name == "" {
+		return "", false, fmt.Errorf("line %d: receiver type must be a struct or a pointer to a struct", p.Line)
+	}
+	if _, ok := c.structs[t.Name]; !ok {
+		return "", false, fmt.Errorf("line %d: unknown struct type %q in receiver", p.Line, t.Name)
+	}
+	return t.Name, isPtr, nil
+}
+
 // checkFuncBody checks fn's body in a fresh scope pre-populated with its
-// parameters (cascade_spec.md §8.1) — §10's scoping rules apply to
-// parameters the same as any other declaration, including rejecting two
-// parameters with the same name.
+// receiver (if any, cascade_spec.md §8.2) and parameters (§8.1) — §10's
+// scoping rules apply to both the same as any other declaration,
+// including rejecting a parameter that shadows the receiver's name.
 func (c *checker) checkFuncBody(fn *ast.FuncDecl) error {
 	sc := newScope(nil)
+	if fn.Receiver != nil {
+		if !sc.declareLocal(fn.Receiver.Name, varInfo{Type: fn.Receiver.Type}) {
+			return fmt.Errorf("line %d: duplicate receiver name %q", fn.Receiver.Line, fn.Receiver.Name)
+		}
+	}
 	for _, p := range fn.Params {
 		if !sc.declareLocal(p.Name, varInfo{Type: p.Type}) {
 			return fmt.Errorf("line %d: duplicate parameter name %q", p.Line, p.Name)
@@ -147,6 +264,61 @@ func (c *checker) checkFuncBody(fn *ast.FuncDecl) error {
 		}
 	}
 	return nil
+}
+
+// validateType reports whether t names a type sema recognizes: a builtin
+// scalar (int/float/string/bool), a list of a valid type, a pointer to a
+// valid type, or a declared struct name (cascade_spec.md §2, §4.1). The
+// parser accepts any identifier as a type name (see parseTypeBase) since
+// it cannot know which ones are declared structs — that check happens
+// here instead, once every struct is registered.
+func (c *checker) validateType(t ast.Type, line int) error {
+	if t.Elem != nil {
+		return c.validateType(*t.Elem, line)
+	}
+	if t.Ptr != nil {
+		return c.validateType(*t.Ptr, line)
+	}
+	switch t.Name {
+	case "int", "float", "string", "bool":
+		return nil
+	}
+	if _, ok := c.structs[t.Name]; ok {
+		return nil
+	}
+	return fmt.Errorf("line %d: unknown type %q", line, t.Name)
+}
+
+// structTypeName reports the struct name t refers to, directly or
+// through a pointer (cascade_spec.md §4.1/§8.2 — a field/method access
+// works the same either way, see ast.FieldExpr's doc), and whether t
+// itself was a pointer. ok is false for any non-struct type (scalar,
+// list, or an unregistered name).
+func (c *checker) structTypeName(t ast.Type) (name string, isPtr bool, ok bool) {
+	if t.Ptr != nil {
+		t = *t.Ptr
+		isPtr = true
+	}
+	if t.Elem != nil || t.Name == "" {
+		return "", false, false
+	}
+	if _, exists := c.structs[t.Name]; !exists {
+		return "", false, false
+	}
+	return t.Name, isPtr, true
+}
+
+// isAddressable reports whether e is a valid operand for unary `&`
+// (cascade_spec.md §6) or a value-receiver method call's implicit
+// address-of (§8.2) — a plain variable only. Go itself allows the
+// broader set of lvalues (a struct field, a list element, ...), but
+// amivm's ADDR instruction accepts only a bare variable as its operand
+// (the "variable" category, amivm_spec.md §6: $N/&N/%xxx/@xxx — never a
+// field-path or index expression), so codegen has no way to honor
+// anything wider even though Go's own semantics would allow it.
+func isAddressable(e ast.Expr) bool {
+	_, ok := e.(*ast.Ident)
+	return ok
 }
 
 // checkStmt dispatches to one statement's own check function. want is the
@@ -164,6 +336,8 @@ func (c *checker) checkStmt(sc *scope, stmt ast.Stmt, want []ast.Type, loopDepth
 		return c.checkMultiLetDecl(sc, s)
 	case *ast.AssignStmt:
 		return c.checkAssignStmt(sc, s)
+	case *ast.DerefAssignStmt:
+		return c.checkDerefAssignStmt(sc, s)
 	case *ast.CompoundAssignStmt:
 		return c.checkCompoundAssignStmt(sc, s)
 	case *ast.IncDecStmt:
@@ -265,6 +439,18 @@ func (c *checker) checkIfStmt(sc *scope, stmt *ast.IfStmt, want []ast.Type, loop
 // (cascade_spec.md §2.3, §7) on a plain identifier already declared (and
 // nullable) in sc — wantNot selects which of the two (true for "is not
 // none", false for "is none") cond must be for narrowing to apply.
+//
+// A pointer is deliberately excluded even though it's always Nullable
+// (see ast.Type's doc): there is no distinct "non-nullable pointer" type
+// to narrow into — *T is *T whether or not it happens to be nil right
+// now — so reconstructing ast.Type{Name: orig.Type.Name, ...} below would
+// silently drop its Ptr field and produce a broken, nameless type (a real
+// bug caught by TestGenerate_PointerNullCheckUsesEQNilNotIssetFlag).
+// Nothing is lost by skipping it: field/method access through a pointer
+// is already unconditionally allowed regardless of nullness, mirroring
+// Go's own "a nil-pointer method call only panics on actual dereference"
+// behavior (see structTypeName's callers) — narrowing was never load-
+// bearing for pointers in the first place.
 func narrowedVarInfo(sc *scope, cond ast.Expr, wantNot bool) (name string, info varInfo, ok bool) {
 	nc, isCheck := cond.(*ast.NullCheckExpr)
 	if !isCheck || nc.Not != wantNot {
@@ -275,7 +461,7 @@ func narrowedVarInfo(sc *scope, cond ast.Expr, wantNot bool) (name string, info 
 		return "", varInfo{}, false
 	}
 	orig, found := sc.lookup(id.Name)
-	if !found || !orig.Type.Nullable {
+	if !found || !orig.Type.Nullable || orig.Type.Ptr != nil {
 		return "", varInfo{}, false
 	}
 	narrowed := orig
@@ -442,9 +628,14 @@ func (c *checker) checkLetDecl(sc *scope, decl *ast.LetDecl) error {
 			return err
 		}
 		typ = t
-	} else if decl.Init != nil {
-		if err := c.checkAssignable(sc, typ, decl.Init); err != nil {
+	} else {
+		if err := c.validateType(typ, decl.Line); err != nil {
 			return err
+		}
+		if decl.Init != nil {
+			if err := c.checkAssignable(sc, typ, decl.Init); err != nil {
+				return err
+			}
 		}
 	}
 	decl.ResolvedType = typ
@@ -463,9 +654,9 @@ func (c *checker) checkLetDecl(sc *scope, decl *ast.LetDecl) error {
 // Names. "_" entries are validated like any other but declare nothing
 // (cascade_spec.md §5).
 func (c *checker) checkMultiLetDecl(sc *scope, decl *ast.MultiLetDecl) error {
-	sig, ok := c.sigs[decl.Init.Callee]
-	if !ok {
-		return fmt.Errorf("line %d: undefined function %q", decl.Init.Line, decl.Init.Callee)
+	sig, err := c.callSig(sc, decl.Init)
+	if err != nil {
+		return err
 	}
 	if err := c.checkCallArgs(sc, decl.Init, sig); err != nil {
 		return err
@@ -486,10 +677,11 @@ func (c *checker) checkMultiLetDecl(sc *scope, decl *ast.MultiLetDecl) error {
 	return nil
 }
 
-// checkAssignStmt validates `name = value` or, when Index is set,
-// `name[Index] = value` (cascade_spec.md §5). Index assignment mutates
-// element content rather than rebinding the variable itself, so it's
-// allowed even on a `const`-declared list (only `name = ...` itself is
+// checkAssignStmt validates `name = value`; `name[Index] = value` when
+// Index is set; or `name.Field = value` when Field is set
+// (cascade_spec.md §5). Both Index and Field assignment mutate existing
+// content rather than rebinding the variable itself, so both are allowed
+// even on a `const`-declared variable (only bare `name = ...` is
 // forbidden there).
 func (c *checker) checkAssignStmt(sc *scope, stmt *ast.AssignStmt) error {
 	info, ok := sc.lookup(stmt.Name)
@@ -509,10 +701,38 @@ func (c *checker) checkAssignStmt(sc *scope, stmt *ast.AssignStmt) error {
 		}
 		return c.checkAssignable(sc, *info.Type.Elem, stmt.Value)
 	}
+	if stmt.Field != "" {
+		name, isPtr, ok := c.structTypeName(info.Type)
+		if !ok {
+			return fmt.Errorf("line %d: cannot access field %q on non-struct type %s", stmt.Line, stmt.Field, typeString(info.Type))
+		}
+		if !isPtr && info.Type.Nullable {
+			return fmt.Errorf("line %d: cannot access a field of a nullable struct value %s (narrow with 'is not none' first)", stmt.Line, typeString(info.Type))
+		}
+		fieldType, found := structFieldType(c.structs[name], stmt.Field)
+		if !found {
+			return fmt.Errorf("line %d: struct %q has no field %q", stmt.Line, name, stmt.Field)
+		}
+		return c.checkAssignable(sc, fieldType, stmt.Value)
+	}
 	if info.Const {
 		return fmt.Errorf("line %d: cannot assign to %q (declared const)", stmt.Line, stmt.Name)
 	}
 	return c.checkAssignable(sc, info.Type, stmt.Value)
+}
+
+// checkDerefAssignStmt validates `*Ptr = Value` (cascade_spec.md §5):
+// Ptr must have a pointer type, and Value must be assignable to its
+// pointee type.
+func (c *checker) checkDerefAssignStmt(sc *scope, stmt *ast.DerefAssignStmt) error {
+	pt, err := c.exprType(sc, stmt.Ptr)
+	if err != nil {
+		return err
+	}
+	if pt.Ptr == nil {
+		return fmt.Errorf("line %d: cannot dereference non-pointer type %s", ast.ExprLine(stmt.Ptr), typeString(pt))
+	}
+	return c.checkAssignable(sc, *pt.Ptr, stmt.Value)
 }
 
 // checkExprStmt validates a call-expression statement: the `print`
@@ -524,6 +744,13 @@ func (c *checker) checkExprStmt(sc *scope, stmt *ast.ExprStmt) error {
 	call, ok := stmt.X.(*ast.CallExpr)
 	if !ok {
 		return fmt.Errorf("line %d: expected a call expression", ast.ExprLine(stmt.X))
+	}
+	if call.Receiver != nil {
+		sig, err := c.resolveMethodCall(sc, call)
+		if err != nil {
+			return err
+		}
+		return c.checkCallArgs(sc, call, sig)
 	}
 	switch call.Callee {
 	case "print":
@@ -614,6 +841,63 @@ func (c *checker) checkCallArgs(sc *scope, call *ast.CallExpr, sig funcSig) erro
 	return nil
 }
 
+// resolveMethodCall resolves a method call's receiver (cascade_spec.md
+// §8.2): the receiver expression's type must name a known struct
+// (directly or through a pointer), that struct must declare a method
+// named call.Callee, and — when the receiver's own value/pointer kind
+// doesn't already match the method's declared receiver kind — the
+// mismatch must be bridgeable automatically: a value receiver expression
+// used where a pointer receiver is wanted must be addressable (§6;
+// codegen emits an implicit ADDR, see CallExpr.RecvNeedsAddr), while a
+// pointer receiver expression used where a value receiver is wanted is
+// always bridgeable (an implicit PGET, see RecvNeedsDeref). The
+// resolution is recorded onto call itself so codegen doesn't have to redo
+// it.
+func (c *checker) resolveMethodCall(sc *scope, call *ast.CallExpr) (funcSig, error) {
+	rt, err := c.exprType(sc, call.Receiver)
+	if err != nil {
+		return funcSig{}, err
+	}
+	name, isPtr, ok := c.structTypeName(rt)
+	if !ok {
+		return funcSig{}, fmt.Errorf("line %d: cannot call a method on non-struct type %s", call.Line, typeString(rt))
+	}
+	if !isPtr && rt.Nullable {
+		return funcSig{}, fmt.Errorf("line %d: cannot call a method on a nullable struct value %s (narrow with 'is not none' first)", call.Line, typeString(rt))
+	}
+	sig, ok := c.methods[name][call.Callee]
+	if !ok {
+		return funcSig{}, fmt.Errorf("line %d: struct %q has no method %q", call.Line, name, call.Callee)
+	}
+	wantPtr := sig.RecvType.Ptr != nil
+	switch {
+	case wantPtr && !isPtr:
+		if !isAddressable(call.Receiver) {
+			return funcSig{}, fmt.Errorf("line %d: cannot take the address of this expression to call %s.%s (pointer receiver)", call.Line, name, call.Callee)
+		}
+		call.RecvNeedsAddr = true
+	case !wantPtr && isPtr:
+		call.RecvNeedsDeref = true
+	}
+	call.RecvStruct = name
+	return funcSig{Params: sig.Params, Results: sig.Results}, nil
+}
+
+// callSig resolves call's signature, whether it's a plain function call
+// or a method call (Receiver non-nil) — shared by checkMultiLetDecl,
+// the one call site that needs a signature without also wanting
+// checkCallExprValue/checkExprStmt's single-/void-value restrictions.
+func (c *checker) callSig(sc *scope, call *ast.CallExpr) (funcSig, error) {
+	if call.Receiver != nil {
+		return c.resolveMethodCall(sc, call)
+	}
+	sig, ok := c.sigs[call.Callee]
+	if !ok {
+		return funcSig{}, fmt.Errorf("line %d: undefined function %q", call.Line, call.Callee)
+	}
+	return sig, nil
+}
+
 // checkListLiteralAgainst validates a list literal's elements against
 // target's element type (cascade_spec.md §3, §4.3). target must itself be
 // a list type — an empty `[]` is valid here (the loop simply doesn't
@@ -628,6 +912,47 @@ func (c *checker) checkListLiteralAgainst(sc *scope, lit *ast.ListLit, target as
 		}
 	}
 	return nil
+}
+
+// checkStructLit validates a struct literal (cascade_spec.md §4.1): every
+// field the struct declares must be given exactly once, with a value
+// assignable to that field's declared type — see ast.StructLit's doc for
+// why there is no partial/defaulted-field form.
+func (c *checker) checkStructLit(sc *scope, lit *ast.StructLit) (ast.Type, error) {
+	sd, ok := c.structs[lit.TypeName]
+	if !ok {
+		return ast.Type{}, fmt.Errorf("line %d: unknown struct type %q", lit.Line, lit.TypeName)
+	}
+	given := map[string]bool{}
+	for _, fi := range lit.Fields {
+		if given[fi.Name] {
+			return ast.Type{}, fmt.Errorf("line %d: field %q given more than once", lit.Line, fi.Name)
+		}
+		given[fi.Name] = true
+		fieldType, found := structFieldType(sd, fi.Name)
+		if !found {
+			return ast.Type{}, fmt.Errorf("line %d: struct %q has no field %q", lit.Line, lit.TypeName, fi.Name)
+		}
+		if err := c.checkAssignable(sc, fieldType, fi.Value); err != nil {
+			return ast.Type{}, err
+		}
+	}
+	for _, f := range sd.Fields {
+		if !given[f.Name] {
+			return ast.Type{}, fmt.Errorf("line %d: struct literal %q is missing field %q", lit.Line, lit.TypeName, f.Name)
+		}
+	}
+	return ast.Type{Name: lit.TypeName}, nil
+}
+
+// structFieldType looks up name among sd's declared fields.
+func structFieldType(sd *ast.StructDecl, name string) (ast.Type, bool) {
+	for _, f := range sd.Fields {
+		if f.Name == name {
+			return f.Type, true
+		}
+	}
+	return ast.Type{}, false
 }
 
 // typeShapeEqual reports whether a and b are the same type, ignoring
@@ -646,10 +971,10 @@ func typeShapeEqual(a, b ast.Type) bool {
 
 // typeGiven reports whether t is an explicitly written type (`let x: T`)
 // as opposed to the zero Type `let x = Init` leaves for inference — a
-// list type has an empty Name, so checking Name alone isn't enough once
-// list types exist.
+// list or pointer type has an empty Name, so checking Name alone isn't
+// enough once those exist.
 func typeGiven(t ast.Type) bool {
-	return t.Name != "" || t.Elem != nil
+	return t.Name != "" || t.Elem != nil || t.Ptr != nil
 }
 
 // exprType infers e's type. NoneLit has no type of its own (see its doc
@@ -694,7 +1019,54 @@ func (c *checker) exprType(sc *scope, e ast.Expr) (ast.Type, error) {
 		return info.Type, nil
 	case *ast.CallExpr:
 		return c.checkCallExprValue(sc, v)
+	case *ast.StructLit:
+		return c.checkStructLit(sc, v)
+	case *ast.FieldExpr:
+		xt, err := c.exprType(sc, v.X)
+		if err != nil {
+			return ast.Type{}, err
+		}
+		name, isPtr, ok := c.structTypeName(xt)
+		if !ok {
+			return ast.Type{}, fmt.Errorf("line %d: cannot access field %q on non-struct type %s", v.Line, v.Field, typeString(xt))
+		}
+		if !isPtr && xt.Nullable {
+			return ast.Type{}, fmt.Errorf("line %d: cannot access a field of a nullable struct value %s (narrow with 'is not none' first)", v.Line, typeString(xt))
+		}
+		fieldType, found := structFieldType(c.structs[name], v.Field)
+		if !found {
+			return ast.Type{}, fmt.Errorf("line %d: struct %q has no field %q", v.Line, name, v.Field)
+		}
+		v.ResultType = fieldType
+		return fieldType, nil
 	case *ast.UnaryExpr:
+		// "&" (address-of) and "*" (dereference) don't fit
+		// unaryResultType's generic scalar-operator shape — see
+		// isAddressable's doc and ast.Type's pointer-nullability doc.
+		if v.Op == "&" {
+			if !isAddressable(v.X) {
+				return ast.Type{}, fmt.Errorf("line %d: cannot take the address of this expression", v.Line)
+			}
+			xt, err := c.exprType(sc, v.X)
+			if err != nil {
+				return ast.Type{}, err
+			}
+			rt := ast.Type{Ptr: &xt, Nullable: true}
+			v.ResultType = rt
+			return rt, nil
+		}
+		if v.Op == "*" {
+			xt, err := c.exprType(sc, v.X)
+			if err != nil {
+				return ast.Type{}, err
+			}
+			if xt.Ptr == nil {
+				return ast.Type{}, fmt.Errorf("line %d: cannot dereference non-pointer type %s", v.Line, typeString(xt))
+			}
+			rt := *xt.Ptr
+			v.ResultType = rt
+			return rt, nil
+		}
 		xt, err := c.exprType(sc, v.X)
 		if err != nil {
 			return ast.Type{}, err
@@ -768,6 +1140,22 @@ func (c *checker) inferListLitType(sc *scope, lit *ast.ListLit) (ast.Type, error
 // form instead. The rest of §13's builtins (filter/map/reduce, which
 // need closures) land in the steps that need them.
 func (c *checker) checkCallExprValue(sc *scope, call *ast.CallExpr) (ast.Type, error) {
+	if call.Receiver != nil {
+		sig, err := c.resolveMethodCall(sc, call)
+		if err != nil {
+			return ast.Type{}, err
+		}
+		if err := c.checkCallArgs(sc, call, sig); err != nil {
+			return ast.Type{}, err
+		}
+		if len(sig.Results) == 0 {
+			return ast.Type{}, fmt.Errorf("line %d: %s() returns no value", call.Line, call.Callee)
+		}
+		if len(sig.Results) > 1 {
+			return ast.Type{}, fmt.Errorf("line %d: %s() returns multiple values; use a multi-value let (e.g. 'let a, b = %s(...)') to receive them", call.Line, call.Callee, call.Callee)
+		}
+		return sig.Results[0], nil
+	}
 	switch call.Callee {
 	case "string":
 		if len(call.Args) != 1 {

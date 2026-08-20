@@ -2,11 +2,17 @@
 // shared vocabulary between parser, sema, and codegen.
 package ast
 
-// Type is a Cascade type reference: a bare scalar name (cascade_spec.md
-// §2.1: int/float/string/bool, Name set and Elem nil) or a list type
-// (§2.2's `[]T`, Elem set to T and Name unused/empty), either optionally
-// nullable (§2.3). Pointer/map/func/struct/error forms are added as the
-// steps that need them land (see CLAUDE.md's implementation step plan).
+// Type is a Cascade type reference: a bare scalar or struct name
+// (cascade_spec.md §2.1/§4.1: int/float/string/bool/StructName — Name
+// set, Elem and Ptr nil), a list type (§2.2's `[]T`, Elem set to T), or a
+// pointer type (§2.2's `*T`, Ptr set to T), either optionally nullable
+// (§2.3) — except a pointer, which is *always* nullable regardless of
+// whether `?` was written (§2.2's own zero value for `*T` is `none`; see
+// CLAUDE.md's "確定した設計判断" for why a pointer's nullability is
+// represented via Go's native nil rather than a companion isset flag,
+// unlike every other nullable type). Map/func/error forms are added as
+// the steps that need them land (see CLAUDE.md's implementation step
+// plan).
 //
 // `?` always binds to the outermost type built so far — `[]int?` parses
 // as `([]int)?` (a nullable list), not `[](int?)` (a list of nullable
@@ -18,6 +24,7 @@ type Type struct {
 	Name     string
 	Nullable bool
 	Elem     *Type
+	Ptr      *Type
 }
 
 // Param is a single function parameter.
@@ -27,21 +34,38 @@ type Param struct {
 	Line int
 }
 
-// FuncDecl is a top-level function declaration (cascade_spec.md §8.1).
-// Results is empty when the function has no return value, and may hold
-// more than one entry for a multi-value return (§8.5) — modeling that
-// shape from the start avoids reworking every caller once Step 7 adds it.
+// FuncDecl is a top-level function declaration (cascade_spec.md §8.1), or,
+// when Receiver is non-nil, a receiver function (§8.2) — `func (p: Point)
+// magnitude(): float { ... }`. Results is empty when the function has no
+// return value, and may hold more than one entry for a multi-value return
+// (§8.5) — modeling that shape from the start avoids reworking every
+// caller once Step 7 adds it.
 type FuncDecl struct {
-	Name    string
-	Params  []Param
-	Results []Type
-	Body    []Stmt
-	Line    int
+	Receiver *Param // non-nil for a receiver function (§8.2)
+	Name     string
+	Params   []Param
+	Results  []Type
+	Body     []Stmt
+	Line     int
+}
+
+// StructField is one field in a struct declaration (cascade_spec.md §4.1).
+type StructField struct {
+	Name string
+	Type Type
+}
+
+// StructDecl is a top-level `struct` declaration (cascade_spec.md §4.1).
+type StructDecl struct {
+	Name   string
+	Fields []StructField
+	Line   int
 }
 
 // File is the root node of a parsed Cascade source file.
 type File struct {
-	Funcs []*FuncDecl
+	Structs []*StructDecl
+	Funcs   []*FuncDecl
 }
 
 // Stmt is implemented by every statement node.
@@ -106,18 +130,34 @@ type MultiLetDecl struct {
 
 func (*MultiLetDecl) stmtNode() {}
 
-// AssignStmt is a scalar assignment (cascade_spec.md §5): `name = Value`,
-// or, when Index is non-nil, a single list-element assignment (`name[Index]
-// = Value`). The struct-field/pointer-deref/map-element forms are added
-// once the steps that introduce those types land.
+// AssignStmt is a scalar assignment (cascade_spec.md §5): `name = Value`;
+// `name[Index] = Value`, a single list-element assignment, when Index is
+// non-nil; or `name.Field = Value`, a struct-field assignment (§4.1,
+// §8.2 — name may be a struct or a pointer to one, written identically),
+// when Field is non-empty. Index and Field are never both set. The
+// pointer-dereference form (`*ptr = Value`) is its own statement,
+// DerefAssignStmt, since its target isn't name-rooted. The map-element
+// form is added once maps land (Step 10).
 type AssignStmt struct {
 	Name  string
-	Index Expr // nil for `name = value`; non-nil for `name[Index] = value`
+	Index Expr   // non-nil for `name[Index] = value`
+	Field string // non-empty for `name.Field = value`
 	Value Expr
 	Line  int
 }
 
 func (*AssignStmt) stmtNode() {}
+
+// DerefAssignStmt is `*Ptr = Value` (cascade_spec.md §5): assignment
+// through a pointer dereference. Ptr is typically a plain identifier, but
+// nothing here requires that.
+type DerefAssignStmt struct {
+	Ptr   Expr
+	Value Expr
+	Line  int
+}
+
+func (*DerefAssignStmt) stmtNode() {}
 
 // CompoundAssignStmt is a compound assignment (cascade_spec.md §5): `name
 // op= Value` where op is one of + - * / %. Like `++`/`--`, this only
@@ -305,7 +345,14 @@ type IndexExpr struct {
 
 func (*IndexExpr) exprNode() {}
 
-// CallExpr is a function call, e.g. print("hello").
+// CallExpr is a function call, e.g. print("hello"), or, when Receiver is
+// non-nil, a method call (cascade_spec.md §8.2) — `p.magnitude()` parses
+// as CallExpr{Receiver: p, Callee: "magnitude"}. Reusing CallExpr for
+// both (rather than a parallel MethodCallExpr type) means every place
+// that already resolves/compiles a call — as a statement, a value, or a
+// MultiLetDecl's initializer — only needs one extra branch (does Receiver
+// name a struct method or does Callee name a plain function?) instead of
+// duplicating all of checkCallExprValue/checkExprStmt/genCallValue/etc.
 //
 // ArgType is filled in by sema.Check only for the builtins that need an
 // argument's resolved type to pick their AMIVM-IR (cascade_spec.md §13):
@@ -314,17 +361,62 @@ func (*IndexExpr) exprNode() {}
 // This mirrors BinaryExpr/UnaryExpr's ResultType — the same pattern
 // Seed's identical CallExpr.ArgType uses — so codegen never re-derives a
 // type it already has. It's the zero Type for every other call.
+//
+// RecvStruct/RecvNeedsAddr/RecvNeedsDeref are filled in by sema.Check
+// only when Receiver is non-nil (cascade_spec.md §8.2): RecvStruct is the
+// resolved struct name, used to build the method's qualified top-level
+// function name (StructName_Method — see CLAUDE.md's "確定した設計判断").
+// RecvNeedsAddr/RecvNeedsDeref record whether Receiver itself must be
+// automatically address-of'd or dereferenced before the call, when its
+// own value/pointer kind doesn't already match the method's declared
+// receiver kind — at most one of the two is ever true.
 type CallExpr struct {
-	Callee  string
-	Args    []Expr
-	Line    int
-	ArgType Type
+	Receiver       Expr // non-nil for obj.method(...); nil for a plain call
+	Callee         string
+	Args           []Expr
+	Line           int
+	ArgType        Type
+	RecvStruct     string
+	RecvNeedsAddr  bool
+	RecvNeedsDeref bool
 }
 
 func (*CallExpr) exprNode() {}
 
-// UnaryExpr is a prefix unary operator (cascade_spec.md §6): "!", "-", or
-// "~" so far — "*"/"&" join once pointers land (Step 8). ResultType is
+// StructFieldInit is one `name: value` pair in a struct literal.
+type StructFieldInit struct {
+	Name  string
+	Value Expr
+}
+
+// StructLit is a struct literal, e.g. `Point{x: 1.0, y: 2.0}`
+// (cascade_spec.md §4.1). Every field must be given explicitly — there is
+// no partial/defaulted-field form (see CLAUDE.md's "確定した設計判断").
+type StructLit struct {
+	TypeName string
+	Fields   []StructFieldInit
+	Line     int
+}
+
+func (*StructLit) exprNode() {}
+
+// FieldExpr is a struct field read, e.g. `p.x` (cascade_spec.md §4.1,
+// §8.2 — X may be a struct or a pointer to one, read identically; Go's
+// own auto-deref on field access means codegen needs no special case for
+// either). ResultType is filled in by sema.Check with the field's
+// declared type, so codegen doesn't have to re-derive it.
+type FieldExpr struct {
+	X          Expr
+	Field      string
+	Line       int
+	ResultType Type
+}
+
+func (*FieldExpr) exprNode() {}
+
+// UnaryExpr is a prefix unary operator (cascade_spec.md §6): "!", "-",
+// "~", "&" (address-of — X must be addressable, cascade_spec.md §6; see
+// CLAUDE.md's "確定した設計判断"), or "*" (dereference). ResultType is
 // filled in by sema.Check; codegen relies on it to pick the right
 // AMIVM-IR type for the temporary holding the result (the same
 // ast-annotation pattern LetDecl.ResolvedType uses).
@@ -377,6 +469,8 @@ func StmtLine(s Stmt) int {
 		return v.Line
 	case *AssignStmt:
 		return v.Line
+	case *DerefAssignStmt:
+		return v.Line
 	case *CompoundAssignStmt:
 		return v.Line
 	case *IncDecStmt:
@@ -418,6 +512,10 @@ func ExprLine(e Expr) int {
 	case *IndexExpr:
 		return v.Line
 	case *CallExpr:
+		return v.Line
+	case *StructLit:
+		return v.Line
+	case *FieldExpr:
 		return v.Line
 	case *UnaryExpr:
 		return v.Line

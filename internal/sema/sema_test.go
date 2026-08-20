@@ -881,6 +881,263 @@ func main(): int {
 	}
 }
 
+func TestCheck_ValidStructsAndPointers(t *testing.T) {
+	src := `
+struct Point {
+	x: float
+	y: float
+}
+
+struct Line {
+	start: Point
+	end: Point
+}
+
+func (p: Point) sum(): float {
+	return p.x + p.y
+}
+
+func (p: *Point) scale(factor: float) {
+	p.x = p.x * factor
+	p.y = p.y * factor
+}
+
+func origin(): Point {
+	return Point{x: 0.0, y: 0.0}
+}
+
+func main(): int {
+	let pt: Point = Point{x: 3.0, y: 4.0}
+	print(string(pt.sum()))
+
+	pt.scale(2.0)
+	print(string(pt.x))
+
+	let p: *Point = &pt
+	print(string(p.sum()))
+	p.scale(0.5)
+
+	let q: *Point = none
+	if q is none {
+		print("empty")
+	}
+	q = &pt
+	if q is not none {
+		print("set")
+	}
+
+	let ln: Line
+	ln.start = origin()
+	ln.end = Point{x: 1.0, y: 1.0}
+	print(string(ln.end.x))
+
+	return 0
+}
+`
+	if err := check(t, src); err != nil {
+		t.Fatalf("Check() = %v, want nil", err)
+	}
+}
+
+func TestCheck_StructPointerErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		src     string
+		wantErr string
+	}{
+		{
+			name: "duplicate struct name",
+			src: `
+struct Point { x: int }
+struct Point { y: int }
+func main(): int {
+	return 0
+}
+`,
+			wantErr: "duplicate struct \"Point\"",
+		},
+		{
+			name: "duplicate field name",
+			src: `
+struct Point {
+	x: int
+	x: int
+}
+func main(): int {
+	return 0
+}
+`,
+			wantErr: "duplicate field \"x\"",
+		},
+		{
+			name: "unknown field type",
+			src: `
+struct Foo { x: Bar }
+func main(): int {
+	return 0
+}
+`,
+			wantErr: "unknown type \"Bar\"",
+		},
+		{
+			name: "nullable non-pointer field type is rejected",
+			src: `
+struct Foo { x: int? }
+func main(): int {
+	return 0
+}
+`,
+			wantErr: "nullable non-pointer field types are not supported yet",
+		},
+		{
+			name: "struct literal missing a field",
+			src: `
+struct Point {
+	x: int
+	y: int
+}
+func main(): int {
+	let p = Point{x: 1}
+	return 0
+}
+`,
+			wantErr: "missing field \"y\"",
+		},
+		{
+			name: "struct literal unknown field",
+			src: `
+struct Point {
+	x: int
+	y: int
+}
+func main(): int {
+	let p = Point{x: 1, y: 2, z: 3}
+	return 0
+}
+`,
+			wantErr: "struct \"Point\" has no field \"z\"",
+		},
+		{
+			name: "field access on a non-struct",
+			src: `
+func main(): int {
+	let x = 1
+	let y = x.field
+	return 0
+}
+`,
+			wantErr: "cannot access field \"field\" on non-struct type int",
+		},
+		{
+			name: "unknown field on a known struct",
+			src: `
+struct Point {
+	x: int
+	y: int
+}
+func main(): int {
+	let p = Point{x: 1, y: 2}
+	let z = p.z
+	return 0
+}
+`,
+			wantErr: "struct \"Point\" has no field \"z\"",
+		},
+		{
+			name: "receiver type must name a known struct",
+			src: `
+func (p: Missing) foo(): int {
+	return 0
+}
+func main(): int {
+	return 0
+}
+`,
+			wantErr: "unknown struct type \"Missing\" in receiver",
+		},
+		{
+			name: "duplicate method name on the same struct",
+			src: `
+struct Point { x: int }
+func (p: Point) foo(): int {
+	return 0
+}
+func (p: Point) foo(): int {
+	return 1
+}
+func main(): int {
+	return 0
+}
+`,
+			wantErr: "duplicate method \"foo\"",
+		},
+		{
+			name: "call to an undeclared method",
+			src: `
+struct Point { x: int }
+func main(): int {
+	let p = Point{x: 1}
+	p.missing()
+	return 0
+}
+`,
+			wantErr: "struct \"Point\" has no method \"missing\"",
+		},
+		{
+			name: "pointer-receiver method requires an addressable receiver",
+			src: `
+struct Point {
+	x: int
+}
+func (p: *Point) foo(): int {
+	return p.x
+}
+func main(): int {
+	let ok = Point{x: 1}.foo()
+	return 0
+}
+`,
+			wantErr: "cannot take the address of this expression",
+		},
+		{
+			name: "dereferencing a non-pointer is rejected",
+			src: `
+func main(): int {
+	let x = 1
+	*x = 2
+	return 0
+}
+`,
+			wantErr: "cannot dereference non-pointer type int",
+		},
+		{
+			name: "address-of a non-addressable expression is rejected",
+			src: `
+func f(): int {
+	return 1
+}
+func main(): int {
+	let p = &f()
+	return 0
+}
+`,
+			wantErr: "cannot take the address of this expression",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := check(t, tt.src)
+			if err == nil {
+				t.Fatalf("Check() = nil, want error containing %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Check() = %q, want error containing %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestCheck_FunctionErrors(t *testing.T) {
 	tests := []struct {
 		name    string

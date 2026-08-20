@@ -3,20 +3,27 @@
 // for why no parser generator is used).
 //
 // The grammar implemented here is intentionally a subset of
-// cascade_spec.md: top-level func declarations with a single or
-// multi-value (`(T1, T2)`) result type (§8.1, §8.5); a block of
-// statements covering `let`/`const` declarations (including the
-// multi-value `let n1, n2 = call(...)` form), a call-expression
-// statement, scalar/list-element/compound assignment, `++`/`--`,
-// `return`, `if`/`elif`/`else`, `while`, `for x in list`, `switch`
-// (tagged and untagged), and `break`/`continue`; and a full
-// operator-precedence expression grammar (§6), literals (including
-// nullable-type `T?` declarations, the `none` literal, and list literals
-// `[1, 2, 3]`/`[]`), variable references, function calls, list indexing
-// `xs[i]`, and `is none`/`is not none` (§7) directly on an atom (the only
-// place the spec actually uses it — as an `if`/`switch` condition). Later
-// development steps extend this grammar further (structs, closures, ...)
-// one feature at a time.
+// cascade_spec.md: top-level `struct` declarations (§4.1) and func
+// declarations, including an optional receiver clause `func (p: Point)
+// name(...)` (§8.2), with a single or multi-value (`(T1, T2)`) result
+// type (§8.1, §8.5); a block of statements covering `let`/`const`
+// declarations (including the multi-value `let n1, n2 = call(...)`
+// form), a call-expression statement (plain or `obj.method(...)`), a
+// dereferencing assignment `*ptr = value` (§4.4), scalar/list-element/
+// struct-field/compound assignment, `++`/`--`, `return`, `if`/`elif`/
+// `else`, `while`, `for x in list`, `switch` (tagged and untagged), and
+// `break`/`continue`; and a full operator-precedence expression grammar
+// (§6, including unary `&`/`*` for address-of/dereference, §4.4),
+// literals (including nullable-type `T?` declarations, pointer types
+// `*T`, the `none` literal, list literals `[1, 2, 3]`/`[]`, and struct
+// literals `Name{field: value, ...}`), variable references, function/
+// method calls, field access `x.field`, list indexing `xs[i]`, and `is
+// none`/`is not none` (§7) directly on an atom (the only place the spec
+// actually uses it — as an `if`/`switch` condition). A struct literal is
+// only recognized where `{` cannot instead open a block (see
+// withStructLitForbidden/withStructLitAllowed), mirroring Go's identical
+// restriction. Later development steps extend this grammar further
+// (closures, channels/pipelines, ...) one feature at a time.
 package parser
 
 import (
@@ -40,6 +47,37 @@ func Parse(src string) (*ast.File, error) {
 type parser struct {
 	toks []lexer.Token
 	pos  int
+	// noStructLit disables parsing a bare `Name{...}` as a struct literal
+	// (cascade_spec.md §4.1) — set while parsing an if/while/switch/for-in
+	// condition, which is otherwise ambiguous with the construct's own
+	// following '{' body (the same restriction Go places on composite
+	// literals in these exact positions). Cleared again inside any
+	// unambiguous bracket/paren context — see withStructLitAllowed.
+	noStructLit bool
+}
+
+// withStructLitForbidden parses using fn with struct-literal parsing
+// disabled — for an if/while/switch/for-in condition immediately followed
+// by the construct's own '{' body.
+func (p *parser) withStructLitForbidden(fn func() (ast.Expr, error)) (ast.Expr, error) {
+	saved := p.noStructLit
+	p.noStructLit = true
+	x, err := fn()
+	p.noStructLit = saved
+	return x, err
+}
+
+// withStructLitAllowed parses using fn with struct-literal parsing
+// re-enabled — for anywhere inside an unambiguous bracket/paren context
+// (call arguments, a list literal's elements, a struct literal's own
+// field values, a parenthesized sub-expression), even while nested inside
+// a condition that itself forbids a bare struct literal.
+func (p *parser) withStructLitAllowed(fn func() (ast.Expr, error)) (ast.Expr, error) {
+	saved := p.noStructLit
+	p.noStructLit = false
+	x, err := fn()
+	p.noStructLit = saved
+	return x, err
 }
 
 func (p *parser) cur() lexer.Token {
@@ -89,12 +127,56 @@ func (p *parser) parseFile() (*ast.File, error) {
 				return nil, err
 			}
 			f.Funcs = append(f.Funcs, fn)
+		case lexer.KwStruct:
+			sd, err := p.parseStructDecl()
+			if err != nil {
+				return nil, err
+			}
+			f.Structs = append(f.Structs, sd)
 		default:
-			return nil, fmt.Errorf("line %d: expected 'func' at top level, got %q", p.cur().Line, p.cur().Literal)
+			return nil, fmt.Errorf("line %d: expected 'func' or 'struct' at top level, got %q", p.cur().Line, p.cur().Literal)
 		}
 		p.skipNewlines()
 	}
 	return f, nil
+}
+
+// parseStructDecl parses a `struct` declaration (cascade_spec.md §4.1):
+// `struct Name { field: Type ... }`, one field per line.
+func (p *parser) parseStructDecl() (*ast.StructDecl, error) {
+	kw, err := p.expect(lexer.KwStruct, "'struct'")
+	if err != nil {
+		return nil, err
+	}
+	name, err := p.expect(lexer.Ident, "struct name")
+	if err != nil {
+		return nil, err
+	}
+	sd := &ast.StructDecl{Name: name.Literal, Line: kw.Line}
+
+	if _, err := p.expect(lexer.LBrace, "'{'"); err != nil {
+		return nil, err
+	}
+	p.skipNewlines()
+	for p.cur().Kind != lexer.RBrace {
+		fname, err := p.expect(lexer.Ident, "field name")
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(lexer.Colon, "':'"); err != nil {
+			return nil, err
+		}
+		typ, err := p.parseType()
+		if err != nil {
+			return nil, err
+		}
+		sd.Fields = append(sd.Fields, ast.StructField{Name: fname.Literal, Type: typ})
+		p.skipNewlines()
+	}
+	if _, err := p.expect(lexer.RBrace, "'}'"); err != nil {
+		return nil, err
+	}
+	return sd, nil
 }
 
 func (p *parser) parseFuncDecl() (*ast.FuncDecl, error) {
@@ -103,6 +185,14 @@ func (p *parser) parseFuncDecl() (*ast.FuncDecl, error) {
 		return nil, err
 	}
 	fn := &ast.FuncDecl{Line: kw.Line}
+
+	if p.cur().Kind == lexer.LParen {
+		recv, err := p.parseReceiver()
+		if err != nil {
+			return nil, err
+		}
+		fn.Receiver = &recv
+	}
 
 	name, err := p.expect(lexer.Ident, "function name")
 	if err != nil {
@@ -159,6 +249,23 @@ func (p *parser) parseParam() (ast.Param, error) {
 		return ast.Param{}, err
 	}
 	return ast.Param{Type: typ, Name: name.Literal, Line: name.Line}, nil
+}
+
+// parseReceiver parses a receiver function's `(name: Type)` clause
+// (cascade_spec.md §8.2), syntactically identical to a single parameter
+// in parens.
+func (p *parser) parseReceiver() (ast.Param, error) {
+	if _, err := p.expect(lexer.LParen, "'('"); err != nil {
+		return ast.Param{}, err
+	}
+	recv, err := p.parseParam()
+	if err != nil {
+		return ast.Param{}, err
+	}
+	if _, err := p.expect(lexer.RParen, "')'"); err != nil {
+		return ast.Param{}, err
+	}
+	return recv, nil
 }
 
 // parseResultTypes parses a function's return-type list (cascade_spec.md
@@ -227,12 +334,28 @@ func (p *parser) parseTypeBase() (ast.Type, error) {
 		}
 		return ast.Type{Elem: &elem}, nil
 	}
-	name, ok := typeKeywords[p.cur().Kind]
-	if !ok {
-		return ast.Type{}, fmt.Errorf("line %d: expected a type, got %q", p.cur().Line, p.cur().Literal)
+	if p.cur().Kind == lexer.Star {
+		p.advance()
+		elem, err := p.parseTypeBase()
+		if err != nil {
+			return ast.Type{}, err
+		}
+		// A pointer's zero value is always `none` (cascade_spec.md §2.2),
+		// with no `?` written — see ast.Type's doc.
+		return ast.Type{Ptr: &elem, Nullable: true}, nil
 	}
-	p.advance()
-	return ast.Type{Name: name}, nil
+	if name, ok := typeKeywords[p.cur().Kind]; ok {
+		p.advance()
+		return ast.Type{Name: name}, nil
+	}
+	if p.cur().Kind == lexer.Ident {
+		// A struct type name (cascade_spec.md §4.1) — unlike int/float/
+		// string/bool, struct names aren't reserved keywords, so they lex
+		// as plain identifiers.
+		name := p.advance()
+		return ast.Type{Name: name.Literal}, nil
+	}
+	return ast.Type{}, fmt.Errorf("line %d: expected a type, got %q", p.cur().Line, p.cur().Literal)
 }
 
 func (p *parser) parseBlock() ([]ast.Stmt, error) {
@@ -278,6 +401,8 @@ func (p *parser) parseStmt() (ast.Stmt, error) {
 		return &ast.ContinueStmt{Line: tok.Line}, nil
 	case lexer.Ident:
 		return p.parseIdentStmt()
+	case lexer.Star:
+		return p.parseDerefAssignStmt()
 	default:
 		return nil, fmt.Errorf("line %d: unexpected token %q", p.cur().Line, p.cur().Literal)
 	}
@@ -320,7 +445,7 @@ func (p *parser) parseIfStmt() (ast.Stmt, error) {
 }
 
 func (p *parser) parseIfClause() (ast.IfClause, error) {
-	cond, err := p.parseExpr()
+	cond, err := p.withStructLitForbidden(p.parseExpr)
 	if err != nil {
 		return ast.IfClause{}, err
 	}
@@ -333,7 +458,7 @@ func (p *parser) parseIfClause() (ast.IfClause, error) {
 
 func (p *parser) parseWhileStmt() (ast.Stmt, error) {
 	kw := p.advance() // 'while'
-	cond, err := p.parseExpr()
+	cond, err := p.withStructLitForbidden(p.parseExpr)
 	if err != nil {
 		return nil, err
 	}
@@ -356,7 +481,7 @@ func (p *parser) parseForInStmt() (ast.Stmt, error) {
 	if _, err := p.expect(lexer.KwIn, "'in'"); err != nil {
 		return nil, err
 	}
-	list, err := p.parseExpr()
+	list, err := p.withStructLitForbidden(p.parseExpr)
 	if err != nil {
 		return nil, err
 	}
@@ -377,7 +502,7 @@ func (p *parser) parseSwitchStmt() (ast.Stmt, error) {
 	stmt := &ast.SwitchStmt{Line: kw.Line}
 
 	if p.cur().Kind != lexer.LBrace {
-		tag, err := p.parseExpr()
+		tag, err := p.withStructLitForbidden(p.parseExpr)
 		if err != nil {
 			return nil, err
 		}
@@ -546,9 +671,11 @@ func (p *parser) parseIdentStmt() (ast.Stmt, error) {
 			return nil, err
 		}
 		return &ast.ExprStmt{X: call, Line: call.Line}, nil
+	case p.cur().Kind == lexer.Dot:
+		return p.parseFieldOrMethodStmt(name)
 	case p.cur().Kind == lexer.LBracket:
 		p.advance()
-		index, err := p.parseExpr()
+		index, err := p.withStructLitAllowed(p.parseExpr)
 		if err != nil {
 			return nil, err
 		}
@@ -584,6 +711,59 @@ func (p *parser) parseIdentStmt() (ast.Stmt, error) {
 	default:
 		return nil, fmt.Errorf("line %d: expected '(', '=', a compound assignment, or '++'/'--' after %q", p.cur().Line, name.Literal)
 	}
+}
+
+// parseFieldOrMethodStmt parses `name.field = value` (cascade_spec.md §5,
+// §8.2's field write, valid whether name is a struct or a pointer to
+// one) or `name.method(args)` used as its own statement (e.g.
+// `pt.scale(2.0)`). Only a single level rooted at a plain identifier is
+// supported — the spec's own examples never chain further (`a.b.c`).
+func (p *parser) parseFieldOrMethodStmt(name lexer.Token) (ast.Stmt, error) {
+	p.advance() // '.'
+	fname, err := p.expect(lexer.Ident, "field or method name")
+	if err != nil {
+		return nil, err
+	}
+	if p.cur().Kind == lexer.LParen {
+		call, err := p.parseCallExprFrom(fname)
+		if err != nil {
+			return nil, err
+		}
+		call.Receiver = &ast.Ident{Name: name.Literal, Line: name.Line}
+		return &ast.ExprStmt{X: call, Line: call.Line}, nil
+	}
+	if _, err := p.expect(lexer.Assign, "'='"); err != nil {
+		return nil, err
+	}
+	val, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	return &ast.AssignStmt{Name: name.Literal, Field: fname.Literal, Value: val, Line: name.Line}, nil
+}
+
+// parseDerefAssignStmt parses `*Ptr = Value` (cascade_spec.md §5), the
+// one assignment form that isn't rooted at a plain identifier — its
+// target is reached via parseUnary's existing "*" (dereference) handling
+// (see unaryOpNames), which parseStmt dispatches to on seeing a leading
+// '*'.
+func (p *parser) parseDerefAssignStmt() (ast.Stmt, error) {
+	expr, err := p.parseUnary()
+	if err != nil {
+		return nil, err
+	}
+	deref, ok := expr.(*ast.UnaryExpr)
+	if !ok || deref.Op != "*" {
+		return nil, fmt.Errorf("line %d: expected a dereference assignment '*ptr = value'", ast.ExprLine(expr))
+	}
+	if _, err := p.expect(lexer.Assign, "'='"); err != nil {
+		return nil, err
+	}
+	val, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	return &ast.DerefAssignStmt{Ptr: deref.X, Value: val, Line: ast.ExprLine(expr)}, nil
 }
 
 func (p *parser) parseReturnStmt() (ast.Stmt, error) {
@@ -708,11 +888,18 @@ func (p *parser) parseMultiplicative() (ast.Expr, error) {
 }
 
 // unaryOpNames maps a prefix unary operator token to its ast.UnaryExpr Op
-// string (§6 priority 2). "*"/"&" (pointers) join once Step 8 lands.
+// string (§6 priority 2). "*" (dereference) and "&" (address-of) reuse
+// the same tokens parseMultiplicative/parseBitAnd consume as *infix*
+// operators — there's no ambiguity because parseUnary only ever looks at
+// the current token where an *operand* is expected (the start of a
+// unary/primary expression), never after a complete one, exactly
+// mirroring how Go and C resolve the same lexical overload by position.
 var unaryOpNames = map[lexer.Kind]string{
 	lexer.Not:   "!",
 	lexer.Minus: "-",
 	lexer.Tilde: "~",
+	lexer.Star:  "*",
+	lexer.Amp:   "&",
 }
 
 func (p *parser) parseUnary() (ast.Expr, error) {
@@ -727,33 +914,40 @@ func (p *parser) parseUnary() (ast.Expr, error) {
 	return p.parsePrimary()
 }
 
-// parsePrimary parses a primary atom, then any number of `[index]`
-// suffixes (cascade_spec.md §5's list indexing, §6 priority 1), and
-// finally wraps the result in `is none`/`is not none` (§7) if one
-// directly follows — the tightest binding possible, matching every spec
-// example (always a bare identifier immediately followed by `is`).
+// parsePrimary parses a primary atom, then any number of `[index]` and
+// `.field`/`.method(...)` suffixes (cascade_spec.md §5's list indexing,
+// §4.1/§8.2's field/method access, §6 priority 1), and finally wraps the
+// result in `is none`/`is not none` (§7) if one directly follows — the
+// tightest binding possible, matching every spec example (always a bare
+// identifier immediately followed by `is`).
 func (p *parser) parsePrimary() (ast.Expr, error) {
 	x, err := p.parsePrimaryAtom()
 	if err != nil {
 		return nil, err
 	}
-	for p.cur().Kind == lexer.LBracket {
-		x, err = p.parseIndexSuffix(x)
+	for {
+		switch p.cur().Kind {
+		case lexer.LBracket:
+			x, err = p.parseIndexSuffix(x)
+		case lexer.Dot:
+			x, err = p.parseSelectorSuffix(x)
+		default:
+			if p.cur().Kind == lexer.KwIs {
+				return p.parseNullCheck(x)
+			}
+			return x, nil
+		}
 		if err != nil {
 			return nil, err
 		}
 	}
-	if p.cur().Kind == lexer.KwIs {
-		return p.parseNullCheck(x)
-	}
-	return x, nil
 }
 
 // parseIndexSuffix parses the `[Index]` part of a list-index expression
 // whose target x has already been parsed.
 func (p *parser) parseIndexSuffix(x ast.Expr) (ast.Expr, error) {
 	lb := p.advance() // '['
-	index, err := p.parseExpr()
+	index, err := p.withStructLitAllowed(p.parseExpr)
 	if err != nil {
 		return nil, err
 	}
@@ -761,6 +955,28 @@ func (p *parser) parseIndexSuffix(x ast.Expr) (ast.Expr, error) {
 		return nil, err
 	}
 	return &ast.IndexExpr{X: x, Index: index, Line: lb.Line}, nil
+}
+
+// parseSelectorSuffix parses the `.field` or `.method(args...)` part of a
+// field-access/method-call expression whose target x has already been
+// parsed (cascade_spec.md §4.1/§8.2). A method call reuses ast.CallExpr
+// via its Receiver field rather than a parallel expression type — see
+// CallExpr's doc for the rationale.
+func (p *parser) parseSelectorSuffix(x ast.Expr) (ast.Expr, error) {
+	p.advance() // '.'
+	name, err := p.expect(lexer.Ident, "field or method name")
+	if err != nil {
+		return nil, err
+	}
+	if p.cur().Kind == lexer.LParen {
+		call, err := p.parseCallExprFrom(name)
+		if err != nil {
+			return nil, err
+		}
+		call.Receiver = x
+		return call, nil
+	}
+	return &ast.FieldExpr{X: x, Field: name.Literal, Line: name.Line}, nil
 }
 
 // parseNullCheck parses the `is none`/`is not none` suffix onto an
@@ -786,7 +1002,7 @@ func (p *parser) parsePrimaryAtom() (ast.Expr, error) {
 	switch tok.Kind {
 	case lexer.LParen:
 		p.advance()
-		x, err := p.parseExpr()
+		x, err := p.withStructLitAllowed(p.parseExpr)
 		if err != nil {
 			return nil, err
 		}
@@ -837,6 +1053,9 @@ func (p *parser) parsePrimaryAtom() (ast.Expr, error) {
 		if p.cur().Kind == lexer.LParen {
 			return p.parseCallExprFrom(name)
 		}
+		if p.cur().Kind == lexer.LBrace && !p.noStructLit {
+			return p.parseStructLit(name)
+		}
 		return &ast.Ident{Name: name.Literal, Line: name.Line}, nil
 	default:
 		return nil, fmt.Errorf("line %d: unexpected token %q", tok.Line, tok.Literal)
@@ -855,7 +1074,7 @@ func (p *parser) parseListLit() (ast.Expr, error) {
 				return nil, err
 			}
 		}
-		elem, err := p.parseExpr()
+		elem, err := p.withStructLitAllowed(p.parseExpr)
 		if err != nil {
 			return nil, err
 		}
@@ -880,7 +1099,7 @@ func (p *parser) parseCallExprFrom(name lexer.Token) (*ast.CallExpr, error) {
 				return nil, err
 			}
 		}
-		arg, err := p.parseExpr()
+		arg, err := p.withStructLitAllowed(p.parseExpr)
 		if err != nil {
 			return nil, err
 		}
@@ -890,4 +1109,38 @@ func (p *parser) parseCallExprFrom(name lexer.Token) (*ast.CallExpr, error) {
 		return nil, err
 	}
 	return call, nil
+}
+
+// parseStructLit parses a struct literal `Name{field: value, ...}`
+// (cascade_spec.md §4.1) whose type-name identifier has already been
+// consumed. Every field must be given explicitly — see ast.StructLit's
+// doc for why there is no partial/defaulted-field form.
+func (p *parser) parseStructLit(name lexer.Token) (ast.Expr, error) {
+	if _, err := p.expect(lexer.LBrace, "'{'"); err != nil {
+		return nil, err
+	}
+	lit := &ast.StructLit{TypeName: name.Literal, Line: name.Line}
+	for p.cur().Kind != lexer.RBrace {
+		if len(lit.Fields) > 0 {
+			if _, err := p.expect(lexer.Comma, "','"); err != nil {
+				return nil, err
+			}
+		}
+		fname, err := p.expect(lexer.Ident, "field name")
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(lexer.Colon, "':'"); err != nil {
+			return nil, err
+		}
+		val, err := p.withStructLitAllowed(p.parseExpr)
+		if err != nil {
+			return nil, err
+		}
+		lit.Fields = append(lit.Fields, ast.StructFieldInit{Name: fname.Literal, Value: val})
+	}
+	if _, err := p.expect(lexer.RBrace, "'}'"); err != nil {
+		return nil, err
+	}
+	return lit, nil
 }

@@ -27,15 +27,18 @@
 // `break` (loop or switch) and `continue` (loop only, skipping over any
 // enclosing switch) need separate target stacks.
 //
-// Only enough is implemented so far to compile Steps 1-7: `main` plus any
+// Only enough is implemented so far to compile Steps 1-8: `main` plus any
 // number of other functions (§8.1, including multi-value returns via
 // §8.5 — see func.go), whose bodies are `let`/`const`/multi-value `let`
-// declarations, scalar/list-element/compound assignment, `print(...)`
-// and other function calls, `return`, the full operator set (§6),
-// control flow (if/elif/else, while, for-in, switch, break/continue),
-// and lists (`[]T` — literals, indexing, append/range/len; see list.go).
-// Later steps extend genStmt/genValue one feature at a time, the same
-// way parser's grammar grows.
+// declarations, scalar/list-element/struct-field/compound assignment,
+// `print(...)` and other function/method calls, `return`, the full
+// operator set (§6, including `&`/`*`), control flow (if/elif/else,
+// while, for-in, switch, break/continue), lists (`[]T` — literals,
+// indexing, append/range/len; see list.go), and structs/pointers/
+// receiver functions (§4.1, §4.4, §8.2 — struct literals, field read/
+// write, pointer address-of/dereference, and method calls; see
+// struct.go). Later steps extend genStmt/genValue one feature at a time,
+// the same way parser's grammar grows.
 package codegen
 
 import (
@@ -51,17 +54,34 @@ import (
 const mainInternalName = "cascade_main"
 
 // Generate translates f (already validated by sema.Check) into AMIVM-IR
-// text: a top-level SLTYPE for every list element type any function
-// uses, then every function's own FUNC block (main's under
-// mainInternalName — see func.go's genFuncDecl), then the generated
-// `!main` wrapper that bridges to it.
+// text: a top-level STTYPE for every struct declaration (must precede
+// everything else, since a SLTYPE or FUNC parameter/local may reference a
+// struct type — see genStructDecl), then a top-level SLTYPE for every
+// list element type any function uses, then every function's own FUNC
+// block (main's under mainInternalName, a receiver function's under its
+// qualified StructName_Method name — see func.go's genFuncDecl), then the
+// generated `!main` wrapper that bridges to it.
 func Generate(f *ast.File) (string, error) {
+	structs := map[string]*ast.StructDecl{}
+	for _, sd := range f.Structs {
+		structs[sd.Name] = sd
+	}
+
 	var main *ast.FuncDecl
 	sigs := map[string]funcSig{}
+	methods := map[string]map[string]funcSig{}
 	for _, fn := range f.Funcs {
 		params := make([]ast.Type, len(fn.Params))
 		for i, p := range fn.Params {
 			params[i] = p.Type
+		}
+		if fn.Receiver != nil {
+			structName := receiverStructName(fn.Receiver.Type)
+			if methods[structName] == nil {
+				methods[structName] = map[string]funcSig{}
+			}
+			methods[structName][fn.Name] = funcSig{Params: params, Results: fn.Results}
+			continue
 		}
 		sigs[fn.Name] = funcSig{Params: params, Results: fn.Results}
 		if fn.Name == "main" {
@@ -73,9 +93,19 @@ func Generate(f *ast.File) (string, error) {
 	}
 
 	slices := &sliceRegistry{used: map[string]bool{}}
+
+	var structsIR strings.Builder
+	for _, sd := range f.Structs {
+		ir, err := genStructDecl(slices, sd)
+		if err != nil {
+			return "", err
+		}
+		structsIR.WriteString(ir)
+	}
+
 	var funcsIR strings.Builder
 	for _, fn := range f.Funcs {
-		ir, err := genFuncDecl(fn, slices, sigs)
+		ir, err := genFuncDecl(fn, slices, structs, sigs, methods)
 		if err != nil {
 			return "", err
 		}
@@ -83,6 +113,7 @@ func Generate(f *ast.File) (string, error) {
 	}
 
 	var b strings.Builder
+	b.WriteString(structsIR.String())
 	for _, elemName := range slices.sorted() {
 		elemIRType, err := scalarTypeToIR(ast.Type{Name: elemName})
 		if err != nil {
@@ -119,7 +150,9 @@ type funcGen struct {
 	b             strings.Builder
 	scope         *scope
 	slices        *sliceRegistry
+	structs       map[string]*ast.StructDecl // struct name -> declaration, for struct.go's genStructZeroReset
 	sigs          map[string]funcSig
+	methods       map[string]map[string]funcSig // struct name -> method name -> sig, for struct.go's method-call codegen
 	seq           int
 	labelSeq      int
 	breakStack    []string // break targets: pushed by both while and switch
@@ -207,6 +240,8 @@ func genStmt(g *funcGen, stmt ast.Stmt) error {
 		return genMultiLetDecl(g, s)
 	case *ast.AssignStmt:
 		return genAssignStmt(g, s)
+	case *ast.DerefAssignStmt:
+		return genDerefAssignStmt(g, s)
 	case *ast.CompoundAssignStmt:
 		return genCompoundAssignStmt(g, s)
 	case *ast.IncDecStmt:
@@ -472,7 +507,7 @@ func genLetDecl(g *funcGen, decl *ast.LetDecl) error {
 	name := g.freshName(decl.Name)
 	ref := varRef{Type: typ, ValOp: "%" + name}
 	g.declareVar(ref.ValOp, irType)
-	if typ.Nullable {
+	if needsIssetSlot(typ) {
 		ref.SetOp = "%" + name + "_isset"
 		g.declareVar(ref.SetOp, "^bool")
 	}
@@ -481,11 +516,13 @@ func genLetDecl(g *funcGen, decl *ast.LetDecl) error {
 	return genInit(g, ref, decl.Init)
 }
 
-// genAssignStmt compiles `name = value` or, when Index is set,
-// `name[Index] = value` (cascade_spec.md §5), an ASET into the existing
-// list — unlike a whole-list reassignment (genInit), this never
-// reallocates, matching Go's own in-place slice-element-assignment
-// semantics.
+// genAssignStmt compiles `name = value`; `name[Index] = value` when Index
+// is set, an ASET into the existing list — unlike a whole-list
+// reassignment (genInit), this never reallocates, matching Go's own
+// in-place slice-element-assignment semantics; or `name.Field = value`
+// when Field is set, an FSET (cascade_spec.md §5) — works identically
+// whether ref holds a struct value or a pointer to one, see
+// ast.FieldExpr's doc.
 func genAssignStmt(g *funcGen, stmt *ast.AssignStmt) error {
 	ref, ok := g.scope.lookup(stmt.Name)
 	if !ok {
@@ -501,6 +538,14 @@ func genAssignStmt(g *funcGen, stmt *ast.AssignStmt) error {
 			return err
 		}
 		g.emit("\tASET\t%s\t%s\t%s\n", ref.ValOp, idxOp, v)
+		return nil
+	}
+	if stmt.Field != "" {
+		v, err := genValue(g, stmt.Value)
+		if err != nil {
+			return err
+		}
+		g.emit("\tFSET\t%s\t>%s\t%s\n", ref.ValOp, stmt.Field, v)
 		return nil
 	}
 	return genInit(g, ref, stmt.Value)
@@ -542,6 +587,17 @@ func genInit(g *funcGen, ref varRef, init ast.Expr) error {
 }
 
 func genResetToZero(g *funcGen, ref varRef) error {
+	if ref.Type.Ptr == nil && ref.Type.Elem == nil {
+		if sd, ok := g.structs[ref.Type.Name]; ok {
+			if err := genStructZeroReset(g, ref.ValOp, sd); err != nil {
+				return err
+			}
+			if ref.SetOp != "" {
+				g.emit("\tSET\t%s\tfalse\n", ref.SetOp)
+			}
+			return nil
+		}
+	}
 	zero, err := zeroValueLiteral(ref.Type)
 	if err != nil {
 		return err
@@ -562,6 +618,9 @@ func genExprStmt(g *funcGen, stmt *ast.ExprStmt) error {
 	call, ok := stmt.X.(*ast.CallExpr)
 	if !ok {
 		return fmt.Errorf("codegen: unsupported expression statement %T", stmt.X)
+	}
+	if call.Receiver != nil {
+		return genMethodCallStmt(g, call)
 	}
 	switch call.Callee {
 	case "print":
@@ -634,18 +693,24 @@ func genValue(g *funcGen, e ast.Expr) (string, error) {
 		return genNullCheck(g, v)
 	case *ast.IndexExpr:
 		return genIndexRead(g, v)
+	case *ast.StructLit:
+		return genStructLit(g, v)
+	case *ast.FieldExpr:
+		return genFieldRead(g, v)
 	default:
 		return "", fmt.Errorf("codegen: unsupported value expression %T", e)
 	}
 }
 
-// genNullCheck compiles `X is none`/`X is not none` (cascade_spec.md §7)
-// by reading X's own isset flag directly — sema.Check guarantees X is a
-// plain identifier with a nullable type (see ast.NullCheckExpr's doc), so
-// its varRef always has a SetOp (scope.go's varRef). "is not none" is the
-// flag itself; "is none" is its negation. No new AMIVM instruction is
-// needed, and narrowing (§2.3) itself is a sema-only concept — see
-// CLAUDE.md's "確定した設計判断" — so there is nothing further to do here.
+// genNullCheck compiles `X is none`/`X is not none` (cascade_spec.md §7).
+// sema.Check guarantees X is a plain identifier with a nullable type (see
+// ast.NullCheckExpr's doc). A pointer variable has no isset flag at all —
+// its nullability is native Go nil (see ast.Type's doc) — so it's
+// compared directly against nil via EQ/NEQ instead; every other nullable
+// type reads its own isset flag directly (scope.go's varRef): "is not
+// none" is the flag itself, "is none" is its negation. Narrowing (§2.3)
+// itself is a sema-only concept — see CLAUDE.md's "確定した設計判断" — so
+// there is nothing further to do here.
 func genNullCheck(g *funcGen, e *ast.NullCheckExpr) (string, error) {
 	id, ok := e.X.(*ast.Ident)
 	if !ok {
@@ -654,6 +719,15 @@ func genNullCheck(g *funcGen, e *ast.NullCheckExpr) (string, error) {
 	ref, ok := g.scope.lookup(id.Name)
 	if !ok {
 		return "", fmt.Errorf("codegen: undefined name %q (sema bug)", id.Name)
+	}
+	if ref.Type.Ptr != nil {
+		instr := "EQ"
+		if e.Not {
+			instr = "NEQ"
+		}
+		tmp := g.newTemp("^bool")
+		g.emit("\t%s\t%s\t%s\tnil\n", instr, tmp, ref.ValOp)
+		return tmp, nil
 	}
 	if ref.SetOp == "" {
 		return "", fmt.Errorf("codegen: null-check on non-nullable %q (sema bug)", id.Name)
@@ -673,6 +747,9 @@ func genNullCheck(g *funcGen, e *ast.NullCheckExpr) (string, error) {
 // for calls used as a bare statement (print) and genMultiLetDecl for a
 // multi-value function call (§8.5).
 func genCallValue(g *funcGen, call *ast.CallExpr) (string, error) {
+	if call.Receiver != nil {
+		return genMethodCallValue(g, call)
+	}
 	switch call.Callee {
 	case "string":
 		return genStringConversion(g, call)
@@ -715,13 +792,21 @@ func genStringConversion(g *funcGen, call *ast.CallExpr) (string, error) {
 	return tmp, nil
 }
 
-// genUnary compiles a unary "!"/"-"/"~" expression (cascade_spec.md §6)
-// into a fresh temp of ResultType (filled in by sema.Check). AMIVM-IR has
-// no unary-minus instruction, so "-x" is emitted as "SUB tmp 0 x"
+// genUnary compiles a unary expression (cascade_spec.md §6). "&"
+// (address-of) and "*" (dereference) don't fit the generic scalar-
+// operator shape below at all — see struct.go's genAddrOf/genDeref — so
+// they're dispatched separately. For the rest, AMIVM-IR has no unary-
+// minus instruction, so "-x" is emitted as "SUB tmp 0 x"
 // (seed_implementation_notes.md §5.6's exact pattern for the same gap);
 // "~x" (bitwise NOT) has its own instruction, BNOT, so it needs no such
 // workaround.
 func genUnary(g *funcGen, e *ast.UnaryExpr) (string, error) {
+	switch e.Op {
+	case "&":
+		return genAddrOf(g, e)
+	case "*":
+		return genDeref(g, e)
+	}
 	x, err := genValue(g, e.X)
 	if err != nil {
 		return "", err
@@ -803,34 +888,68 @@ func genBinary(g *funcGen, e *ast.BinaryExpr) (string, error) {
 	return tmp, nil
 }
 
-// scalarTypeToIR maps a Cascade scalar type to its AMIVM-IR type token.
-// The nullable flag plays no part in the token itself — a `T?`'s value
-// variable has exactly T's IR type; its extra "is this set?" flag is a
-// second, separate ^bool variable (see scope.go's varRef).
-func scalarTypeToIR(t ast.Type) (string, error) {
+// needsIssetSlot reports whether t needs a companion isset flag
+// (cascade_spec.md §2.3) alongside its value — every nullable type
+// except a pointer, whose nullability is represented by Go's native nil
+// instead (see ast.Type's doc and CLAUDE.md's "確定した設計判断").
+func needsIssetSlot(t ast.Type) bool {
+	return t.Nullable && t.Ptr == nil
+}
+
+// baseTypeName maps t — a scalar or struct type, never a list or a
+// pointer — to the bare name portion of its AMIVM-IR type token, with no
+// leading `^`. Shared by scalarTypeToIR and typeToIR's pointer-type case
+// (list.go): amivm's pointer type token is a single `^*Name` token, not a
+// nested `^*(^Name)` (verified against amivm/test_ir/08_pointer.ir), so
+// the bare name is needed on its own to build that token. A struct type
+// name (cascade_spec.md §4.1) isn't one of the four builtins below, but
+// sema.Check has already verified it names a declared struct before
+// codegen ever sees it (see CLAUDE.md's "意味検証の責任分担"), so codegen
+// trusts it rather than re-validating.
+func baseTypeName(t ast.Type) (string, error) {
 	switch t.Name {
 	case "int":
-		return "^int", nil
+		return "int", nil
 	case "float":
-		return "^float64", nil
+		return "float64", nil
 	case "string":
-		return "^string", nil
+		return "string", nil
 	case "bool":
-		return "^bool", nil
+		return "bool", nil
+	case "":
+		return "", fmt.Errorf("codegen: type has no name (compound type used where a scalar/struct type was expected)")
 	default:
-		return "", fmt.Errorf("codegen: unknown type %q", t.Name)
+		return t.Name, nil
 	}
 }
 
+// scalarTypeToIR maps a Cascade scalar or struct type to its AMIVM-IR
+// type token. The nullable flag plays no part in the token itself — a
+// `T?`'s value variable has exactly T's IR type; its extra "is this set?"
+// flag, when it has one at all (see needsIssetSlot), is a second,
+// separate ^bool variable (see scope.go's varRef).
+func scalarTypeToIR(t ast.Type) (string, error) {
+	name, err := baseTypeName(t)
+	if err != nil {
+		return "", err
+	}
+	return "^" + name, nil
+}
+
 // zeroValueLiteral is the AMIVM-IR value token for t's Cascade base value
-// (cascade_spec.md §2.1, §2.2), which happens to coincide with Go's zero
-// value in every case: a list's base value is the empty list `[]`
+// (cascade_spec.md §2.1, §2.2, §4.4), which happens to coincide with Go's
+// zero value in every case: a list's base value is the empty list `[]`
 // (§2.2), and Go's nil slice already behaves as an empty one for every
-// operation Cascade exposes (len, range-over, append) — `nil` is also
-// what a nullable-and-unset variable of any type resets to, whether
-// scalar or list, so this one token serves both cases identically.
+// operation Cascade exposes (len, range-over, append); a pointer's base
+// value is always `none` (§2.2), represented as Go's native nil (see
+// ast.Type's doc) rather than an isset flag — `nil` is also what a
+// nullable-and-unset variable of any other type resets to, so this one
+// token serves all three cases identically. A struct's own base value
+// (every field at its own base value) has no single literal token — see
+// struct.go's genStructZeroReset, which codegen.go's genResetToZero
+// dispatches to instead of calling this function at all.
 func zeroValueLiteral(t ast.Type) (string, error) {
-	if t.Elem != nil {
+	if t.Elem != nil || t.Ptr != nil {
 		return "nil", nil
 	}
 	switch t.Name {

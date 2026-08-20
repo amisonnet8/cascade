@@ -29,7 +29,14 @@ func funcAmivmName(name string) string {
 }
 
 // genFuncDecl compiles one function declaration (cascade_spec.md §8.1,
-// §8.5) into a complete AMIVM-IR FUNC block.
+// §8.5), or, when Receiver is non-nil, a receiver function (§8.2) — see
+// CLAUDE.md's "確定した設計判断" for why this is emitted as a plain
+// top-level FUNC named StructName_Method rather than a Go method: the
+// receiver is simply the function's first parameter, exactly like any
+// other. Unlike an ordinary nullable parameter, the receiver never gets a
+// second isset-flag slot — its declared type is always either a bare
+// struct name (never nullable) or a pointer to one (always nullable via
+// native nil, needing no flag at all — see needsIssetSlot).
 //
 // A nullable parameter (`x: T?`) expands into *two* consecutive Go
 // parameter slots — the value, then a `^bool` isset flag — exactly
@@ -40,11 +47,20 @@ func funcAmivmName(name string) string {
 // own, explicit second parameter, filled in by the caller (see
 // genCallArgs) — it cannot be synthesized locally the way Seed
 // synthesized `true` for its own (always-assigned) parameters.
-func genFuncDecl(fn *ast.FuncDecl, slices *sliceRegistry, sigs map[string]funcSig) (string, error) {
-	g := &funcGen{scope: newScope(nil), slices: slices, sigs: sigs}
+func genFuncDecl(fn *ast.FuncDecl, slices *sliceRegistry, structs map[string]*ast.StructDecl, sigs map[string]funcSig, methods map[string]map[string]funcSig) (string, error) {
+	g := &funcGen{scope: newScope(nil), slices: slices, structs: structs, sigs: sigs, methods: methods}
 
 	var paramIRTypes []string
 	argIdx := 0
+	if fn.Receiver != nil {
+		irType, err := typeToIR(slices, fn.Receiver.Type)
+		if err != nil {
+			return "", err
+		}
+		argIdx++
+		paramIRTypes = append(paramIRTypes, irType)
+		g.scope.declare(fn.Receiver.Name, varRef{Type: fn.Receiver.Type, ValOp: fmt.Sprintf("$%d", argIdx)})
+	}
 	for _, p := range fn.Params {
 		irType, err := typeToIR(slices, p.Type)
 		if err != nil {
@@ -53,7 +69,7 @@ func genFuncDecl(fn *ast.FuncDecl, slices *sliceRegistry, sigs map[string]funcSi
 		argIdx++
 		ref := varRef{Type: p.Type, ValOp: fmt.Sprintf("$%d", argIdx)}
 		paramIRTypes = append(paramIRTypes, irType)
-		if p.Type.Nullable {
+		if needsIssetSlot(p.Type) {
 			argIdx++
 			ref.SetOp = fmt.Sprintf("$%d", argIdx)
 			paramIRTypes = append(paramIRTypes, "^bool")
@@ -76,8 +92,13 @@ func genFuncDecl(fn *ast.FuncDecl, slices *sliceRegistry, sigs map[string]funcSi
 		}
 	}
 
+	amivmName := funcAmivmName(fn.Name)
+	if fn.Receiver != nil {
+		amivmName = receiverStructName(fn.Receiver.Type) + "_" + fn.Name
+	}
+
 	var b strings.Builder
-	fmt.Fprintf(&b, "FUNC\t!%s", funcAmivmName(fn.Name))
+	fmt.Fprintf(&b, "FUNC\t!%s", amivmName)
 	for _, t := range paramIRTypes {
 		b.WriteString("\t")
 		b.WriteString(t)
@@ -137,7 +158,7 @@ func genNullableOperands(g *funcGen, expr ast.Expr, targetType ast.Type) (val, i
 func genCallArgs(g *funcGen, call *ast.CallExpr, sig funcSig) ([]string, error) {
 	var args []string
 	for i, argExpr := range call.Args {
-		if sig.Params[i].Nullable {
+		if needsIssetSlot(sig.Params[i]) {
 			val, isset, err := genNullableOperands(g, argExpr, sig.Params[i])
 			if err != nil {
 				return nil, err
@@ -210,9 +231,21 @@ func genUserFuncCallStmt(g *funcGen, call *ast.CallExpr, sig funcSig) error {
 // (AMIVM-IR's own discard token, matching the multi1/multi2 operand
 // category — see amivm_spec.md §5). decl.ResolvedTypes (filled in by
 // sema.Check) gives each name's type without re-deriving it from sig.
+// Init's callee may be either a plain function or a method call (§8.2,
+// Receiver non-nil) — see struct.go's genMethodCallArgs/methodAmivmName.
 func genMultiLetDecl(g *funcGen, decl *ast.MultiLetDecl) error {
-	sig := g.sigs[decl.Init.Callee]
-	args, err := genCallArgs(g, decl.Init, sig)
+	var args []string
+	var calleeName string
+	var err error
+	if decl.Init.Receiver != nil {
+		sig := g.methods[decl.Init.RecvStruct][decl.Init.Callee]
+		args, err = genMethodCallArgs(g, decl.Init, sig)
+		calleeName = "!" + methodAmivmName(decl.Init)
+	} else {
+		sig := g.sigs[decl.Init.Callee]
+		args, err = genCallArgs(g, decl.Init, sig)
+		calleeName = "!" + funcAmivmName(decl.Init.Callee)
+	}
 	if err != nil {
 		return err
 	}
@@ -235,6 +268,6 @@ func genMultiLetDecl(g *funcGen, decl *ast.MultiLetDecl) error {
 		results[i] = ref.ValOp
 	}
 
-	emitCall(g, results, "!"+funcAmivmName(decl.Init.Callee), args)
+	emitCall(g, results, calleeName, args)
 	return nil
 }
