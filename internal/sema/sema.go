@@ -1,13 +1,20 @@
 // Package sema performs semantic analysis on a Cascade ast.File, since
 // amivm delegates all type/scope checking to go/types and does not check
 // anything itself (see CLAUDE.md "意味検証の責任分担"). Only the checks
-// Steps 1-6 need are implemented so far: a single well-formed `main`,
-// scope-resolved `let`/`const` declarations and scalar/list-element/
-// compound assignment, nullable-type (`T?`) compatibility and narrowing
-// (cascade_spec.md §2.3, §4.2, §5, §7), the full operator set (§6),
-// control flow (if/elif/else, while, for-in, switch, break/continue), and
-// lists (`[]T` — literals, indexing, append/range/len). Later steps add
-// functions, structs, and everything past that.
+// Steps 1-7 need are implemented so far: a single well-formed `main` plus
+// any number of other functions (§8.1) — including multi-value returns
+// (§8.5) — scope-resolved `let`/`const` declarations and scalar/list-
+// element/compound assignment, nullable-type (`T?`) compatibility and
+// narrowing (§2.3, §4.2, §5, §7), the full operator set (§6), control
+// flow (if/elif/else, while, for-in, switch, break/continue), and lists
+// (`[]T` — literals, indexing, append/range/len). Later steps add
+// structs, closures, and everything past that.
+//
+// A function whose non-void body doesn't obviously return on every path
+// isn't checked here (no control-flow reachability analysis is
+// implemented yet) — such a mistake surfaces as amivm's less friendly
+// "missing return" error instead. Nullable return types (`func f(): T?`)
+// are rejected outright for now; see checkFuncSig.
 package sema
 
 import (
@@ -21,20 +28,71 @@ import (
 // directly). Must match codegen's mainInternalName constant.
 const mainInternalName = "cascade_main"
 
+// funcSig is one function's signature (cascade_spec.md §8.1): its
+// parameter and result types, used to validate every call to it. The
+// whole table is built before any function body is checked (see Check),
+// so forward references and (mutual) recursion both work regardless of
+// declaration order.
+type funcSig struct {
+	Params  []ast.Type
+	Results []ast.Type
+}
+
+// checker carries state shared across every function body being checked
+// — currently just the signature table. This is the "小さな構造体
+// (checker)" seed_implementation_notes.md §7 recommends introducing once
+// program-wide (not just per-call-site) shared information is needed.
+// Scope, by contrast, changes with every nested block, so it stays an
+// explicit parameter throughout rather than becoming a checker field.
+type checker struct {
+	sigs map[string]funcSig
+}
+
+// reservedBuiltinNames are plain identifiers (not lexer keywords, unlike
+// print/string/int/float/bool are not, but see below) that sema/codegen
+// dispatch on directly by name (cascade_spec.md §13). A user-defined
+// function reusing one of these names would be silently unreachable —
+// shadowed by the builtin's own dispatch, which always checks first — so
+// it's rejected outright instead. "string"/"int"/"float"/"bool" need no
+// entry here: they're lexer keywords, so the parser already can't parse
+// them as a function name in the first place (see parser's
+// parsePrimaryAtom), and likewise for "send"/"chan"/"collect"/"map"/
+// "error".
+var reservedBuiltinNames = map[string]bool{
+	"print":  true,
+	"len":    true,
+	"range":  true,
+	"append": true,
+}
+
 // Check validates f. cascade_spec.md §12 requires exactly one `main`
 // function, taking no parameters and returning a single non-nullable int;
-// its body is then checked statement by statement in a fresh top-level
-// scope.
+// every function's signature (including main's) is collected into one
+// table first, and then every function's body — main's and every other
+// one's — is checked against it.
 func Check(f *ast.File) error {
+	c := &checker{sigs: map[string]funcSig{}}
+
 	var main *ast.FuncDecl
 	for _, fn := range f.Funcs {
 		if fn.Name == mainInternalName {
 			return fmt.Errorf("line %d: %q is a reserved name and cannot be used as a function name", fn.Line, mainInternalName)
 		}
+		if reservedBuiltinNames[fn.Name] {
+			return fmt.Errorf("line %d: %q is a builtin function name and cannot be redefined", fn.Line, fn.Name)
+		}
+		if _, exists := c.sigs[fn.Name]; exists {
+			return fmt.Errorf("line %d: duplicate function %q", fn.Line, fn.Name)
+		}
+		if err := checkFuncSig(fn); err != nil {
+			return err
+		}
+		params := make([]ast.Type, len(fn.Params))
+		for i, p := range fn.Params {
+			params[i] = p.Type
+		}
+		c.sigs[fn.Name] = funcSig{Params: params, Results: fn.Results}
 		if fn.Name == "main" {
-			if main != nil {
-				return fmt.Errorf("line %d: duplicate 'main' function (first declared on line %d)", fn.Line, main.Line)
-			}
 			main = fn
 		}
 	}
@@ -48,9 +106,43 @@ func Check(f *ast.File) error {
 		return fmt.Errorf("line %d: 'main' must return int (cascade_spec.md §12)", main.Line)
 	}
 
+	for _, fn := range f.Funcs {
+		if err := c.checkFuncBody(fn); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkFuncSig validates fn's declared signature on its own, before any
+// body is checked. Nullable return types would need a function's result
+// to carry a companion isset flag across the CALL/RET boundary — the
+// same 2-slot expansion codegen already does for a nullable *parameter*
+// (see codegen's genCallArgs) — but nothing through Step 7 demonstrates
+// it, and it's exactly what Step 11's `(T, error?)` convention needs, so
+// it's deliberately deferred there rather than half-built now.
+func checkFuncSig(fn *ast.FuncDecl) error {
+	for _, r := range fn.Results {
+		if r.Nullable {
+			return fmt.Errorf("line %d: function %q: nullable return types are not supported yet", fn.Line, fn.Name)
+		}
+	}
+	return nil
+}
+
+// checkFuncBody checks fn's body in a fresh scope pre-populated with its
+// parameters (cascade_spec.md §8.1) — §10's scoping rules apply to
+// parameters the same as any other declaration, including rejecting two
+// parameters with the same name.
+func (c *checker) checkFuncBody(fn *ast.FuncDecl) error {
 	sc := newScope(nil)
-	for _, stmt := range main.Body {
-		if err := checkStmt(sc, stmt, main.Results, 0, 0); err != nil {
+	for _, p := range fn.Params {
+		if !sc.declareLocal(p.Name, varInfo{Type: p.Type}) {
+			return fmt.Errorf("line %d: duplicate parameter name %q", p.Line, p.Name)
+		}
+	}
+	for _, stmt := range fn.Body {
+		if err := c.checkStmt(sc, stmt, fn.Results, 0, 0); err != nil {
 			return err
 		}
 	}
@@ -64,28 +156,30 @@ func Check(f *ast.File) error {
 // requires breakDepth > 0) — cascade_spec.md §7: break exits the
 // innermost loop or switch, but continue always skips over an enclosing
 // switch to reach the innermost loop, since "switch自体はループではない".
-func checkStmt(sc *scope, stmt ast.Stmt, want []ast.Type, loopDepth, breakDepth int) error {
+func (c *checker) checkStmt(sc *scope, stmt ast.Stmt, want []ast.Type, loopDepth, breakDepth int) error {
 	switch s := stmt.(type) {
 	case *ast.LetDecl:
-		return checkLetDecl(sc, s)
+		return c.checkLetDecl(sc, s)
+	case *ast.MultiLetDecl:
+		return c.checkMultiLetDecl(sc, s)
 	case *ast.AssignStmt:
-		return checkAssignStmt(sc, s)
+		return c.checkAssignStmt(sc, s)
 	case *ast.CompoundAssignStmt:
-		return checkCompoundAssignStmt(sc, s)
+		return c.checkCompoundAssignStmt(sc, s)
 	case *ast.IncDecStmt:
-		return checkIncDecStmt(sc, s)
+		return c.checkIncDecStmt(sc, s)
 	case *ast.ExprStmt:
-		return checkExprStmt(sc, s)
+		return c.checkExprStmt(sc, s)
 	case *ast.ReturnStmt:
-		return checkReturnStmt(sc, s, want)
+		return c.checkReturnStmt(sc, s, want)
 	case *ast.IfStmt:
-		return checkIfStmt(sc, s, want, loopDepth, breakDepth)
+		return c.checkIfStmt(sc, s, want, loopDepth, breakDepth)
 	case *ast.WhileStmt:
-		return checkWhileStmt(sc, s, want, loopDepth, breakDepth)
+		return c.checkWhileStmt(sc, s, want, loopDepth, breakDepth)
 	case *ast.SwitchStmt:
-		return checkSwitchStmt(sc, s, want, loopDepth, breakDepth)
+		return c.checkSwitchStmt(sc, s, want, loopDepth, breakDepth)
 	case *ast.ForInStmt:
-		return checkForInStmt(sc, s, want, loopDepth, breakDepth)
+		return c.checkForInStmt(sc, s, want, loopDepth, breakDepth)
 	case *ast.BreakStmt:
 		if breakDepth == 0 {
 			return fmt.Errorf("line %d: break outside of a loop or switch", s.Line)
@@ -103,16 +197,16 @@ func checkStmt(sc *scope, stmt ast.Stmt, want []ast.Type, loopDepth, breakDepth 
 
 // checkBlock checks stmts in a fresh child scope of sc (cascade_spec.md
 // §10: every `{ }` block gets its own scope).
-func checkBlock(sc *scope, stmts []ast.Stmt, want []ast.Type, loopDepth, breakDepth int) error {
-	return checkStmtsIn(newScope(sc), stmts, want, loopDepth, breakDepth)
+func (c *checker) checkBlock(sc *scope, stmts []ast.Stmt, want []ast.Type, loopDepth, breakDepth int) error {
+	return c.checkStmtsIn(newScope(sc), stmts, want, loopDepth, breakDepth)
 }
 
 // checkStmtsIn checks stmts directly in sc, with no new scope pushed —
 // used where the caller already created (and possibly narrowed, see
 // checkIfStmt) the scope stmts should run in.
-func checkStmtsIn(sc *scope, stmts []ast.Stmt, want []ast.Type, loopDepth, breakDepth int) error {
+func (c *checker) checkStmtsIn(sc *scope, stmts []ast.Stmt, want []ast.Type, loopDepth, breakDepth int) error {
 	for _, stmt := range stmts {
-		if err := checkStmt(sc, stmt, want, loopDepth, breakDepth); err != nil {
+		if err := c.checkStmt(sc, stmt, want, loopDepth, breakDepth); err != nil {
 			return err
 		}
 	}
@@ -126,9 +220,9 @@ func checkStmtsIn(sc *scope, stmts []ast.Stmt, want []ast.Type, loopDepth, break
 // narrowedVarInfo) — and, for the single-clause `if x is none { ... }`
 // shape whose body always exits, propagated into sc itself for the rest
 // of the enclosing block (cascade_spec.md §2.3's own example).
-func checkIfStmt(sc *scope, stmt *ast.IfStmt, want []ast.Type, loopDepth, breakDepth int) error {
+func (c *checker) checkIfStmt(sc *scope, stmt *ast.IfStmt, want []ast.Type, loopDepth, breakDepth int) error {
 	for _, clause := range stmt.Clauses {
-		ct, err := exprType(sc, clause.Cond)
+		ct, err := c.exprType(sc, clause.Cond)
 		if err != nil {
 			return err
 		}
@@ -140,7 +234,7 @@ func checkIfStmt(sc *scope, stmt *ast.IfStmt, want []ast.Type, loopDepth, breakD
 		if name, info, ok := narrowedVarInfo(sc, clause.Cond, true); ok {
 			inner.shadow(name, info)
 		}
-		if err := checkStmtsIn(inner, clause.Body, want, loopDepth, breakDepth); err != nil {
+		if err := c.checkStmtsIn(inner, clause.Body, want, loopDepth, breakDepth); err != nil {
 			return err
 		}
 	}
@@ -152,7 +246,7 @@ func checkIfStmt(sc *scope, stmt *ast.IfStmt, want []ast.Type, loopDepth, breakD
 				inner.shadow(name, info)
 			}
 		}
-		if err := checkStmtsIn(inner, stmt.Else, want, loopDepth, breakDepth); err != nil {
+		if err := c.checkStmtsIn(inner, stmt.Else, want, loopDepth, breakDepth); err != nil {
 			return err
 		}
 	}
@@ -207,15 +301,15 @@ func endsInUnconditionalExit(body []ast.Stmt) bool {
 	}
 }
 
-func checkWhileStmt(sc *scope, stmt *ast.WhileStmt, want []ast.Type, loopDepth, breakDepth int) error {
-	ct, err := exprType(sc, stmt.Cond)
+func (c *checker) checkWhileStmt(sc *scope, stmt *ast.WhileStmt, want []ast.Type, loopDepth, breakDepth int) error {
+	ct, err := c.exprType(sc, stmt.Cond)
 	if err != nil {
 		return err
 	}
 	if ct.Name != "bool" || ct.Nullable {
 		return fmt.Errorf("line %d: while condition must be bool, got %s", ast.ExprLine(stmt.Cond), typeString(ct))
 	}
-	return checkBlock(sc, stmt.Body, want, loopDepth+1, breakDepth+1)
+	return c.checkBlock(sc, stmt.Body, want, loopDepth+1, breakDepth+1)
 }
 
 // checkSwitchStmt checks a tagged or untagged switch (cascade_spec.md
@@ -224,10 +318,10 @@ func checkWhileStmt(sc *scope, stmt *ast.WhileStmt, want []ast.Type, loopDepth, 
 // each case value is itself a bool condition. Every case/default body is
 // checked in its own scope with breakDepth+1 (switch is not a loop, so
 // loopDepth is unchanged — see checkStmt's doc).
-func checkSwitchStmt(sc *scope, stmt *ast.SwitchStmt, want []ast.Type, loopDepth, breakDepth int) error {
+func (c *checker) checkSwitchStmt(sc *scope, stmt *ast.SwitchStmt, want []ast.Type, loopDepth, breakDepth int) error {
 	var tagType ast.Type
 	if stmt.Tag != nil {
-		t, err := exprType(sc, stmt.Tag)
+		t, err := c.exprType(sc, stmt.Tag)
 		if err != nil {
 			return err
 		}
@@ -237,9 +331,9 @@ func checkSwitchStmt(sc *scope, stmt *ast.SwitchStmt, want []ast.Type, loopDepth
 		tagType = t
 	}
 
-	for _, c := range stmt.Cases {
-		for _, v := range c.Values {
-			vt, err := exprType(sc, v)
+	for _, cs := range stmt.Cases {
+		for _, v := range cs.Values {
+			vt, err := c.exprType(sc, v)
 			if err != nil {
 				return err
 			}
@@ -251,13 +345,13 @@ func checkSwitchStmt(sc *scope, stmt *ast.SwitchStmt, want []ast.Type, loopDepth
 				return fmt.Errorf("line %d: case condition must be bool, got %s", ast.ExprLine(v), typeString(vt))
 			}
 		}
-		if err := checkBlock(sc, c.Body, want, loopDepth, breakDepth+1); err != nil {
+		if err := c.checkBlock(sc, cs.Body, want, loopDepth, breakDepth+1); err != nil {
 			return err
 		}
 	}
 
 	if stmt.Default != nil {
-		if err := checkBlock(sc, stmt.Default, want, loopDepth, breakDepth+1); err != nil {
+		if err := c.checkBlock(sc, stmt.Default, want, loopDepth, breakDepth+1); err != nil {
 			return err
 		}
 	}
@@ -268,8 +362,8 @@ func checkSwitchStmt(sc *scope, stmt *ast.SwitchStmt, want []ast.Type, loopDepth
 // List must be a non-nullable list, and the loop variable x is declared
 // with its element type in a fresh scope wrapping the body (loopDepth+1,
 // breakDepth+1, same as while — see checkStmt's doc).
-func checkForInStmt(sc *scope, stmt *ast.ForInStmt, want []ast.Type, loopDepth, breakDepth int) error {
-	t, err := exprType(sc, stmt.List)
+func (c *checker) checkForInStmt(sc *scope, stmt *ast.ForInStmt, want []ast.Type, loopDepth, breakDepth int) error {
+	t, err := c.exprType(sc, stmt.List)
 	if err != nil {
 		return err
 	}
@@ -280,14 +374,14 @@ func checkForInStmt(sc *scope, stmt *ast.ForInStmt, want []ast.Type, loopDepth, 
 
 	inner := newScope(sc)
 	inner.declareLocal(stmt.VarName, varInfo{Type: stmt.ElemType})
-	return checkStmtsIn(inner, stmt.Body, want, loopDepth+1, breakDepth+1)
+	return c.checkStmtsIn(inner, stmt.Body, want, loopDepth+1, breakDepth+1)
 }
 
 // checkCompoundAssignStmt validates `name op= value` (cascade_spec.md
 // §5) by reusing binaryResultType as if it were `name = name op value` —
 // the same rules apply (e.g. `+=` on a string concatenates, `%=` requires
 // int), so there is no separate rule set to maintain.
-func checkCompoundAssignStmt(sc *scope, stmt *ast.CompoundAssignStmt) error {
+func (c *checker) checkCompoundAssignStmt(sc *scope, stmt *ast.CompoundAssignStmt) error {
 	info, ok := sc.lookup(stmt.Name)
 	if !ok {
 		return fmt.Errorf("line %d: undefined name %q", stmt.Line, stmt.Name)
@@ -295,7 +389,7 @@ func checkCompoundAssignStmt(sc *scope, stmt *ast.CompoundAssignStmt) error {
 	if info.Const {
 		return fmt.Errorf("line %d: cannot assign to %q (declared const)", stmt.Line, stmt.Name)
 	}
-	vt, err := exprType(sc, stmt.Value)
+	vt, err := c.exprType(sc, stmt.Value)
 	if err != nil {
 		return err
 	}
@@ -311,7 +405,7 @@ func checkCompoundAssignStmt(sc *scope, stmt *ast.CompoundAssignStmt) error {
 
 // checkIncDecStmt validates `name++`/`name--` (cascade_spec.md §5): name
 // must be a non-nullable, non-const int or float.
-func checkIncDecStmt(sc *scope, stmt *ast.IncDecStmt) error {
+func (c *checker) checkIncDecStmt(sc *scope, stmt *ast.IncDecStmt) error {
 	info, ok := sc.lookup(stmt.Name)
 	if !ok {
 		return fmt.Errorf("line %d: undefined name %q", stmt.Line, stmt.Name)
@@ -329,7 +423,7 @@ func checkIncDecStmt(sc *scope, stmt *ast.IncDecStmt) error {
 // §4.2) and records its resolved type both in sc (for later statements to
 // look up) and on the AST node itself (ResolvedType, so codegen doesn't
 // have to re-infer it — see LetDecl's doc comment).
-func checkLetDecl(sc *scope, decl *ast.LetDecl) error {
+func (c *checker) checkLetDecl(sc *scope, decl *ast.LetDecl) error {
 	if decl.Const && decl.Init == nil {
 		return fmt.Errorf("line %d: 'const %s' requires an initializer", decl.Line, decl.Name)
 	}
@@ -343,13 +437,13 @@ func checkLetDecl(sc *scope, decl *ast.LetDecl) error {
 		if decl.Init == nil {
 			return fmt.Errorf("line %d: 'let %s' needs either a type or an initializer", decl.Line, decl.Name)
 		}
-		t, err := exprType(sc, decl.Init)
+		t, err := c.exprType(sc, decl.Init)
 		if err != nil {
 			return err
 		}
 		typ = t
 	} else if decl.Init != nil {
-		if err := checkAssignable(sc, typ, decl.Init); err != nil {
+		if err := c.checkAssignable(sc, typ, decl.Init); err != nil {
 			return err
 		}
 	}
@@ -361,12 +455,43 @@ func checkLetDecl(sc *scope, decl *ast.LetDecl) error {
 	return nil
 }
 
+// checkMultiLetDecl validates a multi-value `let`/`const` declaration
+// (cascade_spec.md §5, §8.5): Init's callee must be a known function
+// (sema has no way to know a value-typed expression's "arity" beyond a
+// direct call — the parser already enforces this shape, see
+// parseMultiLetDecl) returning exactly as many values as there are
+// Names. "_" entries are validated like any other but declare nothing
+// (cascade_spec.md §5).
+func (c *checker) checkMultiLetDecl(sc *scope, decl *ast.MultiLetDecl) error {
+	sig, ok := c.sigs[decl.Init.Callee]
+	if !ok {
+		return fmt.Errorf("line %d: undefined function %q", decl.Init.Line, decl.Init.Callee)
+	}
+	if err := c.checkCallArgs(sc, decl.Init, sig); err != nil {
+		return err
+	}
+	if len(sig.Results) != len(decl.Names) {
+		return fmt.Errorf("line %d: %s() returns %d value(s), but %d name(s) given", decl.Init.Line, decl.Init.Callee, len(sig.Results), len(decl.Names))
+	}
+	decl.ResolvedTypes = sig.Results
+
+	for i, name := range decl.Names {
+		if name == "_" {
+			continue
+		}
+		if !sc.declareLocal(name, varInfo{Type: sig.Results[i], Const: decl.Const}) {
+			return fmt.Errorf("line %d: %q is already declared in this scope (cascade_spec.md §10)", decl.Line, name)
+		}
+	}
+	return nil
+}
+
 // checkAssignStmt validates `name = value` or, when Index is set,
 // `name[Index] = value` (cascade_spec.md §5). Index assignment mutates
 // element content rather than rebinding the variable itself, so it's
 // allowed even on a `const`-declared list (only `name = ...` itself is
 // forbidden there).
-func checkAssignStmt(sc *scope, stmt *ast.AssignStmt) error {
+func (c *checker) checkAssignStmt(sc *scope, stmt *ast.AssignStmt) error {
 	info, ok := sc.lookup(stmt.Name)
 	if !ok {
 		return fmt.Errorf("line %d: undefined name %q", stmt.Line, stmt.Name)
@@ -375,24 +500,27 @@ func checkAssignStmt(sc *scope, stmt *ast.AssignStmt) error {
 		if info.Type.Nullable || info.Type.Elem == nil {
 			return fmt.Errorf("line %d: cannot index into %s", stmt.Line, typeString(info.Type))
 		}
-		it, err := exprType(sc, stmt.Index)
+		it, err := c.exprType(sc, stmt.Index)
 		if err != nil {
 			return err
 		}
 		if it.Nullable || it.Name != "int" {
 			return fmt.Errorf("line %d: list index must be int, got %s", ast.ExprLine(stmt.Index), typeString(it))
 		}
-		return checkAssignable(sc, *info.Type.Elem, stmt.Value)
+		return c.checkAssignable(sc, *info.Type.Elem, stmt.Value)
 	}
 	if info.Const {
 		return fmt.Errorf("line %d: cannot assign to %q (declared const)", stmt.Line, stmt.Name)
 	}
-	return checkAssignable(sc, info.Type, stmt.Value)
+	return c.checkAssignable(sc, info.Type, stmt.Value)
 }
 
-// checkExprStmt validates a call-expression statement. Only the `print`
-// builtin (cascade_spec.md §13) is wired up so far.
-func checkExprStmt(sc *scope, stmt *ast.ExprStmt) error {
+// checkExprStmt validates a call-expression statement: the `print`
+// builtin (cascade_spec.md §13), or a call to any known function
+// (cascade_spec.md §8.1) — a statement discards whatever it returns
+// (zero, one, or many values), so unlike checkCallExprValue there is no
+// result-count restriction here.
+func (c *checker) checkExprStmt(sc *scope, stmt *ast.ExprStmt) error {
 	call, ok := stmt.X.(*ast.CallExpr)
 	if !ok {
 		return fmt.Errorf("line %d: expected a call expression", ast.ExprLine(stmt.X))
@@ -402,7 +530,7 @@ func checkExprStmt(sc *scope, stmt *ast.ExprStmt) error {
 		if len(call.Args) != 1 {
 			return fmt.Errorf("line %d: print expects exactly 1 argument, got %d", call.Line, len(call.Args))
 		}
-		t, err := exprType(sc, call.Args[0])
+		t, err := c.exprType(sc, call.Args[0])
 		if err != nil {
 			return err
 		}
@@ -411,16 +539,20 @@ func checkExprStmt(sc *scope, stmt *ast.ExprStmt) error {
 		}
 		return nil
 	default:
-		return fmt.Errorf("line %d: unsupported call to %q", call.Line, call.Callee)
+		sig, ok := c.sigs[call.Callee]
+		if !ok {
+			return fmt.Errorf("line %d: unsupported call to %q", call.Line, call.Callee)
+		}
+		return c.checkCallArgs(sc, call, sig)
 	}
 }
 
-func checkReturnStmt(sc *scope, stmt *ast.ReturnStmt, want []ast.Type) error {
+func (c *checker) checkReturnStmt(sc *scope, stmt *ast.ReturnStmt, want []ast.Type) error {
 	if len(stmt.Results) != len(want) {
 		return fmt.Errorf("line %d: expected %d return value(s), got %d", stmt.Line, len(want), len(stmt.Results))
 	}
 	for i, r := range stmt.Results {
-		if err := checkAssignable(sc, want[i], r); err != nil {
+		if err := c.checkAssignable(sc, want[i], r); err != nil {
 			return err
 		}
 	}
@@ -438,8 +570,11 @@ func checkReturnStmt(sc *scope, stmt *ast.ReturnStmt, want []ast.Type) error {
 // implicit conversion, and §6's note on `+` makes the same point for
 // operators), and a nullable value may only widen into a nullable target,
 // never narrow implicitly into a non-nullable one (narrowing requires an
-// explicit `is not none` check, §2.3).
-func checkAssignable(sc *scope, target ast.Type, value ast.Expr) error {
+// explicit `is not none` check, §2.3). This same function doubles as
+// argument-type checking for a function call (see checkCallArgs) — a
+// parameter is assigned into exactly the same way a `let`/`return` target
+// is.
+func (c *checker) checkAssignable(sc *scope, target ast.Type, value ast.Expr) error {
 	if _, isNone := value.(*ast.NoneLit); isNone {
 		if !target.Nullable {
 			return fmt.Errorf("line %d: cannot assign 'none' to non-nullable type %s", ast.ExprLine(value), typeString(target))
@@ -447,9 +582,9 @@ func checkAssignable(sc *scope, target ast.Type, value ast.Expr) error {
 		return nil
 	}
 	if lit, isList := value.(*ast.ListLit); isList {
-		return checkListLiteralAgainst(sc, lit, target)
+		return c.checkListLiteralAgainst(sc, lit, target)
 	}
-	vt, err := exprType(sc, value)
+	vt, err := c.exprType(sc, value)
 	if err != nil {
 		return err
 	}
@@ -462,16 +597,33 @@ func checkAssignable(sc *scope, target ast.Type, value ast.Expr) error {
 	return nil
 }
 
+// checkCallArgs validates call's arguments against sig's parameter types
+// (cascade_spec.md §8.1): the argument count must match, and each
+// argument must be assignable to its corresponding parameter type (see
+// checkAssignable — a call argument is checked exactly like any other
+// assignment, including nullable widening).
+func (c *checker) checkCallArgs(sc *scope, call *ast.CallExpr, sig funcSig) error {
+	if len(call.Args) != len(sig.Params) {
+		return fmt.Errorf("line %d: %s() expects %d argument(s), got %d", call.Line, call.Callee, len(sig.Params), len(call.Args))
+	}
+	for i, arg := range call.Args {
+		if err := c.checkAssignable(sc, sig.Params[i], arg); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // checkListLiteralAgainst validates a list literal's elements against
 // target's element type (cascade_spec.md §3, §4.3). target must itself be
 // a list type — an empty `[]` is valid here (the loop simply doesn't
 // run), unlike through exprType's context-free inference.
-func checkListLiteralAgainst(sc *scope, lit *ast.ListLit, target ast.Type) error {
+func (c *checker) checkListLiteralAgainst(sc *scope, lit *ast.ListLit, target ast.Type) error {
 	if target.Elem == nil {
 		return fmt.Errorf("line %d: cannot assign a list literal to non-list type %s", lit.Line, typeString(target))
 	}
 	for _, e := range lit.Elems {
-		if err := checkAssignable(sc, *target.Elem, e); err != nil {
+		if err := c.checkAssignable(sc, *target.Elem, e); err != nil {
 			return err
 		}
 	}
@@ -501,9 +653,9 @@ func typeGiven(t ast.Type) bool {
 }
 
 // exprType infers e's type. NoneLit has no type of its own (see its doc
-// comment) and always fails here — callers that accept `none` (checkAssignable)
-// special-case it before calling exprType.
-func exprType(sc *scope, e ast.Expr) (ast.Type, error) {
+// comment) and always fails here — callers that accept `none`
+// (checkAssignable) special-case it before calling exprType.
+func (c *checker) exprType(sc *scope, e ast.Expr) (ast.Type, error) {
 	switch v := e.(type) {
 	case *ast.StringLit:
 		return ast.Type{Name: "string"}, nil
@@ -516,16 +668,16 @@ func exprType(sc *scope, e ast.Expr) (ast.Type, error) {
 	case *ast.NoneLit:
 		return ast.Type{}, fmt.Errorf("line %d: cannot infer a type from 'none' alone; give the variable an explicit nullable type (e.g. 'T?')", v.Line)
 	case *ast.ListLit:
-		return inferListLitType(sc, v)
+		return c.inferListLitType(sc, v)
 	case *ast.IndexExpr:
-		xt, err := exprType(sc, v.X)
+		xt, err := c.exprType(sc, v.X)
 		if err != nil {
 			return ast.Type{}, err
 		}
 		if xt.Nullable || xt.Elem == nil {
 			return ast.Type{}, fmt.Errorf("line %d: cannot index into %s", v.Line, typeString(xt))
 		}
-		it, err := exprType(sc, v.Index)
+		it, err := c.exprType(sc, v.Index)
 		if err != nil {
 			return ast.Type{}, err
 		}
@@ -541,9 +693,9 @@ func exprType(sc *scope, e ast.Expr) (ast.Type, error) {
 		}
 		return info.Type, nil
 	case *ast.CallExpr:
-		return checkCallExprValue(sc, v)
+		return c.checkCallExprValue(sc, v)
 	case *ast.UnaryExpr:
-		xt, err := exprType(sc, v.X)
+		xt, err := c.exprType(sc, v.X)
 		if err != nil {
 			return ast.Type{}, err
 		}
@@ -554,11 +706,11 @@ func exprType(sc *scope, e ast.Expr) (ast.Type, error) {
 		v.ResultType = rt
 		return rt, nil
 	case *ast.BinaryExpr:
-		xt, err := exprType(sc, v.X)
+		xt, err := c.exprType(sc, v.X)
 		if err != nil {
 			return ast.Type{}, err
 		}
-		yt, err := exprType(sc, v.Y)
+		yt, err := c.exprType(sc, v.Y)
 		if err != nil {
 			return ast.Type{}, err
 		}
@@ -569,7 +721,7 @@ func exprType(sc *scope, e ast.Expr) (ast.Type, error) {
 		v.ResultType = rt
 		return rt, nil
 	case *ast.NullCheckExpr:
-		xt, err := exprType(sc, v.X)
+		xt, err := c.exprType(sc, v.X)
 		if err != nil {
 			return ast.Type{}, err
 		}
@@ -592,16 +744,16 @@ func exprType(sc *scope, e ast.Expr) (ast.Type, error) {
 // nothing to infer from and is always an error here — callers with a
 // target type instead go through checkListLiteralAgainst, which allows
 // an empty literal.
-func inferListLitType(sc *scope, lit *ast.ListLit) (ast.Type, error) {
+func (c *checker) inferListLitType(sc *scope, lit *ast.ListLit) (ast.Type, error) {
 	if len(lit.Elems) == 0 {
 		return ast.Type{}, fmt.Errorf("line %d: cannot infer a type from an empty list literal; give it an explicit []T type", lit.Line)
 	}
-	elemType, err := exprType(sc, lit.Elems[0])
+	elemType, err := c.exprType(sc, lit.Elems[0])
 	if err != nil {
 		return ast.Type{}, err
 	}
 	target := ast.Type{Elem: &elemType}
-	if err := checkListLiteralAgainst(sc, lit, target); err != nil {
+	if err := c.checkListLiteralAgainst(sc, lit, target); err != nil {
 		return ast.Type{}, err
 	}
 	return target, nil
@@ -609,16 +761,19 @@ func inferListLitType(sc *scope, lit *ast.ListLit) (ast.Type, error) {
 
 // checkCallExprValue validates a call expression used as a value (as
 // opposed to a bare statement — see checkExprStmt): the `string()`
-// conversion, and the list builtins `len()`/`range()`/`append()`
-// (cascade_spec.md §13). The rest of §13's builtins (filter/map/reduce,
-// which need closures) land in the steps that need them.
-func checkCallExprValue(sc *scope, call *ast.CallExpr) (ast.Type, error) {
+// conversion, the list builtins `len()`/`range()`/`append()`
+// (cascade_spec.md §13), or a call to any known single-value-returning
+// function (§8.1) — a multi-value function (§8.5) can't produce one
+// value, so it's rejected here with a pointer to the multi-value `let`
+// form instead. The rest of §13's builtins (filter/map/reduce, which
+// need closures) land in the steps that need them.
+func (c *checker) checkCallExprValue(sc *scope, call *ast.CallExpr) (ast.Type, error) {
 	switch call.Callee {
 	case "string":
 		if len(call.Args) != 1 {
 			return ast.Type{}, fmt.Errorf("line %d: string() expects exactly 1 argument, got %d", call.Line, len(call.Args))
 		}
-		t, err := exprType(sc, call.Args[0])
+		t, err := c.exprType(sc, call.Args[0])
 		if err != nil {
 			return ast.Type{}, err
 		}
@@ -631,7 +786,7 @@ func checkCallExprValue(sc *scope, call *ast.CallExpr) (ast.Type, error) {
 		if len(call.Args) != 1 {
 			return ast.Type{}, fmt.Errorf("line %d: len() expects exactly 1 argument, got %d", call.Line, len(call.Args))
 		}
-		t, err := exprType(sc, call.Args[0])
+		t, err := c.exprType(sc, call.Args[0])
 		if err != nil {
 			return ast.Type{}, err
 		}
@@ -644,7 +799,7 @@ func checkCallExprValue(sc *scope, call *ast.CallExpr) (ast.Type, error) {
 			return ast.Type{}, fmt.Errorf("line %d: range() expects exactly 2 arguments, got %d", call.Line, len(call.Args))
 		}
 		for _, a := range call.Args {
-			t, err := exprType(sc, a)
+			t, err := c.exprType(sc, a)
 			if err != nil {
 				return ast.Type{}, err
 			}
@@ -658,20 +813,33 @@ func checkCallExprValue(sc *scope, call *ast.CallExpr) (ast.Type, error) {
 		if len(call.Args) != 2 {
 			return ast.Type{}, fmt.Errorf("line %d: append() expects exactly 2 arguments, got %d", call.Line, len(call.Args))
 		}
-		lt, err := exprType(sc, call.Args[0])
+		lt, err := c.exprType(sc, call.Args[0])
 		if err != nil {
 			return ast.Type{}, err
 		}
 		if lt.Nullable || lt.Elem == nil {
 			return ast.Type{}, fmt.Errorf("line %d: append() expects a list as its first argument, got %s", ast.ExprLine(call.Args[0]), typeString(lt))
 		}
-		if err := checkAssignable(sc, *lt.Elem, call.Args[1]); err != nil {
+		if err := c.checkAssignable(sc, *lt.Elem, call.Args[1]); err != nil {
 			return ast.Type{}, err
 		}
 		call.ArgType = lt
 		return lt, nil
 	default:
-		return ast.Type{}, fmt.Errorf("line %d: %q cannot be used as a value", call.Line, call.Callee)
+		sig, ok := c.sigs[call.Callee]
+		if !ok {
+			return ast.Type{}, fmt.Errorf("line %d: %q cannot be used as a value", call.Line, call.Callee)
+		}
+		if err := c.checkCallArgs(sc, call, sig); err != nil {
+			return ast.Type{}, err
+		}
+		if len(sig.Results) == 0 {
+			return ast.Type{}, fmt.Errorf("line %d: %s() returns no value", call.Line, call.Callee)
+		}
+		if len(sig.Results) > 1 {
+			return ast.Type{}, fmt.Errorf("line %d: %s() returns multiple values; use a multi-value let (e.g. 'let a, b = %s(...)') to receive them", call.Line, call.Callee, call.Callee)
+		}
+		return sig.Results[0], nil
 	}
 }
 

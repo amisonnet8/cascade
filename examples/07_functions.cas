@@ -1,0 +1,45 @@
+func add(a: int, b: int): int {
+    return a + b
+}
+
+func log(message: string) {
+    print("[LOG] " + message)
+}
+
+func divmod(a: int, b: int): (int, int) {
+    return a / b, a % b
+}
+
+func greet(name: string?): string {
+    if name is none {
+        return "Hello, stranger!"
+    }
+    return "Hello, " + name + "!"
+}
+
+func factorial(n: int): int {
+    if n <= 1 {
+        return 1
+    }
+    return n * factorial(n - 1)
+}
+
+func main(): int {
+    let sum = add(3, 4)
+    print("sum=" + string(sum))
+
+    log("starting up")
+
+    let q, r = divmod(17, 5)
+    print("q=" + string(q) + " r=" + string(r))
+
+    let _, r2 = divmod(20, 6)
+    print("r2=" + string(r2))
+
+    print(greet(none))
+    print(greet("Cascade"))
+
+    print("5! = " + string(factorial(5)))
+
+    return 0
+}

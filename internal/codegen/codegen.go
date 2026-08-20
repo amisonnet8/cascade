@@ -27,13 +27,15 @@
 // `break` (loop or switch) and `continue` (loop only, skipping over any
 // enclosing switch) need separate target stacks.
 //
-// Only enough is implemented so far to compile Steps 1-6: a single `main`
-// function whose body is `let`/`const` declarations, scalar/list-element/
-// compound assignment, `print(...)`, `return`, the full operator set
-// (cascade_spec.md §6), control flow (if/elif/else, while, for-in,
-// switch, break/continue), and lists (`[]T` — literals, indexing,
-// append/range/len; see list.go). Later steps extend genStmt/genValue one
-// feature at a time, the same way parser's grammar grows.
+// Only enough is implemented so far to compile Steps 1-7: `main` plus any
+// number of other functions (§8.1, including multi-value returns via
+// §8.5 — see func.go), whose bodies are `let`/`const`/multi-value `let`
+// declarations, scalar/list-element/compound assignment, `print(...)`
+// and other function calls, `return`, the full operator set (§6),
+// control flow (if/elif/else, while, for-in, switch, break/continue),
+// and lists (`[]T` — literals, indexing, append/range/len; see list.go).
+// Later steps extend genStmt/genValue one feature at a time, the same
+// way parser's grammar grows.
 package codegen
 
 import (
@@ -49,10 +51,19 @@ import (
 const mainInternalName = "cascade_main"
 
 // Generate translates f (already validated by sema.Check) into AMIVM-IR
-// text.
+// text: a top-level SLTYPE for every list element type any function
+// uses, then every function's own FUNC block (main's under
+// mainInternalName — see func.go's genFuncDecl), then the generated
+// `!main` wrapper that bridges to it.
 func Generate(f *ast.File) (string, error) {
 	var main *ast.FuncDecl
+	sigs := map[string]funcSig{}
 	for _, fn := range f.Funcs {
+		params := make([]ast.Type, len(fn.Params))
+		for i, p := range fn.Params {
+			params[i] = p.Type
+		}
+		sigs[fn.Name] = funcSig{Params: params, Results: fn.Results}
 		if fn.Name == "main" {
 			main = fn
 		}
@@ -62,11 +73,13 @@ func Generate(f *ast.File) (string, error) {
 	}
 
 	slices := &sliceRegistry{used: map[string]bool{}}
-	g := &funcGen{scope: newScope(nil), slices: slices}
-	for _, stmt := range main.Body {
-		if err := genStmt(g, stmt); err != nil {
+	var funcsIR strings.Builder
+	for _, fn := range f.Funcs {
+		ir, err := genFuncDecl(fn, slices, sigs)
+		if err != nil {
 			return "", err
 		}
+		funcsIR.WriteString(ir)
 	}
 
 	var b strings.Builder
@@ -77,13 +90,7 @@ func Generate(f *ast.File) (string, error) {
 		}
 		fmt.Fprintf(&b, "SLTYPE\t%s\t%s\n", listTypeToken(elemName), elemIRType)
 	}
-
-	fmt.Fprintf(&b, "FUNC\t!%s\t:\t^int\n", mainInternalName)
-	for _, d := range g.decls {
-		fmt.Fprintf(&b, "\tVAR\t%s\t%s\n", d.Op, d.IRType)
-	}
-	b.WriteString(g.b.String())
-	b.WriteString("ENDFUNC\n")
+	b.WriteString(funcsIR.String())
 
 	b.WriteString("FUNC\t!main\t:\n")
 	b.WriteString("\tVAR\t%exitcode\t^int\n")
@@ -112,6 +119,7 @@ type funcGen struct {
 	b             strings.Builder
 	scope         *scope
 	slices        *sliceRegistry
+	sigs          map[string]funcSig
 	seq           int
 	labelSeq      int
 	breakStack    []string // break targets: pushed by both while and switch
@@ -195,6 +203,8 @@ func genStmt(g *funcGen, stmt ast.Stmt) error {
 	switch s := stmt.(type) {
 	case *ast.LetDecl:
 		return genLetDecl(g, s)
+	case *ast.MultiLetDecl:
+		return genMultiLetDecl(g, s)
 	case *ast.AssignStmt:
 		return genAssignStmt(g, s)
 	case *ast.CompoundAssignStmt:
@@ -499,7 +509,11 @@ func genAssignStmt(g *funcGen, stmt *ast.AssignStmt) error {
 // genInit emits the SET(s) (or, for a list literal, SLMAKE+ASET — see
 // genListLiteralInit) that give ref its value: the zero value (and, if
 // nullable, a false flag) when init is nil or the `none` literal, or
-// init's own value (and a true flag) otherwise.
+// init's own value otherwise. When ref is nullable, the isset flag comes
+// from genNullableOperands rather than being hardcoded to "true" — init
+// may itself be another nullable variable that currently holds none, and
+// the target must end up none too (see genNullableOperands's doc for why
+// this needs its own helper rather than a plain genValue call).
 func genInit(g *funcGen, ref varRef, init ast.Expr) error {
 	if init == nil {
 		return genResetToZero(g, ref)
@@ -510,14 +524,20 @@ func genInit(g *funcGen, ref varRef, init ast.Expr) error {
 	if lit, isList := init.(*ast.ListLit); isList {
 		return genListLiteralInit(g, ref, lit)
 	}
+	if ref.SetOp != "" {
+		val, isset, err := genNullableOperands(g, init, ref.Type)
+		if err != nil {
+			return err
+		}
+		g.emit("\tSET\t%s\t%s\n", ref.ValOp, val)
+		g.emit("\tSET\t%s\t%s\n", ref.SetOp, isset)
+		return nil
+	}
 	v, err := genValue(g, init)
 	if err != nil {
 		return err
 	}
 	g.emit("\tSET\t%s\t%s\n", ref.ValOp, v)
-	if ref.SetOp != "" {
-		g.emit("\tSET\t%s\ttrue\n", ref.SetOp)
-	}
 	return nil
 }
 
@@ -533,9 +553,11 @@ func genResetToZero(g *funcGen, ref varRef) error {
 	return nil
 }
 
-// genExprStmt compiles a call-expression statement. Only the `print`
-// builtin (cascade_spec.md §13) is wired up so far; user-defined function
-// calls and the remaining builtins land in later steps.
+// genExprStmt compiles a call-expression statement: the `print` builtin
+// (cascade_spec.md §13), or a call to any other function (§8.1) with its
+// result(s) — zero, one, or many — simply discarded (AMIVM-IR's CALL
+// omits its result operand(s) entirely for this, not an empty token —
+// see genUserFuncCallStmt).
 func genExprStmt(g *funcGen, stmt *ast.ExprStmt) error {
 	call, ok := stmt.X.(*ast.CallExpr)
 	if !ok {
@@ -553,7 +575,11 @@ func genExprStmt(g *funcGen, stmt *ast.ExprStmt) error {
 		g.emit("\tCALL\t:\t?fmt.Println\t%s\n", v)
 		return nil
 	default:
-		return fmt.Errorf("codegen: unsupported call to %q", call.Callee)
+		sig, ok := g.sigs[call.Callee]
+		if !ok {
+			return fmt.Errorf("codegen: unsupported call to %q", call.Callee)
+		}
+		return genUserFuncCallStmt(g, call, sig)
 	}
 }
 
@@ -641,9 +667,11 @@ func genNullCheck(g *funcGen, e *ast.NullCheckExpr) (string, error) {
 }
 
 // genCallValue compiles a call expression used as a value: the
-// `string()` conversion, and the list builtins `len()`/`range()`/
-// `append()` (cascade_spec.md §13, see list.go) — see genExprStmt for
-// calls used as a bare statement (print).
+// `string()` conversion, the list builtins `len()`/`range()`/`append()`
+// (cascade_spec.md §13, see list.go), or a call to any other
+// single-value-returning function (§8.1, see func.go) — see genExprStmt
+// for calls used as a bare statement (print) and genMultiLetDecl for a
+// multi-value function call (§8.5).
 func genCallValue(g *funcGen, call *ast.CallExpr) (string, error) {
 	switch call.Callee {
 	case "string":
@@ -655,7 +683,11 @@ func genCallValue(g *funcGen, call *ast.CallExpr) (string, error) {
 	case "append":
 		return genAppendCall(g, call)
 	default:
-		return "", fmt.Errorf("codegen: unsupported call to %q as a value", call.Callee)
+		sig, ok := g.sigs[call.Callee]
+		if !ok {
+			return "", fmt.Errorf("codegen: unsupported call to %q as a value", call.Callee)
+		}
+		return genUserFuncCallValue(g, call, sig)
 	}
 }
 

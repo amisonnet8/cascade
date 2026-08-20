@@ -234,6 +234,18 @@ Cascadeの`func main(): int`をamivmの`!main`へ直接対応させることは�
 
 **副産物のバグ修正**: リスト型の比較ロジックを書く過程で、`checkAssignable`が値の`Nullable`を全くチェックしていなかったことに気づいた(`let a: int? = 5; let b: int = a`が絞り込み無しで通ってしまっていた)。`vt.Nullable && !target.Nullable`のときエラーにするよう修正し、回帰テストを追加した(`TestCheck_ListErrors/nullable_value_cannot_narrow_implicitly_into_a_non-nullable_target`)。あわせて型の同値判定を`typeShapeEqual`(Nullableを無視し、リストは要素型を再帰比較)に統一し、`[]int == []string`のような異なる要素型同士の比較がすり抜けていた別のバグも合わせて塞いだ。
 
+### 関数(通常関数・複数戻り値)の設計(Step 7)
+
+**sema側に`checker`構造体(`sigs map[string]funcSig`)を新設し、それまで裸の関数群だった`internal/sema`をメソッド群へ書き換えた。** これはseed_implementation_notes.md §7が予告していた「プログラム全体で共有する情報(前方参照可能な関数シグネチャ表など)が必要になった時点で小さな構造体を導入する」というタイミングそのもの。`Check`は最初に全関数のシグネチャを1回のパスで集め、その後に各関数本体を検査するため、宣言順序に関係なく前方参照・相互再帰・自己再帰が動く(`examples/07_functions.cas`の`factorial`で自己再帰を実地確認)。スコープ(`*scope`)はブロックごとに変わる情報なので、Seedの助言通り構造体のフィールドにはせず引数のまま渡し続けている。codegen側も同じ理由で独立した`funcSig`テーブルを自前に持つ(sema側には依存しない。seed_implementation_notes.md §2の「semaとcodegenは互いに依存しない」を踏襲)。
+
+**nullable引数はCALL境界を越える際に値+`_isset`フラグの2オペランドへ展開する。** 関数引数は1つの宣言型につき1つの値しか渡せないため、`T?`パラメータの「値がセットされているか」フラグは呼び出し側が明示的にもう1つのオペランドとして渡す以外に方法が無い(Seedの「パラメータは常に既に代入済みなのでローカルで`true`にSETするだけでよい」という簡略化はCascadeでは通用しない——Cascadeのnullable引数は`none`を正当な値として本当に受け取れる必要があるため)。`FUNC`の仮引数リストで`T?`が2スロット(値+`^bool`)に展開され(`genFuncDecl`)、呼び出し側も同じ形で2オペランドを渡す(`genCallArgs`)。`examples/07_functions.cas`の`greet(name: string?)`を`greet(none)`/`greet("Cascade")`の両方で呼び、生成IRが`!greet "" false`/`!greet "Cascade" true`になることを確認済み。
+
+**nullable戻り値(`func f(): T?`)は今回実装せず、semaで明示的に拒否することにした。** 戻り値がCALL/RET境界を越えてnullableフラグを運ぶには、引数と対称的な「RET/CALLの結果オペランドも2つに展開する」機構が必要になるが、Step7の仕様例(`add`/`log`/`divmod`)はどれもnullable戻り値を使わない。一方Step11の`(T, error?)`規約はまさにこの機構を必要とするため、生半可に今作って後で仕様に合わせて手直しするより、Step11で腰を据えて設計する方が良いと判断した。`checkFuncSig`が`fn.Results`に`Nullable`な型があれば明示的にエラーにする(曖昧な未定義動作にせず、はっきり「未対応」と伝える)。
+
+**副産物のバグ修正(2件目)**: 関数引数のnullable展開を実装する過程で、`genInit`(`let`宣言・単純代入の値設定)がnullable変数からnullable変数への代入で`_isset`フラグを常に`true`に固定してしまっていたバグに気づいた(`let x: int? = none; let y: int? = x`のとき、`y`が`x`の実際のnone状態を無視して常に「値あり」になっていた——Step2から存在していた欠陥)。関数引数と全く同じ「値+issetの2オペランド」を必要としていたため、共通ヘルパー`genNullableOperands`を新設し(`none`→ゼロ値+false、既存のnullable変数→そのままValOp/SetOpを転送、その他の非nullable値→値+true)、`genInit`と`genCallArgs`の両方から使うようにした。`TestGenerate_NullablePropagationThroughAssignment`で回帰テストを追加し、実地でも確認済み(`y is none`が正しく`true`になる)。
+
+**既知の未対応事項として記録**: 関数本体の全パスがreturnで終わっているかの検証(Goの`missing return`相当)は実装していない。この解析はGo自身のアルゴリズムも決して単純ではなく、Step7の本題(複数戻り値・関数呼び出し)から外れるため見送った。該当するコードを書いた場合、Cascade自身の分かりやすいエラーではなく、amivmの`go/types`経由の`missing return`エラーとして表面化する。将来必要になれば`internal/sema`に制御到達性解析を追加する。
+
 ## 意味検証の責任分担(重要)
 
 型の整合性・未定義識別子・関数シグネチャの不一致・メソッドの存在チェックなどは、**amivm側では検証せず`go/types`に全面的に委ねている。** amivmが保証するのは「構文的に妥当なGoコードを出力すること」だけ。
@@ -298,7 +310,7 @@ Seedは7〜8ステップ(git履歴上は「Step1: hello-worldパイプライン�
 | 4 ✅ | ビット演算・シフト演算 | `&` `\|` `^` `&^` `~`、`<<` `>>`(int専用、semaで型制約を検査)。優先順位表(シフトが`+`/`-`より低優先度という非直感的な並び)も実地検証 | `BAND` `BOR` `BXOR` `BCLEAR` `BNOT` `SHL` `SHR` | — |
 | 5 ✅ | 制御構文 | `if/elif/else`、`while`、`switch`(タグ付き/タグなし)、`break/continue`、`is none`/`is not none`と型絞り込み(Step2から持ち越し)。`+=`等の複合代入・`++`/`--`も前倒し実装。`for-in`は`[]T`(Step6)に依存するためStep6へ移動 | `LABEL` `GOTO` `IF` | goto/VAR巻き上げ問題(seed_implementation_notes.md §1)の再検証(下記「確定した設計判断」参照) |
 | 6 ✅ | リスト(`[]T`) | リテラル・`append`・添字読み書き・`for x in xs`・`range`/`len`組み込み | `SLTYPE` `SLMAKE` `ASET` `AGET`(`SLICE`の使い所も探る) | — |
-| 7 | 関数(通常関数・複数戻り値) | `func`定義、複数戻り値(8.1/8.5節)、`divmod`的サンプル | `FUNC` `RET` `CALL`の本格利用 | — |
+| 7 ✅ | 関数(通常関数・複数戻り値) | `func`定義、複数戻り値(8.1/8.5節)、`divmod`的サンプル | `FUNC` `RET` `CALL`の本格利用 | nullable戻り値は未対応と確定(下記「確定した設計判断」参照) |
 | 8 | 構造体・ポインタ・レシーバー関数 | `struct`定義・フィールドアクセス、`&x`/`*p`、値/ポインタレシーバーの自動変換 | `STTYPE` `FIELD` `ENDSTTYPE` `FSET` `FGET` `ADDR` `PGET` `PSET` | 課題1(レシーバー関数のコンパイル方針)の確定 |
 | 9 | クロージャー・高階関数 | クロージャーリテラル(8.3節)、`filter`/`map`/`reduce`(8.4節)、参照捕捉の実地検証 | `FNTYPE` `CLOS` `ENDCLOS` | — |
 | 10 | map(`map<K, V>`) | リテラル・`m[k]`(`V?`化)・`m[k]=v`・`delete` | `MPTYPE` `MPMAKE` `MSET` `MGET` | — |

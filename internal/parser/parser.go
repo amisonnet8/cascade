@@ -3,18 +3,20 @@
 // for why no parser generator is used).
 //
 // The grammar implemented here is intentionally a subset of
-// cascade_spec.md: top-level func declarations; a block of statements
-// covering `let`/`const` declarations, a call-expression statement,
-// scalar/list-element/compound assignment, `++`/`--`, `return`,
-// `if`/`elif`/`else`, `while`, `for x in list`, `switch` (tagged and
-// untagged), and `break`/`continue`; and a full operator-precedence
-// expression grammar (§6), literals (including nullable-type `T?`
-// declarations, the `none` literal, and list literals `[1, 2, 3]`/`[]`),
-// variable references, list indexing `xs[i]`, and `is none`/`is not none`
-// (§7) directly on an atom (the only place the spec actually uses it —
-// as an `if`/`switch` condition). Later development steps extend this
-// grammar further (functions, structs, closures, ...) one feature at a
-// time.
+// cascade_spec.md: top-level func declarations with a single or
+// multi-value (`(T1, T2)`) result type (§8.1, §8.5); a block of
+// statements covering `let`/`const` declarations (including the
+// multi-value `let n1, n2 = call(...)` form), a call-expression
+// statement, scalar/list-element/compound assignment, `++`/`--`,
+// `return`, `if`/`elif`/`else`, `while`, `for x in list`, `switch`
+// (tagged and untagged), and `break`/`continue`; and a full
+// operator-precedence expression grammar (§6), literals (including
+// nullable-type `T?` declarations, the `none` literal, and list literals
+// `[1, 2, 3]`/`[]`), variable references, function calls, list indexing
+// `xs[i]`, and `is none`/`is not none` (§7) directly on an atom (the only
+// place the spec actually uses it — as an `if`/`switch` condition). Later
+// development steps extend this grammar further (structs, closures, ...)
+// one feature at a time.
 package parser
 
 import (
@@ -129,11 +131,11 @@ func (p *parser) parseFuncDecl() (*ast.FuncDecl, error) {
 
 	if p.cur().Kind == lexer.Colon {
 		p.advance()
-		typ, err := p.parseType()
+		results, err := p.parseResultTypes()
 		if err != nil {
 			return nil, err
 		}
-		fn.Results = []ast.Type{typ}
+		fn.Results = results
 	}
 
 	body, err := p.parseBlock()
@@ -156,7 +158,40 @@ func (p *parser) parseParam() (ast.Param, error) {
 	if err != nil {
 		return ast.Param{}, err
 	}
-	return ast.Param{Type: typ, Name: name.Literal}, nil
+	return ast.Param{Type: typ, Name: name.Literal, Line: name.Line}, nil
+}
+
+// parseResultTypes parses a function's return-type list (cascade_spec.md
+// §8.1, §8.5): a single type (`: int`) or, when immediately followed by
+// '(', a comma-separated multi-value list (`: (int, int)`). The two
+// forms are unambiguous — Cascade has no other use for a parenthesized
+// type — so seeing '(' right after ':' always means the multi-value form.
+func (p *parser) parseResultTypes() ([]ast.Type, error) {
+	if p.cur().Kind != lexer.LParen {
+		t, err := p.parseType()
+		if err != nil {
+			return nil, err
+		}
+		return []ast.Type{t}, nil
+	}
+	p.advance() // '('
+	var types []ast.Type
+	for p.cur().Kind != lexer.RParen {
+		if len(types) > 0 {
+			if _, err := p.expect(lexer.Comma, "','"); err != nil {
+				return nil, err
+			}
+		}
+		t, err := p.parseType()
+		if err != nil {
+			return nil, err
+		}
+		types = append(types, t)
+	}
+	if _, err := p.expect(lexer.RParen, "')'"); err != nil {
+		return nil, err
+	}
+	return types, nil
 }
 
 // parseType parses a scalar or list type with an optional trailing
@@ -416,18 +451,25 @@ func (p *parser) parseCaseBody() ([]ast.Stmt, error) {
 }
 
 // parseLetDecl parses a `let`/`const` declaration (cascade_spec.md §4.2):
-// `let name: Type`, `let name: Type = Init`, `let name = Init`, or the
+// `let name: Type`, `let name: Type = Init`, `let name = Init`, the
 // `const` form (sema enforces that Init is required and no later
-// assignment is allowed — see internal/sema).
+// assignment is allowed — see internal/sema), or, when a comma follows
+// the first name, the multi-value form (§5, §8.5) `let n1, n2, ... =
+// call(...)` — see parseMultiLetDecl.
 func (p *parser) parseLetDecl() (ast.Stmt, error) {
 	kw := p.advance() // 'let' or 'const'
-	decl := &ast.LetDecl{Const: kw.Kind == lexer.KwConst, Line: kw.Line}
+	isConst := kw.Kind == lexer.KwConst
 
 	name, err := p.expect(lexer.Ident, "variable name")
 	if err != nil {
 		return nil, err
 	}
-	decl.Name = name.Literal
+
+	if p.cur().Kind == lexer.Comma {
+		return p.parseMultiLetDecl(kw, name, isConst)
+	}
+
+	decl := &ast.LetDecl{Const: isConst, Name: name.Literal, Line: kw.Line}
 
 	if p.cur().Kind == lexer.Colon {
 		p.advance()
@@ -448,6 +490,37 @@ func (p *parser) parseLetDecl() (ast.Stmt, error) {
 	}
 
 	return decl, nil
+}
+
+// parseMultiLetDecl parses the multi-value form of a `let`/`const`
+// declaration (cascade_spec.md §5, §8.5) once parseLetDecl has already
+// consumed the keyword and first name and seen the comma that follows
+// it: `, name2, ... = call(...)`. There is no explicit-type form here —
+// each name's type always comes from the callee's declared result types
+// (resolved by sema.Check) — and the initializer must be a function
+// call, the only expression shape that can produce multiple values.
+func (p *parser) parseMultiLetDecl(kw, first lexer.Token, isConst bool) (ast.Stmt, error) {
+	names := []string{first.Literal}
+	for p.cur().Kind == lexer.Comma {
+		p.advance()
+		name, err := p.expect(lexer.Ident, "variable name")
+		if err != nil {
+			return nil, err
+		}
+		names = append(names, name.Literal)
+	}
+	if _, err := p.expect(lexer.Assign, "'='"); err != nil {
+		return nil, err
+	}
+	val, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	call, ok := val.(*ast.CallExpr)
+	if !ok {
+		return nil, fmt.Errorf("line %d: multi-value 'let' requires a function call on the right-hand side", kw.Line)
+	}
+	return &ast.MultiLetDecl{Names: names, Const: isConst, Init: call, Line: kw.Line}, nil
 }
 
 // compoundAssignOps maps a compound-assignment token to its ast.Op string

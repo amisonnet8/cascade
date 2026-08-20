@@ -326,7 +326,7 @@ func main(): int {
 	return 0
 }
 `,
-			wantErr: "duplicate 'main'",
+			wantErr: "duplicate function \"main\"",
 		},
 		{
 			name: "assign to const",
@@ -818,6 +818,200 @@ func main(): int {
 }
 `,
 			wantErr: "cannot assign int? to non-nullable int",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := check(t, tt.src)
+			if err == nil {
+				t.Fatalf("Check() = nil, want error containing %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Check() = %q, want error containing %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestCheck_ValidFunctions(t *testing.T) {
+	src := `
+func add(a: int, b: int): int {
+	return a + b
+}
+
+func log(message: string) {
+	print(message)
+}
+
+func divmod(a: int, b: int): (int, int) {
+	return a / b, a % b
+}
+
+func greet(name: string?): string {
+	if name is none {
+		return "hello stranger"
+	}
+	return "hello " + name
+}
+
+func factorial(n: int): int {
+	if n <= 1 {
+		return 1
+	}
+	return n * factorial(n - 1)
+}
+
+func main(): int {
+	let sum = add(3, 4)
+	log("hi")
+
+	let q, r = divmod(17, 5)
+	let _, r2 = divmod(20, 6)
+
+	print(greet(none))
+	print(greet("Cascade"))
+	print(string(sum) + string(q) + string(r) + string(r2))
+	print(string(factorial(5)))
+	return 0
+}
+`
+	if err := check(t, src); err != nil {
+		t.Fatalf("Check() = %v, want nil", err)
+	}
+}
+
+func TestCheck_FunctionErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		src     string
+		wantErr string
+	}{
+		{
+			name: "call to undefined function",
+			src: `
+func main(): int {
+	foo(1)
+	return 0
+}
+`,
+			wantErr: "unsupported call to \"foo\"",
+		},
+		{
+			name: "wrong argument count",
+			src: `
+func add(a: int, b: int): int {
+	return a + b
+}
+func main(): int {
+	let x = add(1)
+	return 0
+}
+`,
+			wantErr: "add() expects 2 argument(s), got 1",
+		},
+		{
+			name: "wrong argument type",
+			src: `
+func add(a: int, b: int): int {
+	return a + b
+}
+func main(): int {
+	let x = add(1, "two")
+	return 0
+}
+`,
+			wantErr: "cannot assign string to int",
+		},
+		{
+			name: "void function used as a value",
+			src: `
+func log(message: string) {
+	print(message)
+}
+func main(): int {
+	let x = log("hi")
+	return 0
+}
+`,
+			wantErr: "log() returns no value",
+		},
+		{
+			name: "multi-value function used as a single value",
+			src: `
+func divmod(a: int, b: int): (int, int) {
+	return a / b, a % b
+}
+func main(): int {
+	let x = divmod(1, 2)
+	return 0
+}
+`,
+			wantErr: "divmod() returns multiple values",
+		},
+		{
+			name: "multi-value let name/result count mismatch",
+			src: `
+func divmod(a: int, b: int): (int, int) {
+	return a / b, a % b
+}
+func main(): int {
+	let q, r, s = divmod(1, 2)
+	return 0
+}
+`,
+			wantErr: "divmod() returns 2 value(s), but 3 name(s) given",
+		},
+		{
+			name: "duplicate function name",
+			src: `
+func f(): int {
+	return 0
+}
+func f(): int {
+	return 1
+}
+func main(): int {
+	return 0
+}
+`,
+			wantErr: "duplicate function \"f\"",
+		},
+		{
+			name: "duplicate parameter name",
+			src: `
+func f(a: int, a: int): int {
+	return a
+}
+func main(): int {
+	return 0
+}
+`,
+			wantErr: "duplicate parameter name \"a\"",
+		},
+		{
+			name: "redefining a builtin function name is rejected",
+			src: `
+func len(x: int): int {
+	return x
+}
+func main(): int {
+	return 0
+}
+`,
+			wantErr: "\"len\" is a builtin function name and cannot be redefined",
+		},
+		{
+			name: "nullable return types are not supported yet",
+			src: `
+func f(): int? {
+	return 1
+}
+func main(): int {
+	return 0
+}
+`,
+			wantErr: "nullable return types are not supported yet",
 		},
 	}
 

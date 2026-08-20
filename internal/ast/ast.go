@@ -24,6 +24,7 @@ type Type struct {
 type Param struct {
 	Type Type
 	Name string
+	Line int
 }
 
 // FuncDecl is a top-level function declaration (cascade_spec.md §8.1).
@@ -84,6 +85,26 @@ type LetDecl struct {
 }
 
 func (*LetDecl) stmtNode() {}
+
+// MultiLetDecl is a multi-value `let`/`const` declaration (cascade_spec.md
+// §5, §8.5): `let n1, n2, ... = call(...)`, receiving every result of a
+// multi-value function call in one statement. Any Name may be "_" to
+// discard that result (§5) — sema does not declare a variable for it.
+// Unlike LetDecl, there is no explicit-type form: each name's type is
+// always the corresponding declared result type of Init's callee.
+//
+// ResolvedTypes is filled in by sema.Check, one entry per Name in the
+// same order (the zero Type for a discarded "_"), so codegen doesn't
+// have to re-derive them.
+type MultiLetDecl struct {
+	Names         []string
+	Const         bool
+	Init          *CallExpr
+	Line          int
+	ResolvedTypes []Type
+}
+
+func (*MultiLetDecl) stmtNode() {}
 
 // AssignStmt is a scalar assignment (cascade_spec.md §5): `name = Value`,
 // or, when Index is non-nil, a single list-element assignment (`name[Index]
@@ -351,6 +372,8 @@ func StmtLine(s Stmt) int {
 	case *ReturnStmt:
 		return v.Line
 	case *LetDecl:
+		return v.Line
+	case *MultiLetDecl:
 		return v.Line
 	case *AssignStmt:
 		return v.Line

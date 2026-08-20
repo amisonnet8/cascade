@@ -629,3 +629,124 @@ func main(): int {
 		t.Fatalf("expected an uninitialized list declaration to SET nil; got:\n%s", ir)
 	}
 }
+
+func TestGenerate_UserFunctionCallValue(t *testing.T) {
+	ir := generate(t, `
+func add(a: int, b: int): int {
+	return a + b
+}
+func main(): int {
+	let sum = add(3, 4)
+	return 0
+}
+`)
+	if !strings.Contains(ir, "FUNC\t!add\t^int\t^int\t:\t^int\n") {
+		t.Fatalf("expected a FUNC declaration for add(); got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "CALL\t%tmp_2\t:\t!add\t3\t4\n") {
+		t.Fatalf("expected a single-result CALL to !add; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_VoidFunctionCallStmt(t *testing.T) {
+	ir := generate(t, `
+func log(message: string) {
+	print(message)
+}
+func main(): int {
+	log("hi")
+	return 0
+}
+`)
+	if !strings.Contains(ir, "FUNC\t!log\t^string\t:\n") {
+		t.Fatalf("expected a FUNC declaration for log() with no result types; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "CALL\t:\t!log\t\"hi\"\n") {
+		t.Fatalf("expected a result-less CALL to !log; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_MultiValueLetCall(t *testing.T) {
+	ir := generate(t, `
+func divmod(a: int, b: int): (int, int) {
+	return a / b, a % b
+}
+func main(): int {
+	let q, r = divmod(17, 5)
+	let _, r2 = divmod(20, 6)
+	return 0
+}
+`)
+	if !strings.Contains(ir, "FUNC\t!divmod\t^int\t^int\t:\t^int\t^int\n") {
+		t.Fatalf("expected a FUNC declaration for divmod() with two result types; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "CALL\t%q_1\t%r_2\t:\t!divmod\t17\t5\n") {
+		t.Fatalf("expected a two-result CALL binding both names; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "CALL\t_\t%r2_") || !strings.Contains(ir, ":\t!divmod\t20\t6\n") {
+		t.Fatalf("expected '_' to discard the first result; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_NullableParameterTwoSlotExpansion(t *testing.T) {
+	// A nullable parameter must expand into two consecutive Go parameter
+	// slots (value, then a ^bool isset flag) — there is no other way for
+	// "is this none?" to cross a CALL boundary (see func.go's doc).
+	ir := generate(t, `
+func greet(name: string?): string {
+	if name is none {
+		return "hello stranger"
+	}
+	return "hello " + name
+}
+func main(): int {
+	print(greet(none))
+	print(greet("Cascade"))
+	return 0
+}
+`)
+	if !strings.Contains(ir, "FUNC\t!greet\t^string\t^bool\t:\t^string\n") {
+		t.Fatalf("expected greet's nullable parameter to expand into ^string ^bool; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "!greet\t\"\"\tfalse\n") {
+		t.Fatalf("expected greet(none) to pass (zero value, false); got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "!greet\t\"Cascade\"\ttrue\n") {
+		t.Fatalf("expected greet(\"Cascade\") to widen into (value, true); got:\n%s", ir)
+	}
+}
+
+func TestGenerate_NullablePropagationThroughAssignment(t *testing.T) {
+	// Regression test: assigning one nullable variable into another must
+	// propagate its *current* isset flag, not hardcode "true" (see
+	// genInit's and genNullableOperands's docs for the bug this fixes).
+	ir := generate(t, `
+func main(): int {
+	let x: int? = none
+	let y: int? = x
+	return 0
+}
+`)
+	if !strings.Contains(ir, "SET\t%y_2\t%x_1\n\tSET\t%y_2_isset\t%x_1_isset\n") {
+		t.Fatalf("expected y's isset flag to be copied from x's own isset flag, not hardcoded; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_RecursiveFunctionCall(t *testing.T) {
+	ir := generate(t, `
+func factorial(n: int): int {
+	if n <= 1 {
+		return 1
+	}
+	return n * factorial(n - 1)
+}
+func main(): int {
+	print(string(factorial(5)))
+	return 0
+}
+`)
+	if !strings.Contains(ir, "!factorial\t%tmp_") {
+		t.Fatalf("expected factorial's own body to call itself via !factorial; got:\n%s", ir)
+	}
+	assertLabelsResolve(t, ir)
+}
