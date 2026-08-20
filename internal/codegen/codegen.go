@@ -74,7 +74,7 @@ const mainInternalName = "cascade_main"
 // (typeToIR calls), so by the time this function's own loops run, every
 // type any function body needed is already known.
 func Generate(f *ast.File) (string, error) {
-	structs := map[string]*ast.StructDecl{}
+	structs := map[string]*ast.StructDecl{"error": errorStructDecl}
 	for _, sd := range f.Structs {
 		structs[sd.Name] = sd
 	}
@@ -107,7 +107,8 @@ func Generate(f *ast.File) (string, error) {
 	types := &typeRegistry{used: map[string]bool{}}
 
 	var structsIR strings.Builder
-	for _, sd := range f.Structs {
+	allStructs := append([]*ast.StructDecl{errorStructDecl}, f.Structs...)
+	for _, sd := range allStructs {
 		ir, err := genStructDecl(types, sd)
 		if err != nil {
 			return "", err
@@ -173,6 +174,7 @@ type funcGen struct {
 	structs       map[string]*ast.StructDecl // struct name -> declaration, for struct.go's genStructZeroReset
 	sigs          map[string]funcSig
 	methods       map[string]map[string]funcSig // struct name -> method name -> sig, for struct.go's method-call codegen
+	results       []ast.Type                    // this FUNC/CLOS's own declared result types, for genReturnStmt's nullable-result expansion and error.go's genErrorProp (§8.6's postfix `?`)
 	seq           int
 	labelSeq      int
 	breakStack    []string // break targets: pushed by both while and switch
@@ -652,12 +654,18 @@ func genResetToZero(g *funcGen, ref varRef) error {
 	return nil
 }
 
-// genExprStmt compiles a call-expression statement: the `print` builtin
-// (cascade_spec.md §13), or a call to any other function (§8.1) with its
-// result(s) — zero, one, or many — simply discarded (AMIVM-IR's CALL
-// omits its result operand(s) entirely for this, not an empty token —
-// see genUserFuncCallStmt).
+// genExprStmt compiles a call-expression statement: a bare `expr?` (§8.6
+// — propagates any error while discarding the success value, see
+// error.go's genErrorProp), the `print` builtin (cascade_spec.md §13),
+// or a call to any other function (§8.1) with its result(s) — zero, one,
+// or many — simply discarded (AMIVM-IR's CALL omits its result
+// operand(s) entirely for this, not an empty token — see
+// genUserFuncCallStmt).
 func genExprStmt(g *funcGen, stmt *ast.ExprStmt) error {
+	if prop, isProp := stmt.X.(*ast.ErrorPropExpr); isProp {
+		_, err := genErrorProp(g, prop)
+		return err
+	}
 	call, ok := stmt.X.(*ast.CallExpr)
 	if !ok {
 		return fmt.Errorf("codegen: unsupported expression statement %T", stmt.X)
@@ -693,14 +701,27 @@ func genExprStmt(g *funcGen, stmt *ast.ExprStmt) error {
 // genReturnStmt compiles a `return` statement, joining every result into
 // one RET instruction (AMIVM-IR's RET natively takes multiple operands, so
 // cascade_spec.md §8.5's multi-value return needs no special-casing here).
+// A result whose declared type (g.results[i]) needs an isset slot
+// (cascade_spec.md §8.6's `(T, error?)` convention, or any other nullable
+// result — see needsIssetSlot) contributes two RET operands instead of
+// one, via the same genNullableOperands machinery genInit/genCallArgs
+// already use for the identical value+isset expansion elsewhere.
 func genReturnStmt(g *funcGen, stmt *ast.ReturnStmt) error {
-	values := make([]string, len(stmt.Results))
+	var values []string
 	for i, r := range stmt.Results {
+		if needsIssetSlot(g.results[i]) {
+			val, isset, err := genNullableOperands(g, r, g.results[i])
+			if err != nil {
+				return err
+			}
+			values = append(values, val, isset)
+			continue
+		}
 		v, err := genValue(g, r)
 		if err != nil {
 			return err
 		}
-		values[i] = v
+		values = append(values, v)
 	}
 	if len(values) == 0 {
 		g.emit("\tRET\n")
@@ -747,6 +768,8 @@ func genValue(g *funcGen, e ast.Expr) (string, error) {
 		return genFieldRead(g, v)
 	case *ast.ClosureLit:
 		return genClosureLit(g, v)
+	case *ast.ErrorPropExpr:
+		return genErrorProp(g, v)
 	default:
 		return "", fmt.Errorf("codegen: unsupported value expression %T", e)
 	}
@@ -818,6 +841,8 @@ func genCallValue(g *funcGen, call *ast.CallExpr) (string, error) {
 		return genMapCall(g, call)
 	case "reduce":
 		return genReduceCall(g, call)
+	case "error":
+		return genErrorCall(g, call)
 	default:
 		sig, ok := g.sigs[call.Callee]
 		if !ok {

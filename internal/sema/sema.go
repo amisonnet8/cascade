@@ -1,7 +1,7 @@
 // Package sema performs semantic analysis on a Cascade ast.File, since
 // amivm delegates all type/scope checking to go/types and does not check
 // anything itself (see CLAUDE.md "意味検証の責任分担"). Only the checks
-// Steps 1-10 need are implemented so far: a single well-formed `main`
+// Steps 1-11 need are implemented so far: a single well-formed `main`
 // plus any number of other functions (§8.1) — including multi-value
 // returns (§8.5) — scope-resolved `let`/`const` declarations and scalar/
 // list-element/map-element/struct-field/compound assignment,
@@ -15,17 +15,19 @@
 // address-of/dereference between value and pointer receivers),
 // closures/higher-order functions (§8.3, §8.4 — closure literals
 // capturing the surrounding scope, calling a closure-valued local
-// variable, and the filter/map/reduce builtins), and maps (§2.2, §4.5 —
+// variable, and the filter/map/reduce builtins), maps (§2.2, §4.5 —
 // `map<K, V>` with a non-nullable scalar key and non-nullable value,
 // literals, `m[k]` returning `V?`, `m[k] = v`, `delete`, and the
-// two-variable `for k, v in m` form). Later steps add channels/
-// pipelines and everything past that.
+// two-variable `for k, v in m` form), and error handling (§8.6 — the
+// built-in `error` type, nullable return types in general (any function/
+// closure result may now be nullable, not just `error?`), and postfix
+// `expr?` propagation). Later steps add channels/pipelines and
+// everything past that.
 //
 // A function whose non-void body doesn't obviously return on every path
 // isn't checked here (no control-flow reachability analysis is
 // implemented yet) — such a mistake surfaces as amivm's less friendly
-// "missing return" error instead. Nullable return types (`func f(): T?`)
-// are rejected outright for now; see checkFuncSig.
+// "missing return" error instead.
 package sema
 
 import (
@@ -81,6 +83,29 @@ type checker struct {
 	// スト不可") — see checkClosureLit, which rejects a ClosureLit found
 	// while this is already > 0, so codegen never has to guard against it.
 	closureDepth int
+
+	// currentFuncResults is the declared result types of whichever
+	// function or closure body is currently being checked — needed by
+	// checkErrorPropExpr (§8.6's postfix `?`) to validate that its own
+	// enclosing function/closure also ends in `error?`, since exprType
+	// isn't threaded a "want" parameter the way checkStmt is. Saved and
+	// restored around checkClosureLit's body check (mirroring
+	// closureDepth) so a closure's own result types don't leak back out
+	// to whatever encloses it.
+	currentFuncResults []ast.Type
+}
+
+// errorStructDecl is the built-in `error` type's synthetic struct
+// declaration (cascade_spec.md §2.2, §8.6: "実体はmessage: stringを1つ
+// 持つ構造体的な値"). It never appears in a parsed ast.File — "error" is a
+// lexer keyword, not a parseable struct name (see parser's
+// parseStructDecl, which requires an Ident) — so Check registers it
+// itself, up front, exactly like a user-declared struct in every other
+// respect (field access, validateType, etc. need no special-casing for
+// it at all).
+var errorStructDecl = &ast.StructDecl{
+	Name:   "error",
+	Fields: []ast.StructField{{Name: "message", Type: ast.Type{Name: "string"}}},
 }
 
 // reservedBuiltinNames are plain identifiers (not lexer keywords, unlike
@@ -114,7 +139,7 @@ var reservedBuiltinNames = map[string]bool{
 func Check(f *ast.File) error {
 	c := &checker{
 		sigs:    map[string]funcSig{},
-		structs: map[string]*ast.StructDecl{},
+		structs: map[string]*ast.StructDecl{"error": errorStructDecl},
 		methods: map[string]map[string]methodSig{},
 	}
 
@@ -216,13 +241,15 @@ func Check(f *ast.File) error {
 
 // checkFuncSig validates fn's declared signature on its own, before any
 // body is checked: its receiver (if any) must name a known struct, and
-// every parameter/result type must be one validateType recognizes.
-// Nullable return types would need a function's result to carry a
-// companion isset flag across the CALL/RET boundary — the same 2-slot
-// expansion codegen already does for a nullable *parameter* (see
-// codegen's genCallArgs) — but nothing through Step 7 demonstrates it,
-// and it's exactly what Step 11's `(T, error?)` convention needs, so it's
-// deliberately deferred there rather than half-built now.
+// every parameter/result type must be one validateType recognizes. A
+// nullable result carries a companion isset flag across the CALL/RET
+// boundary exactly like a nullable *parameter* already does (see
+// codegen's genCallArgs/genFuncDecl and, on the result side, genFuncDecl/
+// genReturnStmt's identical expansion — see needsIssetSlot) — deferred
+// through Step 9 (see CLAUDE.md's "確定した設計判断"), now implemented in
+// Step 11 for cascade_spec.md §8.6's `(T, error?)` convention (and, since
+// the mechanism is generic rather than error-specific, any other
+// nullable result type along with it).
 func (c *checker) checkFuncSig(fn *ast.FuncDecl) error {
 	if fn.Receiver != nil {
 		if _, _, err := c.receiverStructName(*fn.Receiver); err != nil {
@@ -235,30 +262,11 @@ func (c *checker) checkFuncSig(fn *ast.FuncDecl) error {
 		}
 	}
 	for _, r := range fn.Results {
-		if needsRetIssetExpansion(r) {
-			return fmt.Errorf("line %d: function %q: nullable return types are not supported yet", fn.Line, fn.Name)
-		}
 		if err := c.validateType(r, fn.Line); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-// needsRetIssetExpansion reports whether a nullable result type t would
-// need the same value+isset two-operand expansion across a CALL/RET
-// boundary that a nullable *parameter* already gets (see codegen's
-// identically-reasoned needsIssetSlot) — every nullable type except a
-// pointer or a function value, both of which represent "none" via Go's
-// native nil in a single operand, needing no flag at all. Nothing
-// through Step 9 implements that expansion for *results* (see this
-// function's callers, checkFuncSig and checkClosureLit), so only this
-// narrower set is rejected — a pointer- or function-typed return was
-// never blocked by the underlying problem in the first place (an
-// ordinary single-value RET/CALL already handles it, exactly like any
-// other non-nullable-shaped result).
-func needsRetIssetExpansion(t ast.Type) bool {
-	return t.Nullable && t.Ptr == nil && t.Func == nil
 }
 
 // receiverStructName resolves a receiver's declared type to the struct
@@ -295,6 +303,7 @@ func (c *checker) checkFuncBody(fn *ast.FuncDecl) error {
 			return fmt.Errorf("line %d: duplicate parameter name %q", p.Line, p.Name)
 		}
 	}
+	c.currentFuncResults = fn.Results
 	for _, stmt := range fn.Body {
 		if err := c.checkStmt(sc, stmt, fn.Results, 0, 0); err != nil {
 			return err
@@ -853,11 +862,16 @@ func (c *checker) checkDerefAssignStmt(sc *scope, stmt *ast.DerefAssignStmt) err
 }
 
 // checkExprStmt validates a call-expression statement: the `print`
-// builtin (cascade_spec.md §13), or a call to any known function
-// (cascade_spec.md §8.1) — a statement discards whatever it returns
-// (zero, one, or many values), so unlike checkCallExprValue there is no
-// result-count restriction here.
+// builtin (cascade_spec.md §13), a bare `expr?` (§8.6 — propagates any
+// error while discarding the success value, see ast.ErrorPropExpr's
+// doc), or a call to any known function (cascade_spec.md §8.1) — a
+// statement discards whatever it returns (zero, one, or many values), so
+// unlike checkCallExprValue there is no result-count restriction here.
 func (c *checker) checkExprStmt(sc *scope, stmt *ast.ExprStmt) error {
+	if prop, isProp := stmt.X.(*ast.ErrorPropExpr); isProp {
+		_, err := c.checkErrorPropExpr(sc, prop)
+		return err
+	}
 	call, ok := stmt.X.(*ast.CallExpr)
 	if !ok {
 		return fmt.Errorf("line %d: expected a call expression", ast.ExprLine(stmt.X))
@@ -1197,16 +1211,16 @@ func (c *checker) checkClosureLit(sc *scope, lit *ast.ClosureLit) (ast.Type, err
 		}
 	}
 	for _, r := range lit.Results {
-		if needsRetIssetExpansion(r) {
-			return ast.Type{}, fmt.Errorf("line %d: closure literal: nullable return types are not supported yet", lit.Line)
-		}
 		if err := c.validateType(r, lit.Line); err != nil {
 			return ast.Type{}, err
 		}
 	}
 
 	c.closureDepth++
+	savedResults := c.currentFuncResults
+	c.currentFuncResults = lit.Results
 	err := c.checkStmtsIn(inner, lit.Body, lit.Results, 0, 0)
+	c.currentFuncResults = savedResults
 	c.closureDepth--
 	if err != nil {
 		return ast.Type{}, err
@@ -1215,6 +1229,43 @@ func (c *checker) checkClosureLit(sc *scope, lit *ast.ClosureLit) (ast.Type, err
 	rt := ast.Type{Func: &ast.FuncType{Params: paramTypes, Results: lit.Results}, Nullable: true}
 	lit.ResolvedType = rt
 	return rt, nil
+}
+
+// isErrorResultShape reports whether results is exactly `(T, error?)`
+// (cascade_spec.md §8.6): two results, the last being a nullable error.
+func isErrorResultShape(results []ast.Type) bool {
+	return len(results) == 2 && results[1].Name == "error" && results[1].Nullable
+}
+
+// checkErrorPropExpr validates postfix `expr?` (cascade_spec.md §8.6):
+// e.Call must resolve (via callSig — a plain function, method, or
+// closure variable, all sharing that one resolution path) to exactly
+// `(T, error?)` with T non-nullable — a deliberately narrower scope than
+// the mechanism could support in principle, see CLAUDE.md's "確定した設
+// 計判断" for why — and the function/closure currently being checked
+// (checker.currentFuncResults, set by checkFuncBody/checkClosureLit)
+// must also end in `error?`, so a propagated error has somewhere
+// structurally valid to return to. Returns T, the type `expr?` itself
+// evaluates to when no error occurred (see ast.ErrorPropExpr's doc).
+func (c *checker) checkErrorPropExpr(sc *scope, e *ast.ErrorPropExpr) (ast.Type, error) {
+	sig, err := c.callSig(sc, e.Call)
+	if err != nil {
+		return ast.Type{}, err
+	}
+	if err := c.checkCallArgs(sc, e.Call, sig); err != nil {
+		return ast.Type{}, err
+	}
+	if !isErrorResultShape(sig.Results) {
+		return ast.Type{}, fmt.Errorf("line %d: '?' requires a call returning (T, error?), got %d result(s)", e.Line, len(sig.Results))
+	}
+	if sig.Results[0].Nullable {
+		return ast.Type{}, fmt.Errorf("line %d: '?' does not support a nullable success type yet, got %s", e.Line, typeString(sig.Results[0]))
+	}
+	if !isErrorResultShape(c.currentFuncResults) {
+		return ast.Type{}, fmt.Errorf("line %d: '?' can only be used inside a function or closure whose own return type ends in error? (cascade_spec.md §8.6)", e.Line)
+	}
+	e.ResultType = sig.Results[0]
+	return sig.Results[0], nil
 }
 
 // resolveClosureCall reports whether call.Callee names a closure-valued
@@ -1381,6 +1432,8 @@ func (c *checker) exprType(sc *scope, e ast.Expr) (ast.Type, error) {
 		return c.checkCallExprValue(sc, v)
 	case *ast.ClosureLit:
 		return c.checkClosureLit(sc, v)
+	case *ast.ErrorPropExpr:
+		return c.checkErrorPropExpr(sc, v)
 	case *ast.StructLit:
 		return c.checkStructLit(sc, v)
 	case *ast.FieldExpr:
@@ -1546,6 +1599,17 @@ func (c *checker) checkCallExprValue(sc *scope, call *ast.CallExpr) (ast.Type, e
 		}
 		call.ArgType = t
 		return ast.Type{Name: "string"}, nil
+	case "error":
+		// error(message: string): error (cascade_spec.md §8.6, §13) —
+		// always constructs a definite, non-none error value; only a
+		// variable/return declared `error?` carries the nullable wrapper.
+		if len(call.Args) != 1 {
+			return ast.Type{}, fmt.Errorf("line %d: error() expects exactly 1 argument, got %d", call.Line, len(call.Args))
+		}
+		if err := c.checkAssignable(sc, ast.Type{Name: "string"}, call.Args[0]); err != nil {
+			return ast.Type{}, err
+		}
+		return ast.Type{Name: "error"}, nil
 	case "len":
 		if len(call.Args) != 1 {
 			return ast.Type{}, fmt.Errorf("line %d: len() expects exactly 1 argument, got %d", call.Line, len(call.Args))

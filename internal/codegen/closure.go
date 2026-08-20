@@ -60,14 +60,18 @@ func genClosureLit(g *funcGen, lit *ast.ClosureLit) (string, error) {
 		inner.scope.declare(p.Name, ref)
 	}
 
-	resultIRTypes := make([]string, len(lit.Results))
-	for i, r := range lit.Results {
+	var resultIRTypes []string
+	for _, r := range lit.Results {
 		rIRType, err := typeToIR(g.types, r)
 		if err != nil {
 			return "", err
 		}
-		resultIRTypes[i] = rIRType
+		resultIRTypes = append(resultIRTypes, rIRType)
+		if needsIssetSlot(r) {
+			resultIRTypes = append(resultIRTypes, "^bool")
+		}
 	}
+	inner.results = lit.Results
 
 	for _, stmt := range lit.Body {
 		if err := genStmt(inner, stmt); err != nil {
@@ -121,46 +125,26 @@ func closureCallTarget(g *funcGen, valOp, irType string) string {
 // closureCallTarget's doc for why the callee operand isn't always
 // ref.ValOp directly.
 func genClosureCallValue(g *funcGen, call *ast.CallExpr) (string, error) {
-	ref, ok := g.scope.lookup(call.Callee)
-	if !ok {
-		return "", fmt.Errorf("codegen: undefined name %q (sema bug)", call.Callee)
-	}
-	sig := funcSig{Params: ref.Type.Func.Params, Results: ref.Type.Func.Results}
-	args, err := genCallArgs(g, call, sig)
+	calleeName, sig, args, err := resolveCall(g, call)
 	if err != nil {
 		return "", err
 	}
-	calleeIRType, err := typeToIR(g.types, ref.Type)
+	refs, err := emitCallWithResults(g, calleeName, args, sig.Results)
 	if err != nil {
 		return "", err
 	}
-	resultIRType, err := typeToIR(g.types, sig.Results[0])
-	if err != nil {
-		return "", err
-	}
-	tmp := g.newTemp(resultIRType)
-	emitCall(g, []string{tmp}, closureCallTarget(g, ref.ValOp, calleeIRType), args)
-	return tmp, nil
+	return refs[0].ValOp, nil
 }
 
 // genClosureCallStmt compiles a call to a closure-valued local variable
 // used as a bare statement, discarding every result — mirrors
 // genUserFuncCallStmt/genMethodCallStmt.
 func genClosureCallStmt(g *funcGen, call *ast.CallExpr) error {
-	ref, ok := g.scope.lookup(call.Callee)
-	if !ok {
-		return fmt.Errorf("codegen: undefined name %q (sema bug)", call.Callee)
-	}
-	sig := funcSig{Params: ref.Type.Func.Params, Results: ref.Type.Func.Results}
-	args, err := genCallArgs(g, call, sig)
+	calleeName, _, args, err := resolveCall(g, call)
 	if err != nil {
 		return err
 	}
-	calleeIRType, err := typeToIR(g.types, ref.Type)
-	if err != nil {
-		return err
-	}
-	emitCall(g, nil, closureCallTarget(g, ref.ValOp, calleeIRType), args)
+	emitCall(g, nil, calleeName, args)
 	return nil
 }
 

@@ -225,13 +225,11 @@ func genMethodCallValue(g *funcGen, call *ast.CallExpr) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	resultIRType, err := typeToIR(g.types, sig.Results[0])
+	refs, err := emitCallWithResults(g, "!"+methodAmivmName(call), args, sig.Results)
 	if err != nil {
 		return "", err
 	}
-	tmp := g.newTemp(resultIRType)
-	emitCall(g, []string{tmp}, "!"+methodAmivmName(call), args)
-	return tmp, nil
+	return refs[0].ValOp, nil
 }
 
 // genMethodCallStmt compiles a method call used as a bare statement

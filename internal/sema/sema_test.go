@@ -1258,18 +1258,6 @@ func main(): int {
 `,
 			wantErr: "\"len\" is a builtin function name and cannot be redefined",
 		},
-		{
-			name: "nullable return types are not supported yet",
-			src: `
-func f(): int? {
-	return 1
-}
-func main(): int {
-	return 0
-}
-`,
-			wantErr: "nullable return types are not supported yet",
-		},
 	}
 
 	for _, tt := range tests {
@@ -1703,6 +1691,204 @@ func main(): int {
 }
 `,
 			wantErr: "cannot index into int",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := check(t, tt.src)
+			if err == nil {
+				t.Fatalf("Check() = nil, want error containing %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Check() = %q, want error containing %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestCheck_ValidErrorHandling(t *testing.T) {
+	src := `
+func divide(a: int, b: int): (int, error?) {
+	if b == 0 {
+		return 0, error("division by zero")
+	}
+	return a / b, none
+}
+
+func loadAndDouble(a: int, b: int): (int, error?) {
+	let result = divide(a, b)?
+	return result * 2, none
+}
+
+func saveResult(n: int): (int, error?) {
+	return n, none
+}
+
+func process(n: int): (int, error?) {
+	saveResult(n)?
+	return n * 10, none
+}
+
+func mustBePositive(n: int): error? {
+	if n < 0 {
+		return error("must be positive")
+	}
+	return none
+}
+
+func main(): int {
+	let q, err = divide(10, 2)
+	if err is not none {
+		print("failed: " + err.message)
+		return 1
+	}
+	print(string(q))
+
+	let doubled, err2 = loadAndDouble(20, 4)
+	if err2 is not none {
+		return 1
+	}
+	print(string(doubled))
+
+	let processed, err3 = process(7)
+	if err3 is not none {
+		return 1
+	}
+	print(string(processed))
+
+	let e = mustBePositive(-5)
+	if e is not none {
+		print(e.message)
+	}
+
+	let validate = func(n: int): (int, error?) {
+		if n < 0 {
+			return 0, error("negative")
+		}
+		return n, none
+	}
+	let v, verr = validate(5)
+	if verr is not none {
+		print(verr.message)
+	} else {
+		print(string(v))
+	}
+
+	return 0
+}
+`
+	if err := check(t, src); err != nil {
+		t.Fatalf("Check() = %v, want nil", err)
+	}
+}
+
+func TestCheck_ValidNullableReturnType(t *testing.T) {
+	// Regression test: nullable return types (any type, not just error?)
+	// are now supported — Step 7/9 deferred this, Step 11 implements it.
+	src := `
+func maybeGreeting(happy: bool): string? {
+	if happy {
+		return "hello"
+	}
+	return none
+}
+func main(): int {
+	let g = maybeGreeting(true)
+	if g is not none {
+		print(g)
+	}
+	return 0
+}
+`
+	if err := check(t, src); err != nil {
+		t.Fatalf("Check() = %v, want nil", err)
+	}
+}
+
+func TestCheck_ErrorHandlingErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		src     string
+		wantErr string
+	}{
+		{
+			name: "error() expects exactly 1 argument",
+			src: `
+func main(): int {
+	let e = error()
+	return 0
+}
+`,
+			wantErr: "error() expects exactly 1 argument",
+		},
+		{
+			name: "error() argument must be a string",
+			src: `
+func main(): int {
+	let e = error(5)
+	return 0
+}
+`,
+			wantErr: "cannot assign",
+		},
+		{
+			name: "field access on error works via the built-in message field",
+			src: `
+func f(): (int, error?) {
+	return 0, error("boom")
+}
+func main(): int {
+	let v, err = f()
+	if err is not none {
+		print(err.field_that_does_not_exist)
+	}
+	return 0
+}
+`,
+			wantErr: "struct \"error\" has no field \"field_that_does_not_exist\"",
+		},
+		{
+			name: "'?' requires a (T, error?)-shaped call",
+			src: `
+func f(): int {
+	return 0
+}
+func main(): int {
+	let y = f()?
+	return 0
+}
+`,
+			wantErr: "'?' requires a call returning (T, error?)",
+		},
+		{
+			name: "'?' requires the enclosing function to also end in error?",
+			src: `
+func f(): (int, error?) {
+	return 0, none
+}
+func main(): int {
+	let y = f()?
+	return 0
+}
+`,
+			wantErr: "'?' can only be used inside a function or closure whose own return type ends in error?",
+		},
+		{
+			name: "'?' rejects a nullable success type",
+			src: `
+func f(): (string?, error?) {
+	return none, none
+}
+func g(): (string?, error?) {
+	let y = f()?
+	return y, none
+}
+func main(): int {
+	return 0
+}
+`,
+			wantErr: "'?' does not support a nullable success type yet",
 		},
 	}
 

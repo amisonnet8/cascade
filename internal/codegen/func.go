@@ -46,7 +46,11 @@ func funcAmivmName(name string) string {
 // declared parameter type, so a nullable parameter's flag has to be its
 // own, explicit second parameter, filled in by the caller (see
 // genCallArgs) — it cannot be synthesized locally the way Seed
-// synthesized `true` for its own (always-assigned) parameters.
+// synthesized `true` for its own (always-assigned) parameters. A
+// nullable *result* type gets the identical two-slot expansion on the
+// way out (cascade_spec.md §8.6's `(T, error?)` convention, and any
+// other nullable result along with it — see needsIssetSlot and
+// genReturnStmt's matching expansion).
 func genFuncDecl(fn *ast.FuncDecl, types *typeRegistry, structs map[string]*ast.StructDecl, sigs map[string]funcSig, methods map[string]map[string]funcSig) (string, error) {
 	g := &funcGen{scope: newScope(nil), types: types, structs: structs, sigs: sigs, methods: methods}
 
@@ -77,14 +81,18 @@ func genFuncDecl(fn *ast.FuncDecl, types *typeRegistry, structs map[string]*ast.
 		g.scope.declare(p.Name, ref)
 	}
 
-	resultIRTypes := make([]string, len(fn.Results))
-	for i, r := range fn.Results {
+	var resultIRTypes []string
+	for _, r := range fn.Results {
 		irType, err := typeToIR(types, r)
 		if err != nil {
 			return "", err
 		}
-		resultIRTypes[i] = irType
+		resultIRTypes = append(resultIRTypes, irType)
+		if needsIssetSlot(r) {
+			resultIRTypes = append(resultIRTypes, "^bool")
+		}
 	}
+	g.results = fn.Results
 
 	for _, stmt := range fn.Body {
 		if err := genStmt(g, stmt); err != nil {
@@ -137,7 +145,7 @@ func genFuncDecl(fn *ast.FuncDecl, types *typeRegistry, structs map[string]*ast.
 // arguments (genCallArgs).
 func genNullableOperands(g *funcGen, expr ast.Expr, targetType ast.Type) (val, isset string, err error) {
 	if _, isNone := expr.(*ast.NoneLit); isNone {
-		zero, err := zeroValueLiteral(targetType)
+		zero, err := genZeroValueToken(g, targetType)
 		if err != nil {
 			return "", "", err
 		}
@@ -165,6 +173,31 @@ func genNullableOperands(g *funcGen, expr ast.Expr, targetType ast.Type) (val, i
 		okTmp := g.newTemp("^bool")
 		g.emit("\tMGET\t%s\t%s\t%s\t%s\n", valTmp, okTmp, xOp, keyOp)
 		return valTmp, okTmp, nil
+	}
+	if call, isCall := expr.(*ast.CallExpr); isCall {
+		// A call's own single result may itself be nullable (e.g. `let e:
+		// error? = makeError()`, a function returning just `error?`) —
+		// call it exactly once (never via a separate genValue(expr) after
+		// this, which would invoke it a second time) and read both its
+		// value and isset operands directly from that one CALL. Builtins
+		// (append/len/range/string/filter/map/reduce/error) are excluded:
+		// none of them can currently produce a nullable result, so they
+		// fall through to the generic path below instead.
+		_, isPlainFunc := g.sigs[call.Callee]
+		if call.Receiver != nil || call.IsClosureVar || isPlainFunc {
+			calleeName, sig, args, err := resolveCall(g, call)
+			if err != nil {
+				return "", "", err
+			}
+			refs, err := emitCallWithResults(g, calleeName, args, sig.Results)
+			if err != nil {
+				return "", "", err
+			}
+			if refs[0].SetOp != "" {
+				return refs[0].ValOp, refs[0].SetOp, nil
+			}
+			return refs[0].ValOp, "true", nil
+		}
 	}
 	v, err := genValue(g, expr)
 	if err != nil {
@@ -216,22 +249,107 @@ func emitCall(g *funcGen, results []string, calleeName string, args []string) {
 	g.emit(format, parts...)
 }
 
-// genUserFuncCallValue compiles a call to a user-defined, single-result
-// function used as a value (cascade_spec.md §8.1) into a fresh temp.
-// sema.Check guarantees len(sig.Results) == 1 here — a multi-result call
-// can only appear as a MultiLetDecl's Init (see genMultiLetDecl).
+// genResultTemps allocates one or two fresh anonymous temps per result
+// type (two when needsIssetSlot(t) — mirrors genFuncDecl's identical
+// parameter expansion, applied here to CALL's own result side),
+// returning each result's own varRef (ValOp, and SetOp when nullable)
+// alongside the flat list of result-operand tokens to pass to CALL.
+func genResultTemps(g *funcGen, resultTypes []ast.Type) ([]varRef, []string, error) {
+	refs := make([]varRef, len(resultTypes))
+	var tokens []string
+	for i, rt := range resultTypes {
+		irType, err := typeToIR(g.types, rt)
+		if err != nil {
+			return nil, nil, err
+		}
+		ref := varRef{Type: rt, ValOp: g.newTemp(irType)}
+		tokens = append(tokens, ref.ValOp)
+		if needsIssetSlot(rt) {
+			ref.SetOp = g.newTemp("^bool")
+			tokens = append(tokens, ref.SetOp)
+		}
+		refs[i] = ref
+	}
+	return refs, tokens, nil
+}
+
+// emitCallWithResults emits one CALL against calleeName with args,
+// expanding results per genResultTemps, and returns each result's own
+// varRef for the caller to pick out whichever it needs — a single-value
+// call needs only refs[0].ValOp (genUserFuncCallValue/genMethodCallValue/
+// genClosureCallValue), while genNullableOperands's CallExpr case and
+// error.go's genErrorProp need refs[0]'s (or the last result's) SetOp
+// too. Discarding every result entirely never calls this at all — see
+// genUserFuncCallStmt et al., which just pass CALL an empty result list
+// directly (amivm allows fully omitting CALL's results for a bare
+// side-effect call, regardless of how many the callee actually has).
+func emitCallWithResults(g *funcGen, calleeName string, args []string, results []ast.Type) ([]varRef, error) {
+	refs, tokens, err := genResultTemps(g, results)
+	if err != nil {
+		return nil, err
+	}
+	emitCall(g, tokens, calleeName, args)
+	return refs, nil
+}
+
+// resolveCall resolves call's callee token, signature, and compiled
+// argument list, uniformly across every call kind (plain function,
+// method, closure variable) — shared wherever a caller needs to inspect
+// or specially handle a call's *results* itself, rather than simply
+// taking the first one as an ordinary value (see genMultiLetDecl,
+// genNullableOperands's CallExpr case, and error.go's genErrorProp, all
+// of which need every result operand, not just the first). Only ever
+// called with call.Receiver != nil, call.IsClosureVar, or a call.Callee
+// present in g.sigs — never a builtin, which callers must exclude
+// themselves (see genNullableOperands's isPlainFunc guard).
+func resolveCall(g *funcGen, call *ast.CallExpr) (calleeName string, sig funcSig, args []string, err error) {
+	switch {
+	case call.Receiver != nil:
+		sig = g.methods[call.RecvStruct][call.Callee]
+		args, err = genMethodCallArgs(g, call, sig)
+		calleeName = "!" + methodAmivmName(call)
+	case call.IsClosureVar:
+		ref, ok := g.scope.lookup(call.Callee)
+		if !ok {
+			return "", funcSig{}, nil, fmt.Errorf("codegen: undefined name %q (sema bug)", call.Callee)
+		}
+		sig = funcSig{Params: ref.Type.Func.Params, Results: ref.Type.Func.Results}
+		args, err = genCallArgs(g, call, sig)
+		if err != nil {
+			return "", funcSig{}, nil, err
+		}
+		irType, terr := typeToIR(g.types, ref.Type)
+		if terr != nil {
+			return "", funcSig{}, nil, terr
+		}
+		calleeName = closureCallTarget(g, ref.ValOp, irType)
+		return calleeName, sig, args, nil
+	default:
+		sig = g.sigs[call.Callee]
+		args, err = genCallArgs(g, call, sig)
+		calleeName = "!" + funcAmivmName(call.Callee)
+	}
+	return calleeName, sig, args, err
+}
+
+// genUserFuncCallValue compiles a call to a user-defined function used
+// as a value (cascade_spec.md §8.1) into a fresh temp, taking its first
+// result — sema.Check guarantees len(sig.Results) >= 1 here (a
+// zero-result call can't be used as a value at all — see
+// checkCallSigAsValue) and that a genuinely multi-result call only
+// appears as a MultiLetDecl's Init (see genMultiLetDecl) — so refs[0] is
+// always the right (and, in every case that reaches this function via
+// genCallValue's dispatch, only) one to return.
 func genUserFuncCallValue(g *funcGen, call *ast.CallExpr, sig funcSig) (string, error) {
 	args, err := genCallArgs(g, call, sig)
 	if err != nil {
 		return "", err
 	}
-	resultIRType, err := typeToIR(g.types, sig.Results[0])
+	refs, err := emitCallWithResults(g, "!"+funcAmivmName(call.Callee), args, sig.Results)
 	if err != nil {
 		return "", err
 	}
-	tmp := g.newTemp(resultIRType)
-	emitCall(g, []string{tmp}, "!"+funcAmivmName(call.Callee), args)
-	return tmp, nil
+	return refs[0].ValOp, nil
 }
 
 // genUserFuncCallStmt compiles a call to any function used as a bare
@@ -249,36 +367,32 @@ func genUserFuncCallStmt(g *funcGen, call *ast.CallExpr, sig funcSig) error {
 
 // genMultiLetDecl compiles a multi-value `let`/`const` declaration
 // (cascade_spec.md §5, §8.5): one CALL whose result operands are either
-// a freshly hoisted VAR per named result, or "_" for a discarded one
-// (AMIVM-IR's own discard token, matching the multi1/multi2 operand
-// category — see amivm_spec.md §5). decl.ResolvedTypes (filled in by
-// sema.Check) gives each name's type without re-deriving it from sig.
-// Init's callee may be either a plain function or a method call (§8.2,
-// Receiver non-nil) — see struct.go's genMethodCallArgs/methodAmivmName.
+// one or two freshly hoisted VARs per named result (two when that
+// result's own type needs an isset slot — cascade_spec.md §8.6's `(T,
+// error?)` convention is exactly this, with error? in the last
+// position, but the expansion itself applies uniformly to any nullable
+// result), or "_" (twice, for a discarded nullable result) for a
+// discarded one (AMIVM-IR's own discard token, matching the multi1/
+// multi2 operand category — see amivm_spec.md §5). decl.ResolvedTypes
+// (filled in by sema.Check) gives each name's type without re-deriving
+// it from sig. Init's callee may be a plain function, a method call
+// (§8.2), or a closure-valued variable (§8.3) — see resolveCall.
 func genMultiLetDecl(g *funcGen, decl *ast.MultiLetDecl) error {
-	var args []string
-	var calleeName string
-	var err error
-	if decl.Init.Receiver != nil {
-		sig := g.methods[decl.Init.RecvStruct][decl.Init.Callee]
-		args, err = genMethodCallArgs(g, decl.Init, sig)
-		calleeName = "!" + methodAmivmName(decl.Init)
-	} else {
-		sig := g.sigs[decl.Init.Callee]
-		args, err = genCallArgs(g, decl.Init, sig)
-		calleeName = "!" + funcAmivmName(decl.Init.Callee)
-	}
+	calleeName, _, args, err := resolveCall(g, decl.Init)
 	if err != nil {
 		return err
 	}
 
-	results := make([]string, len(decl.Names))
+	var results []string
 	for i, name := range decl.Names {
+		typ := decl.ResolvedTypes[i]
 		if name == "_" {
-			results[i] = "_"
+			results = append(results, "_")
+			if needsIssetSlot(typ) {
+				results = append(results, "_")
+			}
 			continue
 		}
-		typ := decl.ResolvedTypes[i]
 		irType, err := typeToIR(g.types, typ)
 		if err != nil {
 			return err
@@ -286,8 +400,13 @@ func genMultiLetDecl(g *funcGen, decl *ast.MultiLetDecl) error {
 		internal := g.freshName(name)
 		ref := varRef{Type: typ, ValOp: "%" + internal}
 		g.declareVar(ref.ValOp, irType)
+		results = append(results, ref.ValOp)
+		if needsIssetSlot(typ) {
+			ref.SetOp = "%" + internal + "_isset"
+			g.declareVar(ref.SetOp, "^bool")
+			results = append(results, ref.SetOp)
+		}
 		g.scope.declare(name, ref)
-		results[i] = ref.ValOp
 	}
 
 	emitCall(g, results, calleeName, args)

@@ -541,6 +541,22 @@ type ClosureLit struct {
 
 func (*ClosureLit) exprNode() {}
 
+// ErrorPropExpr is postfix `expr?` (cascade_spec.md §8.6's Rust-style
+// error-propagation operator, §6 priority 1). Call must resolve to a
+// function/method/closure call returning exactly `(T, error?)` — sema.Check
+// enforces this, since a bare Cascade expression has no other value shape
+// that could sensibly precede `?` (there's no first-class tuple type for
+// `?` to peel apart otherwise, see ast.MultiLetDecl's doc). ResultType
+// (filled in by sema.Check) is T — see CLAUDE.md's "確定した設計判断" for
+// why T itself must be non-nullable in this scope.
+type ErrorPropExpr struct {
+	Call       *CallExpr
+	Line       int
+	ResultType Type
+}
+
+func (*ErrorPropExpr) exprNode() {}
+
 // StmtLine returns the source line a statement node was parsed from.
 func StmtLine(s Stmt) int {
 	switch v := s.(type) {
@@ -611,6 +627,8 @@ func ExprLine(e Expr) int {
 	case *NullCheckExpr:
 		return v.Line
 	case *ClosureLit:
+		return v.Line
+	case *ErrorPropExpr:
 		return v.Line
 	default:
 		return 0

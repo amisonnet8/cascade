@@ -21,10 +21,12 @@
 // the `none` literal, list literals `[1, 2, 3]`/`[]`, map literals
 // `{"a": 1, "b": 2}`/`{}`, and struct literals `Name{field: value,
 // ...}`), variable references, function/method/closure calls, field
-// access `x.field`, list/map indexing `xs[i]`/`m[k]`, and `is none`/`is
-// not none` (§7) directly on an atom (the only place the spec actually
-// uses it — as an `if`/`switch` condition). A struct or map literal is
-// only recognized where `{` cannot instead open a block (see
+// access `x.field`, list/map indexing `xs[i]`/`m[k]`, postfix error
+// propagation `expr?` on a call expression (§8.6, both in expression
+// position and as its own bare statement), and `is none`/`is not none`
+// (§7) directly on an atom (the only place the spec actually uses it —
+// as an `if`/`switch` condition). A struct or map literal is only
+// recognized where `{` cannot instead open a block (see
 // withStructLitForbidden/withStructLitAllowed — the same guard covers
 // both, despite the name), mirroring Go's identical restriction — a
 // closure literal needs no such guard, since seeing `func` in expression
@@ -114,13 +116,13 @@ func (p *parser) skipNewlines() {
 }
 
 // typeKeywords maps a scalar type keyword to its ast.Type name
-// (cascade_spec.md §2.1). Extended with pointer/slice/map/func/struct/error
-// forms as the steps that need them land.
+// (cascade_spec.md §2.1, plus `error`, §8.6's built-in single-field type).
 var typeKeywords = map[lexer.Kind]string{
 	lexer.KwInt:    "int",
 	lexer.KwFloat:  "float",
 	lexer.KwString: "string",
 	lexer.KwBool:   "bool",
+	lexer.KwError:  "error",
 }
 
 func (p *parser) parseFile() (*ast.File, error) {
@@ -747,6 +749,21 @@ var compoundAssignOps = map[lexer.Kind]string{
 	lexer.PercentAssign: "%",
 }
 
+// exprStmtFromCall wraps call as an ExprStmt, first consuming a
+// following postfix `?` (cascade_spec.md §8.6) if present —
+// `someCall()?`/`obj.method()?` used as a bare statement propagates any
+// error while discarding the success value (see ast.ErrorPropExpr's
+// doc) — shared by parseIdentStmt's and parseFieldOrMethodStmt's call
+// branches.
+func (p *parser) exprStmtFromCall(call *ast.CallExpr) ast.Stmt {
+	var x ast.Expr = call
+	if p.cur().Kind == lexer.Question {
+		qtok := p.advance()
+		x = &ast.ErrorPropExpr{Call: call, Line: qtok.Line}
+	}
+	return &ast.ExprStmt{X: x, Line: call.Line}
+}
+
 // parseIdentStmt parses a statement starting with an identifier: a call
 // expression (`f(...)`), a scalar or list-element assignment (`name =
 // value` / `name[Index] = value`), a compound assignment (`name +=
@@ -759,7 +776,7 @@ func (p *parser) parseIdentStmt() (ast.Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &ast.ExprStmt{X: call, Line: call.Line}, nil
+		return p.exprStmtFromCall(call), nil
 	case p.cur().Kind == lexer.Dot:
 		return p.parseFieldOrMethodStmt(name)
 	case p.cur().Kind == lexer.LBracket:
@@ -819,7 +836,7 @@ func (p *parser) parseFieldOrMethodStmt(name lexer.Token) (ast.Stmt, error) {
 			return nil, err
 		}
 		call.Receiver = &ast.Ident{Name: name.Literal, Line: name.Line}
-		return &ast.ExprStmt{X: call, Line: call.Line}, nil
+		return p.exprStmtFromCall(call), nil
 	}
 	if _, err := p.expect(lexer.Assign, "'='"); err != nil {
 		return nil, err
@@ -1003,11 +1020,13 @@ func (p *parser) parseUnary() (ast.Expr, error) {
 	return p.parsePrimary()
 }
 
-// parsePrimary parses a primary atom, then any number of `[index]` and
-// `.field`/`.method(...)` suffixes (cascade_spec.md §5's list indexing,
-// §4.1/§8.2's field/method access, §6 priority 1), and finally wraps the
-// result in `is none`/`is not none` (§7) if one directly follows — the
-// tightest binding possible, matching every spec example (always a bare
+// parsePrimary parses a primary atom, then any number of `[index]`,
+// `.field`/`.method(...)`, and postfix `?` (error propagation) suffixes
+// (cascade_spec.md §5's list/map indexing, §4.1/§8.2's field/method
+// access, §8.6's error propagation, all §6 priority 1 — hence sharing
+// one left-to-right postfix loop), and finally wraps the result in `is
+// none`/`is not none` (§7) if one directly follows — the tightest
+// binding possible, matching every spec example (always a bare
 // identifier immediately followed by `is`).
 func (p *parser) parsePrimary() (ast.Expr, error) {
 	x, err := p.parsePrimaryAtom()
@@ -1020,6 +1039,8 @@ func (p *parser) parsePrimary() (ast.Expr, error) {
 			x, err = p.parseIndexSuffix(x)
 		case lexer.Dot:
 			x, err = p.parseSelectorSuffix(x)
+		case lexer.Question:
+			x, err = p.parseErrorPropSuffix(x)
 		default:
 			if p.cur().Kind == lexer.KwIs {
 				return p.parseNullCheck(x)
@@ -1066,6 +1087,21 @@ func (p *parser) parseSelectorSuffix(x ast.Expr) (ast.Expr, error) {
 		return call, nil
 	}
 	return &ast.FieldExpr{X: x, Field: name.Literal, Line: name.Line}, nil
+}
+
+// parseErrorPropSuffix parses the postfix `?` (error propagation,
+// cascade_spec.md §8.6) suffix onto an already-parsed expression x — x
+// must be a call expression (a plain function, method, or closure-
+// variable call, all sharing ast.CallExpr — see its doc), since there's
+// nothing else `?` could sensibly unwrap; sema.Check further requires
+// that call's own signature to be exactly `(T, error?)`.
+func (p *parser) parseErrorPropSuffix(x ast.Expr) (ast.Expr, error) {
+	tok := p.advance() // '?'
+	call, ok := x.(*ast.CallExpr)
+	if !ok {
+		return nil, fmt.Errorf("line %d: '?' can only follow a call expression", tok.Line)
+	}
+	return &ast.ErrorPropExpr{Call: call, Line: tok.Line}, nil
 }
 
 // parseNullCheck parses the `is none`/`is not none` suffix onto an
@@ -1140,13 +1176,14 @@ func (p *parser) parsePrimaryAtom() (ast.Expr, error) {
 		return nil, fmt.Errorf("line %d: unexpected token %q", tok.Line, tok.Literal)
 	case lexer.KwFunc:
 		return p.parseClosureLit()
-	case lexer.KwString, lexer.KwInt, lexer.KwFloat, lexer.KwBool, lexer.KwMap:
-		// A type keyword can also name a builtin conversion/collection
-		// call, e.g. string(x) (cascade_spec.md §13) or map(list, f)
-		// (§8.4) — "map" is reserved for the map<K, V> type (§2.2, §4.5,
-		// Step 10), so like string/int/float/bool it's still a keyword
-		// (not an Ident), needing its own case here rather than falling
-		// through to the Ident case below.
+	case lexer.KwString, lexer.KwInt, lexer.KwFloat, lexer.KwBool, lexer.KwMap, lexer.KwError:
+		// A type keyword can also name a builtin conversion/collection/
+		// construction call, e.g. string(x) (cascade_spec.md §13),
+		// map(list, f) (§8.4), or error(message) (§8.6, §13) — "error" is
+		// reserved for the built-in error type (§2.2, §8.6), so like
+		// string/int/float/bool/map it's still a keyword (not an Ident),
+		// needing its own case here rather than falling through to the
+		// Ident case below.
 		name := p.advance()
 		if p.cur().Kind == lexer.LParen {
 			return p.parseCallExprFrom(name)

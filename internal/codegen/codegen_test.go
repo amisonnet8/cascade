@@ -1004,10 +1004,10 @@ func main(): int {
 	return 0
 }
 `)
-	if strings.Contains(ir, "CALL\t%tmp_1\t:\t$1\t") {
+	if strings.Contains(ir, "CALL\t%tmp_2\t:\t$1\t") {
 		t.Fatalf("must not call a closure through a bare $N parameter token; got:\n%s", ir)
 	}
-	if !strings.Contains(ir, "SET\t%tmp_2\t$1\n") {
+	if !strings.Contains(ir, "SET\t%tmp_1\t$1\n") {
 		t.Fatalf("expected the closure parameter to be copied into a local temp before being called; got:\n%s", ir)
 	}
 }
@@ -1155,6 +1155,154 @@ func main(): int {
 	}
 	if !strings.Contains(ir, "\tMGET\t%v_") {
 		t.Fatalf("expected each iteration to MGET the value for its key; got:\n%s", ir)
+	}
+	assertLabelsResolve(t, ir)
+}
+
+func TestGenerate_ErrorStructEmitsSTTYPE(t *testing.T) {
+	ir := generate(t, `
+func main(): int {
+	return 0
+}
+`)
+	if !strings.Contains(ir, "STTYPE\t^error\nFIELD\t>message\t^string\nENDSTTYPE\n") {
+		t.Fatalf("expected the built-in error type to always emit an STTYPE block; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_ErrorCallUsesFSET(t *testing.T) {
+	ir := generate(t, `
+func f(): (int, error?) {
+	return 0, error("boom")
+}
+func main(): int {
+	return 0
+}
+`)
+	if !strings.Contains(ir, "FSET\t%tmp_1\t>message\t\"boom\"\n") {
+		t.Fatalf("expected error(\"boom\") to compile to an FSET of the message field; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_NullableResultExpandsRETAndFUNC(t *testing.T) {
+	// Regression test for the core Step 11 mechanism: a nullable RESULT
+	// type needs the same two-slot (value, isset) expansion a nullable
+	// PARAMETER already gets, applied to both FUNC's own declared result
+	// list and every RET inside its body.
+	ir := generate(t, `
+func divide(a: int, b: int): (int, error?) {
+	if b == 0 {
+		return 0, error("division by zero")
+	}
+	return a / b, none
+}
+func main(): int {
+	return 0
+}
+`)
+	if !strings.Contains(ir, "FUNC\t!divide\t^int\t^int\t:\t^int\t^error\t^bool\n") {
+		t.Fatalf("expected divide's FUNC declaration to expand its error? result into (^error, ^bool); got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "RET\t0\t%tmp_2\ttrue\n") {
+		t.Fatalf("expected 'return 0, error(...)' to RET the error value plus an explicit true isset; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "RET\t%tmp_3\t%tmp_4\tfalse\n") {
+		t.Fatalf("expected 'return a / b, none' to RET the zero error value plus an explicit false isset; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_MultiLetNullableResultGetsIssetFlag(t *testing.T) {
+	ir := generate(t, `
+func divide(a: int, b: int): (int, error?) {
+	if b == 0 {
+		return 0, error("division by zero")
+	}
+	return a / b, none
+}
+func main(): int {
+	let q, err = divide(10, 2)
+	if err is not none {
+		print(err.message)
+	}
+	return 0
+}
+`)
+	if !strings.Contains(ir, "VAR\t%err_2\t^error\n\tVAR\t%err_2_isset\t^bool\n") {
+		t.Fatalf("expected the multi-let's error result to get a companion isset VAR; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "CALL\t%q_1\t%err_2\t%err_2_isset\t:\t!divide\t10\t2\n") {
+		t.Fatalf("expected the CALL to request all three result operands (value, error, isset); got:\n%s", ir)
+	}
+}
+
+func TestGenerate_ErrorPropagationEarlyReturns(t *testing.T) {
+	ir := generate(t, `
+func divide(a: int, b: int): (int, error?) {
+	if b == 0 {
+		return 0, error("division by zero")
+	}
+	return a / b, none
+}
+func loadAndDouble(a: int, b: int): (int, error?) {
+	let result = divide(a, b)?
+	return result * 2, none
+}
+func main(): int {
+	return 0
+}
+`)
+	if !strings.Contains(ir, "CALL\t%tmp_2\t%tmp_3\t%tmp_4\t:\t!divide\t$1\t$2\n") {
+		t.Fatalf("expected 'divide(a, b)?' to request all three of divide's result operands; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "IF\t%tmp_4\t#L1\n") {
+		t.Fatalf("expected the propagation check to branch on divide's own isset flag; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "RET\t0\t%tmp_3\ttrue\n") {
+		t.Fatalf("expected the early return to propagate divide's own error value with true; got:\n%s", ir)
+	}
+	assertLabelsResolve(t, ir)
+}
+
+func TestGenerate_BareStatementErrorPropagation(t *testing.T) {
+	ir := generate(t, `
+func saveResult(n: int): (int, error?) {
+	return n, none
+}
+func process(n: int): (int, error?) {
+	saveResult(n)?
+	return n * 10, none
+}
+func main(): int {
+	return 0
+}
+`)
+	if !strings.Contains(ir, "CALL\t%tmp_1\t%tmp_2\t%tmp_3\t:\t!saveResult\t$1\n") {
+		t.Fatalf("expected the bare 'saveResult(n)?' statement to still call and check the error; got:\n%s", ir)
+	}
+	assertLabelsResolve(t, ir)
+}
+
+func TestGenerate_SingleNullableResultUsesCommaOkPattern(t *testing.T) {
+	ir := generate(t, `
+func mustBePositive(n: int): error? {
+	if n < 0 {
+		return error("must be positive")
+	}
+	return none
+}
+func main(): int {
+	let e = mustBePositive(-5)
+	if e is not none {
+		print(e.message)
+	}
+	return 0
+}
+`)
+	if !strings.Contains(ir, "FUNC\t!mustBePositive\t^int\t:\t^error\t^bool\n") {
+		t.Fatalf("expected a single error? result to expand FUNC's declared result list too; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "CALL\t%tmp_") || !strings.Contains(ir, "!mustBePositive") {
+		t.Fatalf("expected mustBePositive to be called with both result operands; got:\n%s", ir)
 	}
 	assertLabelsResolve(t, ir)
 }

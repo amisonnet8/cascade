@@ -153,11 +153,7 @@ Seedと異なりCascadeは複数ファイル/パッケージ・null許容型・�
 
 いずれも**実装したら`amivm`→`go build`→実行まで必ず確認する**(seed_implementation_notes.md §6.1の教訓)。並行処理はロジック上正しく見えても実地検証なしでは信用しない。
 
-### 2. `error`型(8.6節)の表現
-
-`err.message`のようなフィールドアクセスが必要なため、Goの組み込み`error`インターフェースにマッピングするより、**`^error`という名前で`message: string`を1フィールド持つ`STTYPE`をCascadeコンパイラが自動定義する**案が有力(2.2節の説明「実体は`message: string`を1つ持つ構造体的な値」とも整合する)。後置`?`演算子(8.6節)はsemaが「戻り値の末尾が`error?`である呼び出し」を検出し、`IF`+`RET`による早期returnへ機械的に展開する(Seedのビルトイン脱糖と同じ発想)。
-
-### 3. パッケージ/モジュール解決(11節)
+### 2. パッケージ/モジュール解決(11節)
 
 Seedには存在しなかった、Cascade固有の追加コンパイル工程。`import`文の解決・循環import検出(11.5節)・パッケージ内の複数ファイル統合(11.1節)は、字句解析・構文解析より**前**、あるいはAST構築後・sema前の独立したフェーズ(パッケージローダー)として実装する必要がある。AMIVM-IRへ落とす際の識別子一意化(`パッケージ名_識別子`、11.6節)はcodegenの命名規則に組み込む。
 
@@ -298,6 +294,20 @@ Cascadeの`func main(): int`をamivmの`!main`へ直接対応させることは�
 
 `examples/10_maps.cas`(map リテラル・`m[k]`のnull許容読み取り・`m[k]=v`・`delete`・非nullable/nullable両方の空map宣言・`for k, v in m`の2変数走査)で`amivm`→`go build`→実行まで確認済み。
 
+### エラー処理(`error`型・`(T, error?)`・後置`?`)の設計(Step 11)
+
+**`error`型は、オープンな設計課題で候補に挙げていた通り、`message: string`を1フィールド持つ`STTYPE`をCascadeコンパイラが自動登録する形で確定した。** `internal/sema`と`internal/codegen`それぞれに独立した`errorStructDecl`(パッケージ間非依存の原則を維持するため、あえて共有せず2箇所に同じ定義を持つ)を持たせ、`checker`/`funcGen`双方の構造体テーブルへ他のユーザー定義structと同列に事前登録する。`error`はStep 1からlexerの予約語(`KwError`)だったため、ユーザーが同名のstructを定義しようとしても構文的に不可能で、衝突の心配なしにこの方式が成立した。結果として`err.message`のようなフィールドアクセスは、既存の`FGET`/構造体アクセス経路をそのまま通るだけで、`error`型専用のcodegen分岐は`error(msg)`コンストラクタ(`FSET`で新規`^error`一時変数にmessageを設定するだけ)以外に一切不要だった。
+
+**後置`?`は、仕様例が示す`(T, error?)`ちょうど2値・かつTが非nullable、という形にスコープを絞って確定した。** 一般化した「結果列の末尾がerror?でありさえすればよい」という設計も検討したが、`cascade_spec.md` 8.6節の例は全て「成功値1つ+error?」のみで、Tがnullableなケースや3値以上のケースを示していない。`isErrorResultShape(results) = len(results)==2 && results[1].Name=="error" && results[1].Nullable`という厳密な判定にし、それ以外の形の呼び出しに`?`を使おうとするとsemaが明確なエラーメッセージで拒否する(Step 7/8で確立した「仕様に無い組み合わせは先送りし、曖昧な動作にしない」方針を踏襲)。`checker.currentFuncResults`(関数/クロージャー本体を検査中、その関数自身の宣言済み戻り値型を保持するフィールド。`closureDepth`と同じパターンでクロージャー境界ごとに save/restore する)を使い、「`?`を使えるのは、それを含む関数/クロージャー自身も`(T, error?)`形を返す場合のみ」という制約も同時に検査する(そうでなければ早期returnする値の型が合わなくなるため)。
+
+**Step 7で先送りにしていたnullable戻り値の制限を、Step 11で撤廃し完全に一般化した。** `(T, error?)`規約は「nullableな戻り値をCALL/RET境界越しに運ぶ」という、Step 7時点で意図的に実装を避けていた機構そのものを必要としたため、`checkFuncSig`/`checkClosureLit`から`needsRetIssetExpansion`の拒否チェックを削除し(このヘルパー自体も削除。`needsIssetSlot`と全く同じ判定だったため冗長になった)、`genFuncDecl`/`genClosureLit`の結果型リスト構築・`genReturnStmt`のRET生成を、既存のnullable引数(Step 7)と全く対称な「`needsIssetSlot`なら値+`^bool`の2オペランド」という展開に書き換えた。これはerror型に限定した特殊機構ではなく、`func f(): string?`のような任意のnullable戻り値が今回から一般に使えるようになったということでもある(回帰テスト`TestCheck_ValidNullableReturnType`で確認)。
+
+**呼び出し結果の扱いを`resolveCall`/`genResultTemps`/`emitCallWithResults`という3つの共有ヘルパーに統一し、`genUserFuncCallValue`/`genMethodCallValue`/`genClosureCallValue`/`genMultiLetDecl`/`genNullableOperands`/後置`?`(`genErrorProp`)の6箇所全てから使うようにした。** `resolveCall`はStep 9の`resolveClosureCall`(sema側)に対応するcodegen側の「メソッド/クロージャー変数/通常関数のどれであっても、呼び出し対象名・シグネチャ・引数オペランド列を同じ形で返す」統一ヘルパー。`genResultTemps`は結果型リストから(nullableなら2つずつ)一時変数を確保し、`emitCallWithResults`が両者を組み合わせて`CALL`を発行する。この統一が無いと、6箇所それぞれで「結果が2個になりうる」ロジックを個別に重複実装する必要があり、抜け漏れのリスクが高かった。副産物として`genMultiLetDecl`(複数戻り値の`let`)がクロージャー変数からの呼び出しに未対応だった既存の抜けも同時に塞がれた。
+
+**副産物のバグ修正(5件目)**: いずれも`amivm`→`go build`→実行という実地検証で初めて発覚し、Cascade自身の生成やIRの見た目だけでは気づけなかった。(1) `genNullableOperands`の`none`分岐が構造体非対応の`zeroValueLiteral`を直接呼んでおり、`return 0, none`(`error?`のゼロ値)で`codegen: unknown type "error"`エラーになっていた——`genZeroValueToken`という新ヘルパー(struct型なら`genStructZeroReset`経由、それ以外は従来の`zeroValueLiteral`)を新設し、そちらを呼ぶよう修正した。(2) **`FNTYPE`のdeftype生成(`list.go`の`typeToIR`、`t.Func != nil`分岐)が、nullableなパラメータ・結果の値+`_isset`展開を全く行っておらず、`FUNC`/`CLOS`本体が実際に生成する引数・結果の個数と食い違っていた。** 例えば`func(int): (int, error?)`型のクロージャーは、`FNTYPE`側では`^int : ^int ^error`(2結果)と宣言される一方、`CLOS`本体は`^int : ^int ^error ^bool`(3結果)を実際に返しており、この構造的な不一致はCascade側の生成・IRの目視では発見できず、amivm自身の`go/types`型チェック(`assignment mismatch: 3 variables but ... returns 2 values`)として初めて表面化した。`typeToIR`の`t.Func`分岐を`genFuncDecl`/`genClosureLit`と全く同じ`needsIssetSlot`駆動の展開ロジックに書き換えて修正した。この経緯は「実装したら実地検証まで必ず確認する」(seed_implementation_notes.md §6.1)の重要性を改めて裏付けるものだった——今回のバグはCascade側のどの単体テストが通っていても発見できず、amivmへ通した生成Goコードのコンパイルエラーとしてしか現れなかった。
+
+`examples/11_errors.cas`(`divide`/`loadAndDouble`/`saveResult`/`process`/`mustBePositive`という値の伝播・式位置の`?`・文位置の`?`(戻り値破棄)・単一`error?`結果・クロージャーの`(T, error?)`という組み合わせ)で`amivm`→`go build`→実行まで確認済み。
+
 ## 意味検証の責任分担(重要)
 
 型の整合性・未定義識別子・関数シグネチャの不一致・メソッドの存在チェックなどは、**amivm側では検証せず`go/types`に全面的に委ねている。** amivmが保証するのは「構文的に妥当なGoコードを出力すること」だけ。
@@ -368,10 +378,10 @@ Seedは7〜8ステップ(git履歴上は「Step1: hello-worldパイプライン�
 | 8 ✅ | 構造体・ポインタ・レシーバー関数 | `struct`定義・フィールドアクセス、`&x`/`*p`、値/ポインタレシーバーの自動変換 | `STTYPE` `FIELD` `ENDSTTYPE` `FSET` `FGET` `ADDR` `PGET` `PSET` | レシーバー関数のコンパイル方針を確定(下記「確定した設計判断」参照。旧「オープンな設計課題」課題1) |
 | 9 ✅ | クロージャー・高階関数 | クロージャーリテラル(8.3節)、`filter`/`map`/`reduce`(8.4節)、参照捕捉の実地検証 | `FNTYPE` `CLOS` `ENDCLOS` | — |
 | 10 ✅ | map(`map<K, V>`) | リテラル・`m[k]`(`V?`化)・`m[k]=v`・`delete`・`for k, v in m` | `MPTYPE` `MPMAKE` `MSET` `MGET` | `cascadert`ランタイムの初回導入(下記「確定した設計判断」参照) |
-| 11 | エラー処理 | `error`型・`(T, error?)`規約・後置`?`のsema展開(8.6節) | (新規命令なし。`STTYPE`+`IF`+`RET`の組み合わせ) | 課題2(`error`型の表現)の確定 |
+| 11 ✅ | エラー処理 | `error`型・`(T, error?)`規約・後置`?`のsema展開(8.6節) | (新規命令なし。`STTYPE`+`IF`+`RET`の組み合わせ) | `error`型の表現を確定(下記「確定した設計判断」参照。旧「オープンな設計課題」課題2) |
 | 12 | パイプライン基礎 | `source`/`stage`/`sink`、`chan<T>`、`send`、`for v in channel`、`\|>`連結(9.1/9.2節) | `CHTYPE` `CHMAKE` `CHSEND` `CHRECV` `SPAWN` | 課題1(並行実行モデル)の一次決定。`amivm/test_ir/11_spawn_channel_sel.ir`必読 |
 | 13 | パイプライン拡張(collect/abort/merge) | `collect`(9.3節)・`abort`(9.4節)・`merge`(9.5節) | `SEL` `CASESEND` `CASERECV` `DEFAULT` `ENDSEL` `DEFER` | 課題1の最終確定 |
-| 14 | パッケージ/複数ファイル | ディレクトリ=パッケージの統合(11.1節)、`import`/`pub`(11.2/11.3節)、循環import検出(11.5節)、識別子一意化(11.6節) | (新規命令なし。codegenの命名規則) | 課題3(パッケージ/モジュール解決)の確定 |
+| 14 | パッケージ/複数ファイル | ディレクトリ=パッケージの統合(11.1節)、`import`/`pub`(11.2/11.3節)、循環import検出(11.5節)、識別子一意化(11.6節) | (新規命令なし。codegenの命名規則) | 課題2(パッケージ/モジュール解決)の確定 |
 | 15 | CLI・配布 | `cascade build/run/emit-ir/emit-go/help`、`cascadert`の`go:embed`配布、README作成 | — | — |
 
 特にStep4(ビット演算)・Step8(ポインタ・構造体)・Step9(クロージャー)・Step10(map)・Step12/13(チャネル・SPAWN・SEL)はSeedで未実証だった命令なので、「ロジック上正しそうに見える」だけで次のステップへ進まないこと。上記「オープンな設計課題」の5項目は、対応するステップ着手時に方針を確定し、その節を書き換える(仮説のまま放置しない)。

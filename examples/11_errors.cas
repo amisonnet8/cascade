@@ -1,0 +1,88 @@
+func divide(a: int, b: int): (int, error?) {
+    if b == 0 {
+        return 0, error("division by zero")
+    }
+    return a / b, none
+}
+
+func loadAndDouble(a: int, b: int): (int, error?) {
+    let result = divide(a, b)?
+    return result * 2, none
+}
+
+func saveResult(n: int): (int, error?) {
+    return n, none
+}
+
+func process(n: int): (int, error?) {
+    saveResult(n)?
+    return n * 10, none
+}
+
+func mustBePositive(n: int): error? {
+    if n < 0 {
+        return error("must be positive")
+    }
+    return none
+}
+
+func main(): int {
+    let q, err = divide(10, 2)
+    if err is not none {
+        print("failed: " + err.message)
+        return 1
+    }
+    print("q=" + string(q))
+
+    let q2, err2 = divide(10, 0)
+    if err2 is not none {
+        print("failed: " + err2.message)
+    }
+
+    let doubled, err3 = loadAndDouble(20, 4)
+    if err3 is not none {
+        print("failed: " + err3.message)
+        return 1
+    }
+    print("doubled=" + string(doubled))
+
+    let doubledFail, err4 = loadAndDouble(20, 0)
+    if err4 is not none {
+        print("failed: " + err4.message)
+    }
+
+    let processed, err5 = process(7)
+    if err5 is not none {
+        print("failed: " + err5.message)
+    } else {
+        print("processed=" + string(processed))
+    }
+
+    let e1 = mustBePositive(-5)
+    if e1 is not none {
+        print("mustBePositive: " + e1.message)
+    }
+    let e2 = mustBePositive(5)
+    if e2 is none {
+        print("mustBePositive(5) is ok")
+    }
+
+    let validate = func(n: int): (int, error?) {
+        if n < 0 {
+            return 0, error("negative")
+        }
+        return n, none
+    }
+    let v, verr = validate(5)
+    if verr is not none {
+        print("validate failed: " + verr.message)
+    } else {
+        print("v=" + string(v))
+    }
+    let v2, verr2 = validate(-1)
+    if verr2 is not none {
+        print("validate failed: " + verr2.message)
+    }
+
+    return 0
+}

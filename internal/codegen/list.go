@@ -173,21 +173,35 @@ func typeToIR(reg *typeRegistry, t ast.Type) (string, error) {
 		return "^*" + base, nil
 	}
 	if t.Func != nil {
-		paramTokens := make([]string, len(t.Func.Params))
-		for i, p := range t.Func.Params {
+		// Both params and results need the same needsIssetSlot two-token
+		// expansion here that FUNC/CLOS's own declarations already apply
+		// (see genFuncDecl/genClosureLit) — this FNTYPE deftype describes
+		// the exact callable shape those blocks emit, so the two must
+		// always agree in operand count or amivm's own go/types checking
+		// rejects the mismatch outright (a real error caught only by
+		// actually running a nullable-result closure through amivm — see
+		// CLAUDE.md's "確定した設計判断").
+		var paramTokens []string
+		for _, p := range t.Func.Params {
 			tok, err := typeToIR(reg, p)
 			if err != nil {
 				return "", err
 			}
-			paramTokens[i] = tok
+			paramTokens = append(paramTokens, tok)
+			if needsIssetSlot(p) {
+				paramTokens = append(paramTokens, "^bool")
+			}
 		}
-		resultTokens := make([]string, len(t.Func.Results))
-		for i, r := range t.Func.Results {
+		var resultTokens []string
+		for _, r := range t.Func.Results {
 			tok, err := typeToIR(reg, r)
 			if err != nil {
 				return "", err
 			}
-			resultTokens[i] = tok
+			resultTokens = append(resultTokens, tok)
+			if needsIssetSlot(r) {
+				resultTokens = append(resultTokens, "^bool")
+			}
 		}
 		return reg.useFuncType(paramTokens, resultTokens), nil
 	}
