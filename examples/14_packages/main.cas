@@ -1,0 +1,13 @@
+import mathutil "./mathutil"
+
+func main(): int {
+    let r = mathutil.Clamp(150, 0, 100)
+    print(string(r))
+
+    let v: mathutil.Vector = mathutil.Vector{x: 3.0, y: 4.0}
+    print(string(v.magnitudeSquared()))
+
+    print(mathutil.Version)
+
+    return 0
+}

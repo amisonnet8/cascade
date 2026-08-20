@@ -125,16 +125,21 @@ func Generate(f *ast.File) (string, error) {
 		structsIR.WriteString(ir)
 	}
 
+	gvarIR, initFuncIR, packageScope, err := genTopLevelLets(f.Lets, types, structs)
+	if err != nil {
+		return "", err
+	}
+
 	var funcsIR strings.Builder
 	for _, fn := range f.Funcs {
-		ir, err := genFuncDecl(fn, types, structs, sigs, methods, stages)
+		ir, err := genFuncDecl(fn, types, structs, sigs, methods, stages, packageScope)
 		if err != nil {
 			return "", err
 		}
 		funcsIR.WriteString(ir)
 	}
 	for _, sd := range f.Stages {
-		ir, err := genStageDecl(sd, types, structs, sigs, methods, stages)
+		ir, err := genStageDecl(sd, types, structs, sigs, methods, stages, packageScope)
 		if err != nil {
 			return "", err
 		}
@@ -143,6 +148,7 @@ func Generate(f *ast.File) (string, error) {
 
 	var b strings.Builder
 	b.WriteString(structsIR.String())
+	b.WriteString(gvarIR)
 	for _, elemName := range types.sorted() {
 		elemIRType, err := scalarTypeToIR(ast.Type{Name: elemName})
 		if err != nil {
@@ -169,9 +175,13 @@ func Generate(f *ast.File) (string, error) {
 	for _, ir := range types.mergeFuncs {
 		b.WriteString(ir)
 	}
+	b.WriteString(initFuncIR)
 
 	b.WriteString("FUNC\t!main\t:\n")
 	b.WriteString("\tVAR\t%exitcode\t^int\n")
+	if initFuncIR != "" {
+		b.WriteString("\tCALL\t:\t!cascade_init\n")
+	}
 	fmt.Fprintf(&b, "\tCALL\t%%exitcode\t:\t!%s\n", mainInternalName)
 	b.WriteString("\tCALL\t:\t?os.Exit\t%exitcode\n")
 	b.WriteString("\tRET\n")

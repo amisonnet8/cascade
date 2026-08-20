@@ -1,0 +1,24 @@
+pub const Version: string = "1.0"
+
+pub func Clamp(value: int, min: int, max: int): int {
+    if value < min {
+        return min
+    }
+    if value > max {
+        return max
+    }
+    return value
+}
+
+func helper(): int {
+    return 0
+}
+
+pub struct Vector {
+    x: float
+    y: float
+}
+
+pub func (v: Vector) magnitudeSquared(): float {
+    return v.x * v.x + v.y * v.y
+}

@@ -83,8 +83,8 @@ func boolChanIRType(types *typeRegistry) (string, error) {
 // on to detect "no more data" and exit, and the mechanism
 // genPipelineStmt's synchronous final CALL to the sink relies on to
 // eventually return at all.
-func genStageDecl(sd *ast.StageDecl, types *typeRegistry, structs map[string]*ast.StructDecl, sigs map[string]funcSig, methods map[string]map[string]funcSig, stages map[string]stageInfo) (string, error) {
-	g := &funcGen{scope: newScope(nil), types: types, structs: structs, sigs: sigs, methods: methods, stages: stages}
+func genStageDecl(sd *ast.StageDecl, types *typeRegistry, structs map[string]*ast.StructDecl, sigs map[string]funcSig, methods map[string]map[string]funcSig, stages map[string]stageInfo, packageScope *scope) (string, error) {
+	g := &funcGen{scope: newScope(packageScope), types: types, structs: structs, sigs: sigs, methods: methods, stages: stages}
 
 	var paramIRTypes []string
 	for i, p := range sd.Params {

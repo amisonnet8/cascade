@@ -2335,3 +2335,94 @@ func main(): int {
 		t.Fatalf("Check() = %v, want nil", err)
 	}
 }
+
+func TestCheck_ValidTopLevelLet(t *testing.T) {
+	src := `
+let counter: int = 10
+const greeting: string = "hi"
+pub let shared: int? = none
+
+func main(): int {
+	print(string(counter))
+	print(greeting)
+	if shared is not none {
+		print(string(shared))
+	}
+	counter = counter + 1
+	return bump()
+}
+
+func bump(): int {
+	return counter
+}
+`
+	if err := check(t, src); err != nil {
+		t.Fatalf("Check() = %v, want nil", err)
+	}
+}
+
+func TestCheck_TopLevelLetErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		src     string
+		wantErr string
+	}{
+		{
+			name: "duplicate top-level let",
+			src: `
+let x: int = 1
+let x: int = 2
+func main(): int {
+	return 0
+}
+`,
+			wantErr: "already declared in this scope",
+		},
+		{
+			name: "top-level const requires an initializer",
+			src: `
+const x: int
+func main(): int {
+	return 0
+}
+`,
+			wantErr: "requires an initializer",
+		},
+		{
+			name: "assigning to a top-level const is rejected",
+			src: `
+const x: int = 1
+func main(): int {
+	x = 2
+	return 0
+}
+`,
+			wantErr: "cannot assign to \"x\" (declared const)",
+		},
+		{
+			name: "a top-level let collides with a function name",
+			src: `
+func helper(): int {
+	return 0
+}
+let helper: int = 1
+func main(): int {
+	return 0
+}
+`,
+			wantErr: "already declared as a function",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := check(t, tt.src)
+			if err == nil {
+				t.Fatalf("Check() = nil, want error containing %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Check() = %q, want error containing %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}

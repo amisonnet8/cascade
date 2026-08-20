@@ -132,47 +132,99 @@ var typeKeywords = map[lexer.Kind]string{
 	lexer.KwError:  "error",
 }
 
+// parseFile parses a whole .cas file: any number of leading `import`
+// lines (cascade_spec.md §11.2 — must precede every other declaration,
+// enforced by requiring them all up front before the main loop even
+// starts), then any number of top-level declarations, each optionally
+// `pub`-prefixed (§11.3).
 func (p *parser) parseFile() (*ast.File, error) {
 	f := &ast.File{}
 	p.skipNewlines()
+	for p.cur().Kind == lexer.KwImport {
+		imp, err := p.parseImportDecl()
+		if err != nil {
+			return nil, err
+		}
+		f.Imports = append(f.Imports, imp)
+		p.skipNewlines()
+	}
 	for p.cur().Kind != lexer.EOF {
+		if p.cur().Kind == lexer.KwImport {
+			return nil, fmt.Errorf("line %d: 'import' must appear before any other top-level declaration (cascade_spec.md §11.2)", p.cur().Line)
+		}
+		pub := false
+		if p.cur().Kind == lexer.KwPub {
+			p.advance()
+			pub = true
+		}
 		switch p.cur().Kind {
 		case lexer.KwFunc:
 			fn, err := p.parseFuncDecl()
 			if err != nil {
 				return nil, err
 			}
+			fn.Pub = pub
 			f.Funcs = append(f.Funcs, fn)
 		case lexer.KwStruct:
 			sd, err := p.parseStructDecl()
 			if err != nil {
 				return nil, err
 			}
+			sd.Pub = pub
 			f.Structs = append(f.Structs, sd)
 		case lexer.KwSource:
 			sd, err := p.parseStageDecl(ast.SourceStage)
 			if err != nil {
 				return nil, err
 			}
+			sd.Pub = pub
 			f.Stages = append(f.Stages, sd)
 		case lexer.KwStage:
 			sd, err := p.parseStageDecl(ast.MiddleStage)
 			if err != nil {
 				return nil, err
 			}
+			sd.Pub = pub
 			f.Stages = append(f.Stages, sd)
 		case lexer.KwSink:
 			sd, err := p.parseStageDecl(ast.SinkStage)
 			if err != nil {
 				return nil, err
 			}
+			sd.Pub = pub
 			f.Stages = append(f.Stages, sd)
+		case lexer.KwLet, lexer.KwConst:
+			stmt, err := p.parseLetDecl()
+			if err != nil {
+				return nil, err
+			}
+			let, ok := stmt.(*ast.LetDecl)
+			if !ok {
+				return nil, fmt.Errorf("line %d: multi-value 'let' is not supported at the top level", ast.StmtLine(stmt))
+			}
+			let.Pub = pub
+			f.Lets = append(f.Lets, let)
 		default:
-			return nil, fmt.Errorf("line %d: expected 'func', 'struct', 'source', 'stage', or 'sink' at top level, got %q", p.cur().Line, p.cur().Literal)
+			return nil, fmt.Errorf("line %d: expected 'func', 'struct', 'source', 'stage', 'sink', 'let', or 'const' at top level, got %q", p.cur().Line, p.cur().Literal)
 		}
 		p.skipNewlines()
 	}
 	return f, nil
+}
+
+// parseImportDecl parses `import qualifier "path"` (cascade_spec.md
+// §11.2).
+func (p *parser) parseImportDecl() (*ast.ImportDecl, error) {
+	kw := p.advance() // 'import'
+	qual, err := p.expect(lexer.Ident, "import qualifier")
+	if err != nil {
+		return nil, err
+	}
+	path, err := p.expect(lexer.String, "import path string")
+	if err != nil {
+		return nil, err
+	}
+	return &ast.ImportDecl{Qualifier: qual.Literal, Path: path.Literal, Line: kw.Line}, nil
 }
 
 // parseStructDecl parses a `struct` declaration (cascade_spec.md §4.1):
@@ -439,8 +491,23 @@ func (p *parser) parseTypeBase() (ast.Type, error) {
 	if p.cur().Kind == lexer.Ident {
 		// A struct type name (cascade_spec.md §4.1) — unlike int/float/
 		// string/bool, struct names aren't reserved keywords, so they lex
-		// as plain identifiers.
+		// as plain identifiers. A qualifier.TypeName reference (§11.2) is
+		// syntactically identical except for the immediately-following
+		// '.' — the whole "qualifier.TypeName" string is captured as-is
+		// into Name (a raw, still-unresolved marker: no local type's own
+		// Name ever legally contains a '.', so this can't collide with an
+		// ordinary struct type name); pkgloader resolves it into the
+		// target package's own flat prefixed name (or reports an
+		// undeclared/non-pub error) before sema ever sees it.
 		name := p.advance()
+		if p.cur().Kind == lexer.Dot {
+			p.advance()
+			typeName, err := p.expect(lexer.Ident, "type name after '.'")
+			if err != nil {
+				return ast.Type{}, err
+			}
+			return ast.Type{Name: name.Literal + "." + typeName.Literal}, nil
+		}
 		return ast.Type{Name: name.Literal}, nil
 	}
 	return ast.Type{}, fmt.Errorf("line %d: expected a type, got %q", p.cur().Line, p.cur().Literal)
@@ -1250,6 +1317,15 @@ func (p *parser) parseSelectorSuffix(x ast.Expr) (ast.Expr, error) {
 		}
 		call.Receiver = x
 		return call, nil
+	}
+	// qualifier.TypeName{...} (cascade_spec.md §11.2's own struct-literal
+	// example) — only recognized when x is a bare identifier (the only
+	// shape a qualifier can take) immediately followed by '{' where a
+	// struct literal is allowed; pkgloader later resolves/validates the
+	// raw "qualifier.TypeName" marker exactly like it does for a
+	// qualified type (see parseTypeBase).
+	if id, isIdent := x.(*ast.Ident); isIdent && p.cur().Kind == lexer.LBrace && !p.noStructLit {
+		return p.parseStructLit(lexer.Token{Literal: id.Name + "." + name.Literal, Line: id.Line})
 	}
 	return &ast.FieldExpr{X: x, Field: name.Literal, Line: name.Line}, nil
 }

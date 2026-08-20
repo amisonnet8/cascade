@@ -119,6 +119,14 @@ type checker struct {
 	// CLAUDE.md's "確定した設計判断" for Step 13): calling abort() from an
 	// ordinary function would have no channel to signal on at all.
 	inStageBody bool
+
+	// globalScope holds every top-level `let`/`const` (cascade_spec.md
+	// §11.3), and is the shared *parent* of every function/stage body's
+	// own root scope (see checkFuncBody/checkStageBody) — so a package-
+	// level variable is visible everywhere in the package, exactly like
+	// a struct/func/stage name already is, without needing its own
+	// separate lookup table threaded through every check function.
+	globalScope *scope
 }
 
 // errorStructDecl is the built-in `error` type's synthetic struct
@@ -287,6 +295,33 @@ func Check(f *ast.File) error {
 		c.stages[sd.Name] = sig
 	}
 
+	// Top-level let/const (cascade_spec.md §11.3) share c.sigs/c.stages's
+	// namespace too, and are checked sequentially (each newly declared
+	// one immediately visible to the next one's own initializer, via
+	// globalScope growing as we go) rather than being forward-reference-
+	// tolerant like functions — cascade_spec.md shows no example of one
+	// top-level let referencing another declared later, so this simpler,
+	// declaration-order rule is a deliberate scope choice (see CLAUDE.md's
+	// "確定した設計判断") rather than building a full dependency-order
+	// resolver for an untested case. Function/stage bodies, checked
+	// below, always see the *complete* globalScope regardless of a given
+	// let's own position in the file, since all of this runs before that.
+	c.globalScope = newScope(nil)
+	for _, ld := range f.Lets {
+		if reservedBuiltinNames[ld.Name] {
+			return fmt.Errorf("line %d: %q is a builtin function name and cannot be redefined", ld.Line, ld.Name)
+		}
+		if _, exists := c.sigs[ld.Name]; exists {
+			return fmt.Errorf("line %d: %q is already declared as a function", ld.Line, ld.Name)
+		}
+		if _, exists := c.stages[ld.Name]; exists {
+			return fmt.Errorf("line %d: %q is already declared as a source/stage/sink", ld.Line, ld.Name)
+		}
+		if err := c.checkLetDecl(c.globalScope, ld); err != nil {
+			return err
+		}
+	}
+
 	for _, fn := range f.Funcs {
 		if err := c.checkFuncBody(fn); err != nil {
 			return err
@@ -353,7 +388,7 @@ func (c *checker) receiverStructName(p ast.Param) (name string, isPtr bool, err 
 // scoping rules apply to both the same as any other declaration,
 // including rejecting a parameter that shadows the receiver's name.
 func (c *checker) checkFuncBody(fn *ast.FuncDecl) error {
-	sc := newScope(nil)
+	sc := newScope(c.globalScope)
 	if fn.Receiver != nil {
 		if !sc.declareLocal(fn.Receiver.Name, varInfo{Type: fn.Receiver.Type}) {
 			return fmt.Errorf("line %d: duplicate receiver name %q", fn.Receiver.Line, fn.Receiver.Name)
@@ -443,7 +478,7 @@ func (c *checker) validateChanParamType(t ast.Type, line int) (ast.Type, error) 
 // only a source/stage/sink actually has — from inside one of these
 // bodies.
 func (c *checker) checkStageBody(sd *ast.StageDecl) error {
-	sc := newScope(nil)
+	sc := newScope(c.globalScope)
 	for _, p := range sd.Params {
 		if !sc.declareLocal(p.Name, varInfo{Type: p.Type}) {
 			return fmt.Errorf("line %d: duplicate parameter name %q", p.Line, p.Name)

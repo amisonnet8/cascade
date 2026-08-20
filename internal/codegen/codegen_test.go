@@ -1573,3 +1573,61 @@ func main(): int {
 	}
 	assertLabelsResolve(t, ir)
 }
+
+func TestGenerate_TopLevelLetCompilesToGVARAndInitFunc(t *testing.T) {
+	ir := generate(t, `
+let counter: int = 10
+
+func main(): int {
+	print(string(counter))
+	return bump()
+}
+
+func bump(): int {
+	return counter
+}
+`)
+	if !strings.Contains(ir, "GVAR\t@counter\t^int\n") {
+		t.Fatalf("expected a top-level let to compile to a GVAR; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "FUNC\t!cascade_init\t:\n") || !strings.Contains(ir, "SET\t@counter\t10\n") {
+		t.Fatalf("expected !cascade_init to hold the global's own initializer; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "FUNC\t!main\t:\n\tVAR\t%exitcode\t^int\n\tCALL\t:\t!cascade_init\n") {
+		t.Fatalf("expected the generated !main wrapper to call !cascade_init before !cascade_main; got:\n%s", ir)
+	}
+	bumpIR := ir[strings.Index(ir, "FUNC\t!bump"):]
+	if !strings.Contains(bumpIR, "RET\t@counter\n") {
+		t.Fatalf("expected bump() to read the global directly via @counter, without redeclaring it; got:\n%s", bumpIR)
+	}
+}
+
+func TestGenerate_NullableTopLevelLetGetsIssetGVAR(t *testing.T) {
+	ir := generate(t, `
+let shared: int? = none
+
+func main(): int {
+	if shared is not none {
+		print(string(shared))
+	}
+	return 0
+}
+`)
+	if !strings.Contains(ir, "GVAR\t@shared\t^int\n") || !strings.Contains(ir, "GVAR\t@shared_isset\t^bool\n") {
+		t.Fatalf("expected a nullable top-level let to get a companion isset GVAR; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "SET\t@shared\t0\n\tSET\t@shared_isset\tfalse\n") {
+		t.Fatalf("expected the 'none' initializer to reset the value and isset flag; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_NoTopLevelLetsEmitsNoInitFunc(t *testing.T) {
+	ir := generate(t, `
+func main(): int {
+	return 0
+}
+`)
+	if strings.Contains(ir, "cascade_init") {
+		t.Fatalf("expected no !cascade_init at all when there are no top-level lets; got:\n%s", ir)
+	}
+}

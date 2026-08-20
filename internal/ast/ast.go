@@ -87,6 +87,7 @@ type FuncDecl struct {
 	Results  []Type
 	Body     []Stmt
 	Line     int
+	Pub      bool // cascade_spec.md §11.3 — visible to importers when true
 }
 
 // StructField is one field in a struct declaration (cascade_spec.md §4.1).
@@ -100,6 +101,7 @@ type StructDecl struct {
 	Name   string
 	Fields []StructField
 	Line   int
+	Pub    bool // cascade_spec.md §11.3
 }
 
 // StageKind distinguishes which of the three pipeline-stage shapes a
@@ -127,6 +129,7 @@ type StageDecl struct {
 	Params []Param
 	Body   []Stmt
 	Line   int
+	Pub    bool // cascade_spec.md §11.3
 }
 
 // PipelineStageRef is one name in a `|>`-chained pipeline (cascade_spec.md
@@ -167,10 +170,36 @@ type PipelineExpr struct {
 func (*PipelineExpr) exprNode() {}
 
 // File is the root node of a parsed Cascade source file.
+// ImportDecl is one `import qualifier "path"` line (cascade_spec.md
+// §11.2), always at a file's own head, before any other declaration
+// (enforced by parser's parseFile). Path is relative to the importing
+// file's own package directory. Resolution (following Path, merging the
+// target package, prefixing its identifiers, and rewriting every
+// Qualifier.Name reference in this file into the resolved flat name) is
+// entirely pkgloader's job — sema and codegen never see an ImportDecl or
+// a qualified reference at all; by the time they run, pkgloader has
+// already reduced everything to one flat, single-package-shaped
+// ast.File, exactly like every step before Step 14 produced directly
+// from a single source file.
+type ImportDecl struct {
+	Qualifier string
+	Path      string
+	Line      int
+}
+
+// File is the root node of a parsed Cascade source file. Structs/Funcs/
+// Stages/Lets from every .cas file in one directory are pooled together
+// by pkgloader into a single File representing that whole package
+// (cascade_spec.md §11.1) before sema.Check ever runs — so a File Check
+// receives may already represent more than one physical source file, but
+// never more than one package's own declarations plus whatever pkgloader
+// has merged in from its (already `pub`-filtered and renamed) imports.
 type File struct {
+	Imports []*ImportDecl
 	Structs []*StructDecl
 	Funcs   []*FuncDecl
 	Stages  []*StageDecl
+	Lets    []*LetDecl // top-level `let`/`const` (cascade_spec.md §11.3); never the multi-value form (parser rejects it here)
 }
 
 // Stmt is implemented by every statement node.
@@ -211,6 +240,7 @@ type LetDecl struct {
 	Init         Expr // nil when omitted
 	Line         int
 	ResolvedType Type
+	Pub          bool // cascade_spec.md §11.3 — only meaningful for a top-level LetDecl (File.Lets); always false for one nested inside a function/stage/closure body
 }
 
 func (*LetDecl) stmtNode() {}

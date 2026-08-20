@@ -9,24 +9,22 @@ import (
 
 	"github.com/amisonnet8/cascade/cascadert"
 	"github.com/amisonnet8/cascade/internal/codegen"
-	"github.com/amisonnet8/cascade/internal/parser"
+	"github.com/amisonnet8/cascade/internal/pkgloader"
 	"github.com/amisonnet8/cascade/internal/sema"
 )
 
-// compileToIR runs Cascade's own share of the pipeline — parse, sema.Check,
+// compileToIR runs Cascade's own share of the pipeline — pkgloader.Load
+// (package/import resolution, cascade_spec.md §11), sema.Check,
 // codegen.Generate — and returns the resulting AMIVM-IR text. Per
 // CLAUDE.md, this is the full extent of what Cascade itself is responsible
 // for; everything past this point hands off to an external tool (amivm,
-// then go build).
+// then go build). srcPath may name a single .cas file (compiled alone, as
+// its own implicit package — see pkgloader.Load's doc) or a directory
+// (compiled as a full package per §11.1, with imports resolved).
 func compileToIR(srcPath string) (string, error) {
-	src, err := os.ReadFile(srcPath)
+	file, err := pkgloader.Load(srcPath)
 	if err != nil {
-		return "", err
-	}
-
-	file, err := parser.Parse(string(src))
-	if err != nil {
-		return "", fmt.Errorf("parse error: %w", err)
+		return "", fmt.Errorf("package error: %w", err)
 	}
 
 	if err := sema.Check(file); err != nil {
