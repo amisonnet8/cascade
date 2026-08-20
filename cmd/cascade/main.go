@@ -1,4 +1,4 @@
-// Command cascade is the Cascade language toolchain: it compiles .cascade
+// Command cascade is the Cascade language toolchain: it compiles .cas
 // source through AMIVM-IR (via the external amivm CLI) and go build into a
 // native executable.
 package main
@@ -50,7 +50,7 @@ func printUsage(w io.Writer) {
 
 Usage:
 
-	cascade <command> [flags] <file.cascade>
+	cascade <command> [flags] <file.cas>
 
 Commands:
 
@@ -76,13 +76,13 @@ func outputFlags(name string) (fs *flag.FlagSet, out *string, verbose *bool) {
 }
 
 // parseOneSrcArg parses fs against args and returns the single required
-// <file.cascade> positional argument.
+// <file.cas> positional argument.
 func parseOneSrcArg(fs *flag.FlagSet, args []string) (string, error) {
 	if err := fs.Parse(args); err != nil {
 		return "", err
 	}
 	if fs.NArg() != 1 {
-		return "", fmt.Errorf("usage: cascade %s [-o file] [-v] <file.cascade>", fs.Name())
+		return "", fmt.Errorf("usage: cascade %s [-o file] [-v] <file.cas>", fs.Name())
 	}
 	return fs.Arg(0), nil
 }
@@ -106,7 +106,7 @@ func runBuild(args []string) error {
 
 func runRun(args []string) error {
 	if len(args) != 1 {
-		return fmt.Errorf("usage: cascade run <file.cascade>")
+		return fmt.Errorf("usage: cascade run <file.cas>")
 	}
 	srcPath := args[0]
 
@@ -186,8 +186,8 @@ func runEmitGo(args []string) error {
 }
 
 // defaultOutPath derives an output path from srcPath by stripping its
-// .cascade extension and appending ext (e.g. ".ir", ".go", or "" for a
+// .cas extension and appending ext (e.g. ".ir", ".go", or "" for a
 // build's bare executable name).
 func defaultOutPath(srcPath, ext string) string {
-	return strings.TrimSuffix(srcPath, ".cascade") + ext
+	return strings.TrimSuffix(srcPath, ".cas") + ext
 }

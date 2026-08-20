@@ -1,4 +1,4 @@
-// Package lexer tokenizes Cascade source text (.cascade) per
+// Package lexer tokenizes Cascade source text (.cas) per
 // cascade_spec.md §1: newlines are significant statement terminators, and
 // "//" starts a line comment.
 //

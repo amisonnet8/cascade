@@ -2,7 +2,7 @@
 
 ## プロジェクト概要
 
-Cascadeは新規に設計する独自プログラミング言語。**Go言語で実装する**(Cascadeコンパイラ自身の実装言語がGo)。ソースファイルの拡張子は**`.cascade`**。AMIVM上に実装する2つ目のフロントエンド言語で、1つ目の[[Seed]]がスカラー・固定長配列・制御構文・関数程度に留めたのに対し、Cascadeは**ポインタ・構造体・クロージャー・map・チャネル/goroutine・ビット演算**まで積極的に使う設計になっている。言語名・構文・キーワードはSeedを踏襲しない独自のもの。
+Cascadeは新規に設計する独自プログラミング言語。**Go言語で実装する**(Cascadeコンパイラ自身の実装言語がGo)。ソースファイルの拡張子は**`.cas`**。AMIVM上に実装する2つ目のフロントエンド言語で、1つ目の[[Seed]]がスカラー・固定長配列・制御構文・関数程度に留めたのに対し、Cascadeは**ポインタ・構造体・クロージャー・map・チャネル/goroutine・ビット演算**まで積極的に使う設計になっている。言語名・構文・キーワードはSeedを踏襲しない独自のもの。
 
 設計の3本柱(詳細は`cascade_spec.md` 0節):
 
@@ -13,7 +13,7 @@ Cascadeは新規に設計する独自プログラミング言語。**Go言語で
 コンパイルパイプラインはSeedと同じ3工程。
 
 ```
-Cascadeソース (.cascade)
+Cascadeソース (.cas)
   ↓ (Cascadeが担当。本リポジトリのスコープ)
 AMIVM-IR (.ir)
   ↓ amivm (外部CLIツール。別リポジトリ)
@@ -244,7 +244,7 @@ Cascadeの`func main(): int`をamivmの`!main`へ直接対応させることは�
   internal/codegen/             AST → AMIVM-IR生成
   cascadert/                    Cascadeランタイム(sqrt/args等、CALLで呼ばれるGo実装)。
                                  生成されたGoコードからimportされるため internal/ 配下には置けない
-  examples/                     サンプルCascadeプログラム(`.cascade`。実装した構文ごとに追加)
+  examples/                     サンプルCascadeプログラム(`.cas`。実装した構文ごとに追加)
 ```
 
 ## 実装ステップ計画(15ステップ)
