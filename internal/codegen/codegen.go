@@ -55,21 +55,24 @@ const mainInternalName = "cascade_main"
 
 // Generate translates f (already validated by sema.Check) into AMIVM-IR
 // text: a top-level STTYPE for every struct declaration (must precede
-// everything else, since a SLTYPE/FNTYPE or FUNC parameter/local may
-// reference a struct type — see genStructDecl), then a top-level SLTYPE
-// for every list element type any function uses, then a top-level FNTYPE
-// for every distinct function-type shape any function uses (list.go's
-// typeRegistry.useFuncType — emitted after SLTYPE since a function type
-// may itself take/return a list, e.g. `func([]int): int`), then every
+// everything else, since a SLTYPE/FNTYPE/MPTYPE or FUNC parameter/local
+// may reference a struct type — see genStructDecl), then a top-level
+// SLTYPE for every list element type any function uses, then a top-level
+// FNTYPE for every distinct function-type shape any function uses
+// (list.go's typeRegistry.useFuncType — emitted after SLTYPE since a
+// function type may itself take/return a list, e.g. `func([]int): int`),
+// then a top-level MPTYPE for every distinct map key/value shape any
+// function uses (useMapType — emitted last among the TYPE declarations,
+// since a map's value type may itself be a struct/list/func), then every
 // function's own FUNC block (main's under mainInternalName, a receiver
 // function's under its qualified StructName_Method name, a closure
 // literal's own CLOS block nested inline inside whichever FUNC contains
 // it — see func.go's genFuncDecl and struct.go/closure.go), then the
 // generated `!main` wrapper that bridges to it. Every FUNC's own body is
 // compiled first, into a separate buffer, before this final assembly —
-// SLTYPE/FNTYPE registration happens as a side effect of that (typeToIR
-// calls), so by the time this function's own loops run, every type any
-// function body needed is already known.
+// SLTYPE/FNTYPE/MPTYPE registration happens as a side effect of that
+// (typeToIR calls), so by the time this function's own loops run, every
+// type any function body needed is already known.
 func Generate(f *ast.File) (string, error) {
 	structs := map[string]*ast.StructDecl{}
 	for _, sd := range f.Structs {
@@ -131,6 +134,10 @@ func Generate(f *ast.File) (string, error) {
 		fmt.Fprintf(&b, "SLTYPE\t%s\t%s\n", listTypeToken(elemName), elemIRType)
 	}
 	for _, decl := range types.funcTypeDecls() {
+		b.WriteString(decl)
+		b.WriteString("\n")
+	}
+	for _, decl := range types.mapTypeDecls() {
 		b.WriteString(decl)
 		b.WriteString("\n")
 	}
@@ -530,19 +537,22 @@ func genLetDecl(g *funcGen, decl *ast.LetDecl) error {
 }
 
 // genAssignStmt compiles `name = value`; `name[Index] = value` when Index
-// is set, an ASET into the existing list — unlike a whole-list
-// reassignment (genInit), this never reallocates, matching Go's own
-// in-place slice-element-assignment semantics; or `name.Field = value`
-// when Field is set, an FSET (cascade_spec.md §5) — works identically
-// whether ref holds a struct value or a pointer to one, see
-// ast.FieldExpr's doc.
+// is set — an ASET into the existing list (unlike a whole-list
+// reassignment via genInit, this never reallocates, matching Go's own
+// in-place slice-element-assignment semantics) or, when ref holds a map,
+// an MSET instead (cascade_spec.md §5's `counts["a"] = 1` — creates the
+// key if absent, overwrites it if present, exactly matching Go's own
+// `m[k] = v`, so no special-casing beyond picking the right instruction
+// is needed); or `name.Field = value` when Field is set, an FSET
+// (cascade_spec.md §5) — works identically whether ref holds a struct
+// value or a pointer to one, see ast.FieldExpr's doc.
 func genAssignStmt(g *funcGen, stmt *ast.AssignStmt) error {
 	ref, ok := g.scope.lookup(stmt.Name)
 	if !ok {
 		return fmt.Errorf("codegen: undefined name %q (sema bug)", stmt.Name)
 	}
 	if stmt.Index != nil {
-		idxOp, err := genValue(g, stmt.Index)
+		keyOrIdxOp, err := genValue(g, stmt.Index)
 		if err != nil {
 			return err
 		}
@@ -550,7 +560,11 @@ func genAssignStmt(g *funcGen, stmt *ast.AssignStmt) error {
 		if err != nil {
 			return err
 		}
-		g.emit("\tASET\t%s\t%s\t%s\n", ref.ValOp, idxOp, v)
+		if ref.Type.Map != nil {
+			g.emit("\tMSET\t%s\t%s\t%s\n", ref.ValOp, keyOrIdxOp, v)
+		} else {
+			g.emit("\tASET\t%s\t%s\t%s\n", ref.ValOp, keyOrIdxOp, v)
+		}
 		return nil
 	}
 	if stmt.Field != "" {
@@ -582,6 +596,9 @@ func genInit(g *funcGen, ref varRef, init ast.Expr) error {
 	if lit, isList := init.(*ast.ListLit); isList {
 		return genListLiteralInit(g, ref, lit)
 	}
+	if lit, isMap := init.(*ast.MapLit); isMap {
+		return genMapLiteralInit(g, ref, lit)
+	}
 	if ref.SetOp != "" {
 		val, isset, err := genNullableOperands(g, init, ref.Type)
 		if err != nil {
@@ -610,6 +627,19 @@ func genResetToZero(g *funcGen, ref varRef) error {
 			}
 			return nil
 		}
+	}
+	// A *non-nullable* map's base value is a real, writable empty map
+	// (§2.2's `{}`), unlike a nullable map's none/unset state (still
+	// `nil`, via the ordinary zeroValueLiteral path below — see its doc)
+	// — writing into a nil Go map panics, so this needs its own MPMAKE
+	// rather than a plain SET nil.
+	if ref.Type.Map != nil && !ref.Type.Nullable {
+		irType, err := typeToIR(g.types, ref.Type)
+		if err != nil {
+			return err
+		}
+		g.emit("\tMPMAKE\t%s\t%s\n", ref.ValOp, irType)
+		return nil
 	}
 	zero, err := zeroValueLiteral(ref.Type)
 	if err != nil {
@@ -649,6 +679,8 @@ func genExprStmt(g *funcGen, stmt *ast.ExprStmt) error {
 		}
 		g.emit("\tCALL\t:\t?fmt.Println\t%s\n", v)
 		return nil
+	case "delete":
+		return genDeleteCall(g, call)
 	default:
 		sig, ok := g.sigs[call.Callee]
 		if !ok {
@@ -972,13 +1004,21 @@ func scalarTypeToIR(t ast.Type) (string, error) {
 // pointer's and a function value's base value are both always `none`
 // (§2.2), each represented as Go's native nil (see ast.Type's doc)
 // rather than an isset flag — `nil` is also what a nullable-and-unset
-// variable of any other type resets to, so this one token serves all
-// four cases identically. A struct's own base value (every field at its
-// own base value) has no single literal token — see struct.go's
-// genStructZeroReset, which codegen.go's genResetToZero dispatches to
-// instead of calling this function at all.
+// variable of any other type resets to, so this one token serves these
+// cases identically. A *non-nullable* map's own base value is `{}` (an
+// actually writable empty map, §2.2) — writing into a nil Go map panics,
+// unlike appending to a nil slice, so that case is handled by
+// genResetToZero's own MPMAKE branch instead of reaching this function
+// at all; `nil` here only ever fires for a *nullable* map's none/unset
+// state (see genResetToZero's doc for why that's still safe — briefly,
+// nothing can legally write into a nullable map without narrowing to
+// non-nullable first, and by the time that's possible the value slot has
+// already been through a real MPMAKE). A struct's own base value (every
+// field at its own base value) has no single literal token either — see
+// struct.go's genStructZeroReset, also dispatched to by genResetToZero
+// instead of calling this function.
 func zeroValueLiteral(t ast.Type) (string, error) {
-	if t.Elem != nil || t.Ptr != nil || t.Func != nil {
+	if t.Elem != nil || t.Ptr != nil || t.Func != nil || t.Map != nil {
 		return "nil", nil
 	}
 	switch t.Name {

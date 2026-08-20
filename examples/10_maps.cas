@@ -1,0 +1,38 @@
+func main(): int {
+    let counts: map<string, int> = {"a": 1, "b": 2}
+    counts["c"] = 3
+    print("len=" + string(len(counts)))
+
+    let a = counts["a"]
+    if a is not none {
+        print("a=" + string(a))
+    }
+
+    let missing = counts["z"]
+    if missing is none {
+        print("missing is none")
+    }
+
+    delete(counts, "b")
+    print("len after delete=" + string(len(counts)))
+
+    let total = 0
+    for k, v in counts {
+        total += v
+    }
+    print("total=" + string(total))
+
+    let empty: map<string, int>
+    empty["x"] = 42
+    print("empty-now-has=" + string(len(empty)))
+
+    let scores = {"alice": 90, "bob": 75}
+    let sum = 0
+    for name, score in scores {
+        sum += score
+        print(name + ":" + string(score))
+    }
+    print("sum=" + string(sum))
+
+    return 0
+}

@@ -4,17 +4,20 @@ package ast
 
 // Type is a Cascade type reference: a bare scalar or struct name
 // (cascade_spec.md §2.1/§4.1: int/float/string/bool/StructName — Name
-// set, Elem/Ptr/Func nil), a list type (§2.2's `[]T`, Elem set to T), a
-// pointer type (§2.2's `*T`, Ptr set to T), or a function type (§2.2's
-// `func(T1, T2, ...): R`, Func set), either optionally nullable (§2.3) —
-// except a pointer or a function type, which are *always* nullable
-// regardless of whether `?` was written (§2.2's own zero value for both
-// `*T` and `func(...): R` is `none`; see CLAUDE.md's "確定した設計判断" for
-// why a pointer's — and, by the same reasoning, a function value's —
+// set, Elem/Ptr/Func/Map nil), a list type (§2.2's `[]T`, Elem set to T),
+// a pointer type (§2.2's `*T`, Ptr set to T), a function type (§2.2's
+// `func(T1, T2, ...): R`, Func set), or a map type (§2.2, §4.5's
+// `map<K, V>`, Map set), either optionally nullable (§2.3) — except a
+// pointer or a function type, which are *always* nullable regardless of
+// whether `?` was written (§2.2's own zero value for both `*T` and
+// `func(...): R` is `none`; see CLAUDE.md's "確定した設計判断" for why a
+// pointer's — and, by the same reasoning, a function value's —
 // nullability is represented via Go's native nil rather than a companion
-// isset flag, unlike every other nullable type). Map/error forms are
-// added as the steps that need them land (see CLAUDE.md's implementation
-// step plan).
+// isset flag, unlike every other nullable type). A map behaves like a
+// list here instead, defaulting to non-nullable with base value `{}`
+// (§2.2) — its own possible nullability (`map<K, V>?`) uses the ordinary
+// isset-flag mechanism, same as a list. Error forms are added as the
+// steps that need them land (see CLAUDE.md's implementation step plan).
 //
 // `?` always binds to the outermost type built so far — `[]int?` parses
 // as `([]int)?` (a nullable list), not `[](int?)` (a list of nullable
@@ -28,6 +31,19 @@ type Type struct {
 	Elem     *Type
 	Ptr      *Type
 	Func     *FuncType
+	Map      *MapType
+}
+
+// MapType is a map type's key/value shape (cascade_spec.md §2.2, §4.5):
+// `map<K, V>`. K must be a scalar type (int/float/string/bool — sema
+// validates this, since the grammar itself doesn't restrict it) and V
+// must not itself be nullable (see CLAUDE.md's "確定した設計判断" — `m[k]`
+// already returns `V?` via its own comma-ok nullability, so a
+// independently-nullable V would need a second, unsupported layer of
+// nullability).
+type MapType struct {
+	Key   Type
+	Value Type
 }
 
 // FuncType is a function type's signature (cascade_spec.md §2.2, §8.3):
@@ -239,19 +255,22 @@ type ContinueStmt struct {
 
 func (*ContinueStmt) stmtNode() {}
 
-// ForInStmt is `for x in List { ... }` over a list (cascade_spec.md §7).
-// The two-variable map form (`for k, v in m`) is added once maps land
-// (Step 10).
+// ForInStmt is `for x in List { ... }` over a list, or `for k, v in M {
+// ... }` over a map (cascade_spec.md §7 — ValueVarName non-empty selects
+// this second, map-only form).
 //
-// ElemType is filled in by sema.Check with the list's element type, so
-// codegen doesn't have to re-derive it (the same ast-annotation pattern
-// LetDecl.ResolvedType uses).
+// ElemType is filled in by sema.Check with the list's element type (or,
+// in the map form, the map's key type), and ValueType with the map's
+// value type (map form only), so codegen doesn't have to re-derive
+// either (the same ast-annotation pattern LetDecl.ResolvedType uses).
 type ForInStmt struct {
-	VarName  string
-	List     Expr
-	Body     []Stmt
-	Line     int
-	ElemType Type
+	VarName      string
+	ValueVarName string // non-empty for the two-variable map form
+	List         Expr   // the list or map being iterated
+	Body         []Stmt
+	Line         int
+	ElemType     Type
+	ValueType    Type // map form only
 }
 
 func (*ForInStmt) stmtNode() {}
@@ -347,6 +366,23 @@ type ListLit struct {
 }
 
 func (*ListLit) exprNode() {}
+
+// MapPairInit is one `key: value` pair in a map literal.
+type MapPairInit struct {
+	Key   Expr
+	Value Expr
+}
+
+// MapLit is a map literal, e.g. `{"a": 1, "b": 2}` or `{}`
+// (cascade_spec.md §3, §4.5). Its key/value types are determined by the
+// same assignment-context-or-infer-from-first-pair rule as ListLit — see
+// its doc.
+type MapLit struct {
+	Pairs []MapPairInit
+	Line  int
+}
+
+func (*MapLit) exprNode() {}
 
 // IndexExpr is a list element reference, e.g. `xs[0]` (cascade_spec.md
 // §5). ResultType is filled in by sema.Check with the list's element
@@ -557,6 +593,8 @@ func ExprLine(e Expr) int {
 	case *NoneLit:
 		return v.Line
 	case *ListLit:
+		return v.Line
+	case *MapLit:
 		return v.Line
 	case *IndexExpr:
 		return v.Line

@@ -128,7 +128,7 @@ amivm <IRファイルパス> [-o|--output <出力ファイルパス>] [-v|--verb
 | `SLTYPE` `SLMAKE` `ASET` `AGET` | `[]T`(可変長リスト、4.3節)。`append`は再SLMAKE+コピーで実現する見込み(Seedの配列と異なり可変長なので再確保が前提) | 確定 |
 | `SLICE` | Step 9で実装。ユーザー向け構文としては今も存在しないが、`filter`組み込み関数の内部実装(結果件数が事前にわからないため入力と同じ長さで`SLMAKE`し、マッチ分だけ前方に詰めてから実際の件数へ`SLICE`で切り詰める)で自然な使い道が見つかった | 確定 |
 | `STTYPE` `FIELD` `ENDSTTYPE` `FSET` `FGET` | `struct`定義・フィールドアクセス(4.1/5節) | 確定 |
-| `MPTYPE` `MPMAKE` `MSET` `MGET` | `map<K, V>`(4.5節)。`m[k]`が返す`V?`は`MGET`のcomma-ok形をそのまま値+nullフラグへ流し込める見込み(seed_implementation_notes.md §3参照) | 確定 |
+| `MPTYPE` `MPMAKE` `MSET` `MGET` | `map<K, V>`(4.5節)。`m[k]`が返す`V?`は予想通り`MGET`のcomma-ok形をそのまま値+nullフラグへ流し込めた(seed_implementation_notes.md §3の予想が的中)。Step 10で実装・実地検証済み | 確定 |
 | `FNTYPE` `CLOS` `ENDCLOS` | `func(...): R`型・クロージャーリテラル(8.3節)。Step 9で実装・実地検証済み | 確定 |
 | `CHTYPE` `CHMAKE` `CHSEND` `CHRECV` | `chan<T>`・`send()`・`for v in someChannel`(9節) | 確定 |
 | `SPAWN` | `source`/`stage`/`sink`を`|>`で連結した際の各段の並行実行(9.2節) | 確定 |
@@ -280,6 +280,24 @@ Cascadeの`func main(): int`をamivmの`!main`へ直接対応させることは�
 
 `examples/09_closures.cas`(`makeAdder`/`makeCounter`によるクロージャー生成・捕捉変数の書き換え、`applyTwice`による関数値の引数渡し、`filter`/`map`/`reduce`の3組み込み関数)で`amivm`→`go build`→実行まで確認済み。
 
+### map(`map<K, V>`)の設計(Step 10)
+
+**`map<K, V>`自体のnull許容性はリストと同じ方針にした(ポインタ・関数型とは異なる)。** 2.2節でmapのゼロ値は`{}`(実体を持つ空map)と明記されており、ポインタ・関数型のような「常に`none`」ではない。そのため`ast.Type.Map`が設定されていても`Nullable`は強制せず、`map<K, V>?`と明示的に書かれたときだけ、リストや他の通常の型と全く同じ`_isset`フラグ機構に乗る(`needsIssetSlot`の除外条件にMapは追加していない)。
+
+**非nullableなmapの「宣言のみ」(`let empty: map<string, int>`)は、`SET nil`ではなく`MPMAKE`で実体のある空mapを確保する。** Goのnil mapは読み取り(`len`・`m[k]`・range)は安全だが**書き込みはpanicする**——リストの場合はnilスライスへの`append`が安全なため`zeroValueLiteral`の`nil`を使い回せたが、mapは同じ理由が成立しない。そこで`genResetToZero`にmap専用の分岐を追加し、非nullable・かつ初期化式が無い場合は`MPMAKE`を発行するようにした。一方nullableなmap(`map<K, V>?`、宣言のみだと`none`)は`nil`のままで問題ない——安全性の根拠は、「mapへの書き込みが許されるのは絞り込み(`is not none`)で非nullable化した後だけ」というsemaの既存規則(`checkAssignStmt`の`stmt.Index`分岐が`info.Type.Nullable`を見て弾く、Step 6由来)と、「`isset`が`true`になる代入経路(マップリテラルの`genMapLiteralInit`、または既存の妥当な値の伝播)は必ず実体のある`MPMAKE`済みmapを伴う」という帰納的な不変条件の組み合わせによって、`isset=true`なのに中身が`nil`という状態が構造的に発生し得ないことによる。
+
+**`m[k]`(`V?`を返す添字読み取り)と`xs[i]`(リストの添字読み取り、`T`を返す)は、`ast.IndexExpr`という同じASTノードを共有しつつ、`ResultType.Nullable`だけで判別する設計にした。** 新しい判別用フィールドは追加していない——リストの要素は仕様上決して独立してnullableになれない(Step 6で確定済み)ため`ResultType.Nullable`は常に`false`、mapの読み取りは`MGET`のcomma-ok由来のnullabilityにより常に`true`になることが構造的に保証されているため、この1フィールドだけで安全に分岐できる。codegen側の`genIndexRead`はこれを見て`AGET`(リスト)か値のみの`MGET`(map、isset非対応の文脈用)を選び、`func.go`の`genNullableOperands`は同じ`ResultType.Nullable`を見て、nullable文脈(`let v: int? = m[k]`等)では`MGET`のcomma-ok形(値+okの2オペランド)を1回の命令で両方取得する専用パスに乗せる。
+
+**map value型(`V`)は独立してnullableにできないという制約をsemaで明示的に禁止した(`validateType`)。** `m[k]`が返す`V?`自体が既に「キーが存在するか」という1段のnullabilityを表現しているため、`V`自身もnullable(`map<string, int?>`)だと二重のnullabilityが必要になり、`MGET`のcomma-ok形(値+okの2オペランドのみ)では素直に表現できない。仕様例にも二重nullableの用例が無いため、Step 8の「構造体フィールドの独立nullable禁止」と同じ理由・同じ判断で先送りにした。mapのキー型(`K`)についても、4.5節が明記する「スカラー型(int/float/string/bool)のみ」という制約を`validateMapKeyType`で検証している。
+
+**AMIVM-IRにはmapを走査する命令が存在しない(`RANGE`相当が無い)ため、`for k, v in m`の実装だけ他の3命令(`MPTYPE`/`MPMAKE`/`MSET`/`MGET`)と全く異なるアプローチが必要だった。** 単独のキー・値へのアクセス(`MGET`/`MSET`)はできても、mapの全エントリを列挙する手段がAMIVM-IR自体には無いため、Cascade側のコード生成だけでは`for k, v in m`を組み立てられない。この設計判断はユーザーに確認を取り、**今回`cascadert`ランタイムを新設して解決する方針**を選んだ(先送りにする選択肢もあったが、初回導入のコストを払ってでも今回のStep 10で完結させることにした)。`cascadert.Keys[K comparable, V any](m map[K]V) []K`(Go 1.18+のジェネリクス)を1つ実装し、`for k, v in m`は「`cascadert.Keys`でキー一覧を`[]K`として取得→既存のリストfor-inと全く同じカウントループでキーを走査→各キーごとに`MGET`で値を取得」という、リストfor-inの上に薄く乗せる形にした。ジェネリック関数が`MPTYPE`の生成する名前付きmap型(`type MapType1 map[string]int`のような)からも正しく型推論できることは、実装に入る前に独立した最小限のGoプログラムで検証済み(`go run`で`Keys(namedMapValue)`が動くことを確認してから本実装に着手した)。
+
+**`cascadert`ランタイムの配布はSeedの`seedrt`と完全に同じ方式を踏襲した。** `cascadert/embed.go`が`//go:embed *.go`で自身のソースを埋め込み、`cmd/cascade/build.go`の`writeCascadert`(`seed/cmd/seed/build.go`の`writeSeedrt`をほぼそのまま移植)がビルド時にスクラッチモジュール配下の`cascadert/`へコピーし、`amivm`に`-i cascadert=cascadebuild/cascadert`を渡す。`-i`は`cascadert`を実際に使わないプログラムに対しても無条件に渡してよい(未使用のimportマッピングはamivmが自動的に除去する、既にSeedで確認済みの挙動)。
+
+**`delete(m, key)`はGoの組み込み`delete`をそのまま`CALL : ?delete`で呼ぶだけで実現でき、専用命令もcascadertも不要だった。** `len`が`?len`でGoの組み込み`len`を呼べるのと全く同じパターンで、`delete`もGoのuniverse-scopeビルトインなので`?xxx`+`CALL`の仕組みでそのまま届く。
+
+`examples/10_maps.cas`(map リテラル・`m[k]`のnull許容読み取り・`m[k]=v`・`delete`・非nullable/nullable両方の空map宣言・`for k, v in m`の2変数走査)で`amivm`→`go build`→実行まで確認済み。
+
 ## 意味検証の責任分担(重要)
 
 型の整合性・未定義識別子・関数シグネチャの不一致・メソッドの存在チェックなどは、**amivm側では検証せず`go/types`に全面的に委ねている。** amivmが保証するのは「構文的に妥当なGoコードを出力すること」だけ。
@@ -290,7 +308,7 @@ Cascadeの`func main(): int`をamivmの`!main`へ直接対応させることは�
 
 ## 独自のGoランタイムを呼ぶ
 
-`amivm`は`?pkg.Func`+`CALL`の仕組みで任意のGo関数を呼べる。Cascadeのビルトイン関数(`sqrt`/`args`等)のうち、単純な演算命令に対応しないものは、Cascade自身が用意するGoランタイムパッケージ(例: `cascadert`。Seedの`seedrt`に相当)の関数として実装し、生成したIRから`CALL`で呼び出す設計になる見込み。配布方法(`go:embed`でスクラッチビルド用ディレクトリへコピー→`-i`で解決)もSeedの`seedrt`と同じ方式を踏襲してよい(`seed/CLAUDE.md`「`seedrt`の配布方法」参照)。
+`amivm`は`?pkg.Func`+`CALL`の仕組みで任意のGo関数を呼べる。Cascadeのビルトイン関数(`sqrt`/`args`等)のうち、単純な演算命令に対応しないものは、Cascade自身が用意するGoランタイムパッケージ`cascadert`(Seedの`seedrt`に相当)の関数として実装し、生成したIRから`CALL`で呼び出す。Step 10(map)で`for k, v in m`の実装のために初めて必要になり、Seedの`seedrt`と全く同じ方式で導入済み: `cascadert/embed.go`が自身の`.go`ファイルを`go:embed`で埋め込み、`cmd/cascade/build.go`の`writeCascadert`(`seed/cmd/seed/build.go`の`writeSeedrt`を忠実に踏襲)が`cascade build`実行時にスクラッチビルド用ディレクトリ配下の`cascadert/`へコピーし、`amivm`の`-i cascadert=cascadebuild/cascadert`で解決する(`-i`は未使用でも無害なので毎回無条件に渡してよい)。現在の`cascadert`の中身は`Keys[K comparable, V any](m map[K]V) []K`(Go 1.18+のジェネリクスを使い、`MPTYPE`が生成するどんな名前付きmap型に対しても1つの実装で動く。named map型からの型推論が実際に効くことは実装前に独立した最小Goプログラムで検証済み)のみ。新しいビルトインが必要になるたびにこのパッケージへ関数を追加していく。
 
 ## 過去に踏まれた地雷(Seedからの申し送り。Cascadeでも起こりうる)
 
@@ -327,7 +345,9 @@ Cascadeの`func main(): int`をamivmの`!main`へ直接対応させることは�
   internal/pkgloader/           パッケージ/importの解決(11節。Seedには無かった新規レイヤー)
   internal/sema/                意味検査(型チェック・スコープ解決・null絞り込み・パイプライン型接続検査)
   internal/codegen/             AST → AMIVM-IR生成
-  cascadert/                    Cascadeランタイム(sqrt/args等、CALLで呼ばれるGo実装)。
+  cascadert/                    Cascadeランタイム(Step 10で導入済み。現状は map<K, V> の
+                                 for-in走査に使うKeysのみ。sqrt/args等、単純な演算命令に
+                                 対応しないビルトインを今後ここに追加していく想定)。
                                  生成されたGoコードからimportされるため internal/ 配下には置けない
   examples/                     サンプルCascadeプログラム(`.cas`。実装した構文ごとに追加)
 ```
@@ -347,7 +367,7 @@ Seedは7〜8ステップ(git履歴上は「Step1: hello-worldパイプライン�
 | 7 ✅ | 関数(通常関数・複数戻り値) | `func`定義、複数戻り値(8.1/8.5節)、`divmod`的サンプル | `FUNC` `RET` `CALL`の本格利用 | nullable戻り値は未対応と確定(下記「確定した設計判断」参照) |
 | 8 ✅ | 構造体・ポインタ・レシーバー関数 | `struct`定義・フィールドアクセス、`&x`/`*p`、値/ポインタレシーバーの自動変換 | `STTYPE` `FIELD` `ENDSTTYPE` `FSET` `FGET` `ADDR` `PGET` `PSET` | レシーバー関数のコンパイル方針を確定(下記「確定した設計判断」参照。旧「オープンな設計課題」課題1) |
 | 9 ✅ | クロージャー・高階関数 | クロージャーリテラル(8.3節)、`filter`/`map`/`reduce`(8.4節)、参照捕捉の実地検証 | `FNTYPE` `CLOS` `ENDCLOS` | — |
-| 10 | map(`map<K, V>`) | リテラル・`m[k]`(`V?`化)・`m[k]=v`・`delete` | `MPTYPE` `MPMAKE` `MSET` `MGET` | — |
+| 10 ✅ | map(`map<K, V>`) | リテラル・`m[k]`(`V?`化)・`m[k]=v`・`delete`・`for k, v in m` | `MPTYPE` `MPMAKE` `MSET` `MGET` | `cascadert`ランタイムの初回導入(下記「確定した設計判断」参照) |
 | 11 | エラー処理 | `error`型・`(T, error?)`規約・後置`?`のsema展開(8.6節) | (新規命令なし。`STTYPE`+`IF`+`RET`の組み合わせ) | 課題2(`error`型の表現)の確定 |
 | 12 | パイプライン基礎 | `source`/`stage`/`sink`、`chan<T>`、`send`、`for v in channel`、`\|>`連結(9.1/9.2節) | `CHTYPE` `CHMAKE` `CHSEND` `CHRECV` `SPAWN` | 課題1(並行実行モデル)の一次決定。`amivm/test_ir/11_spawn_channel_sel.ir`必読 |
 | 13 | パイプライン拡張(collect/abort/merge) | `collect`(9.3節)・`abort`(9.4節)・`merge`(9.5節) | `SEL` `CASESEND` `CASERECV` `DEFAULT` `ENDSEL` `DEFER` | 課題1の最終確定 |

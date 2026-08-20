@@ -123,9 +123,13 @@ func genFuncDecl(fn *ast.FuncDecl, types *typeRegistry, structs map[string]*ast.
 // "false"); a plain identifier that is itself a nullable variable passes
 // its own ValOp/SetOp straight through (so a currently-none source stays
 // none, rather than being coerced to "set" — see genInit's doc for the
-// bug this fixes); anything else (a literal or computed non-nullable
-// value being widened into a nullable target) is definitely set, so its
-// isset token is just the literal "true".
+// bug this fixes); a map key read (`m[k]`, always nullable — see
+// ast.IndexExpr's exprType case in sema) uses MGET's comma-ok form
+// directly, giving both operands from a single instruction rather than
+// reading the value and then separately re-deriving whether the key
+// existed; anything else (a literal or computed non-nullable value being
+// widened into a nullable target) is definitely set, so its isset token
+// is just the literal "true".
 //
 // This is shared by every place a value crosses into nullable-typed
 // storage across a boundary genValue's single-token return can't
@@ -143,6 +147,24 @@ func genNullableOperands(g *funcGen, expr ast.Expr, targetType ast.Type) (val, i
 		if ref, ok := g.scope.lookup(id.Name); ok && ref.SetOp != "" {
 			return ref.ValOp, ref.SetOp, nil
 		}
+	}
+	if idx, isIndex := expr.(*ast.IndexExpr); isIndex && idx.ResultType.Nullable {
+		xOp, err := genValue(g, idx.X)
+		if err != nil {
+			return "", "", err
+		}
+		keyOp, err := genValue(g, idx.Index)
+		if err != nil {
+			return "", "", err
+		}
+		valIRType, err := typeToIR(g.types, idx.ResultType)
+		if err != nil {
+			return "", "", err
+		}
+		valTmp := g.newTemp(valIRType)
+		okTmp := g.newTemp("^bool")
+		g.emit("\tMGET\t%s\t%s\t%s\t%s\n", valTmp, okTmp, xOp, keyOp)
+		return valTmp, okTmp, nil
 	}
 	v, err := genValue(g, expr)
 	if err != nil {

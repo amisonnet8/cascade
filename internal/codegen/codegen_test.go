@@ -1056,3 +1056,105 @@ func main(): int {
 		t.Fatalf("expected pointer equality to compile to EQ; got:\n%s", ir)
 	}
 }
+
+func TestGenerate_MapLiteralUsesMPMAKEAndMSET(t *testing.T) {
+	ir := generate(t, `
+func main(): int {
+	let counts: map<string, int> = {"a": 1, "b": 2}
+	return 0
+}
+`)
+	if !strings.Contains(ir, "MPTYPE\t^MapType1\t^string\t^int\n") {
+		t.Fatalf("expected an MPTYPE deftype for map<string, int>; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "MPMAKE\t%counts_1\t^MapType1\n") {
+		t.Fatalf("expected the map literal to MPMAKE its target; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "MSET\t%counts_1\t\"a\"\t1\n\tMSET\t%counts_1\t\"b\"\t2\n") {
+		t.Fatalf("expected each pair to compile to an MSET; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_MapIndexReadUsesCommaOkMGET(t *testing.T) {
+	// Regression test: assigning m[k] into a nullable-typed variable must
+	// use MGET's comma-ok form (both value and ok operands from one
+	// instruction), not a value-only MGET plus a hardcoded "true" isset
+	// flag — see genNullableOperands's IndexExpr case.
+	ir := generate(t, `
+func main(): int {
+	let counts: map<string, int> = {"a": 1}
+	let v = counts["a"]
+	return 0
+}
+`)
+	if !strings.Contains(ir, "MGET\t%tmp_3\t%tmp_4\t%counts_1\t\"a\"\n\tSET\t%v_2\t%tmp_3\n\tSET\t%v_2_isset\t%tmp_4\n") {
+		t.Fatalf("expected a comma-ok MGET feeding both v's value and isset directly; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_MapIndexAssignUsesMSET(t *testing.T) {
+	ir := generate(t, `
+func main(): int {
+	let counts: map<string, int> = {"a": 1}
+	counts["b"] = 2
+	return 0
+}
+`)
+	if !strings.Contains(ir, "MSET\t%counts_1\t\"b\"\t2\n") {
+		t.Fatalf("expected counts[\"b\"] = 2 to compile to MSET; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_NonNullableEmptyMapUsesMPMAKENotNil(t *testing.T) {
+	// Regression test: a non-nullable map with no initializer must
+	// allocate a real, writable empty map via MPMAKE — writing into a nil
+	// Go map panics, unlike appending to a nil slice — see
+	// genResetToZero's doc.
+	ir := generate(t, `
+func main(): int {
+	let empty: map<string, int>
+	empty["x"] = 1
+	return 0
+}
+`)
+	if !strings.Contains(ir, "MPMAKE\t%empty_1\t^MapType1\n") {
+		t.Fatalf("expected a bare 'let empty: map<string, int>' to MPMAKE, not SET nil; got:\n%s", ir)
+	}
+	if strings.Contains(ir, "SET\t%empty_1\tnil") {
+		t.Fatalf("a non-nullable empty map must never be SET to nil; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_DeleteCallsBuiltinDelete(t *testing.T) {
+	ir := generate(t, `
+func main(): int {
+	let counts: map<string, int> = {"a": 1}
+	delete(counts, "a")
+	return 0
+}
+`)
+	if !strings.Contains(ir, "CALL\t:\t?delete\t%counts_1\t\"a\"\n") {
+		t.Fatalf("expected delete(counts, \"a\") to compile to a CALL against Go's builtin delete; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_TwoVariableForInUsesCascadertKeys(t *testing.T) {
+	ir := generate(t, `
+func main(): int {
+	let counts: map<string, int> = {"a": 1, "b": 2}
+	let total = 0
+	for k, v in counts {
+		total += v
+		print(k)
+	}
+	return 0
+}
+`)
+	if !strings.Contains(ir, "CALL\t%tmp_3\t:\t?cascadert.Keys\t%counts_1\n") {
+		t.Fatalf("expected the two-variable for-in to call cascadert.Keys once; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "\tMGET\t%v_") {
+		t.Fatalf("expected each iteration to MGET the value for its key; got:\n%s", ir)
+	}
+	assertLabelsResolve(t, ir)
+}

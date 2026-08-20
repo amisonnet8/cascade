@@ -10,16 +10,20 @@ import (
 
 // typeRegistry tracks which composite AMIVM-IR deftypes need a top-level
 // declaration before any FUNC references them (amivm requires SLTYPE/
-// FNTYPE before any use — see amivm_spec.md §2.2): list element types
-// for SLTYPE (cascade_spec.md §2.2's `[]T`, mirrors Seed's identical
-// registry) and function-type shapes for FNTYPE (§2.2, §8.3). It's
-// shared by the whole Generate() call, since these declarations are
-// emitted once, up front, ahead of every FUNC block.
+// FNTYPE/MPTYPE before any use — see amivm_spec.md §2.2): list element
+// types for SLTYPE (cascade_spec.md §2.2's `[]T`, mirrors Seed's
+// identical registry), function-type shapes for FNTYPE (§2.2, §8.3), and
+// map key/value shapes for MPTYPE (§2.2, §4.5). It's shared by the whole
+// Generate() call, since these declarations are emitted once, up front,
+// ahead of every FUNC block.
 type typeRegistry struct {
 	used map[string]bool
 
 	funcTypes    map[string]*funcTypeEntry // canonical shape key -> entry
 	funcTypeList []*funcTypeEntry          // first-seen order, for stable FNTYPE emission
+
+	mapTypes    map[string]*mapTypeEntry // canonical shape key -> entry
+	mapTypeList []*mapTypeEntry          // first-seen order, for stable MPTYPE emission
 }
 
 // use registers elemName (a scalar type name — nested list element types
@@ -94,6 +98,49 @@ func (r *typeRegistry) funcTypeDecls() []string {
 	return decls
 }
 
+// mapTypeEntry is one map-type shape registered with useMapType, carrying
+// its already-resolved key/value IR type tokens (needed to emit its own
+// MPTYPE line — see mapTypeDecls). Mirrors funcTypeEntry.
+type mapTypeEntry struct {
+	Name  string // deftype name, no leading `^`
+	Key   string
+	Value string
+}
+
+// useMapType registers a map type shape — its already-resolved key/value
+// IR type tokens — as needing a top-level MPTYPE declaration,
+// deduplicating by shape so two Cascade map<K, V> types with the same
+// actual key/value types share one deftype, and returns its AMIVM-IR
+// type token (a synthesized name, e.g. "^MapType1" — mirrors
+// useFuncType).
+func (r *typeRegistry) useMapType(keyToken, valueToken string) string {
+	if r.mapTypes == nil {
+		r.mapTypes = map[string]*mapTypeEntry{}
+	}
+	key := keyToken + ":" + valueToken
+	if e, ok := r.mapTypes[key]; ok {
+		return "^" + e.Name
+	}
+	e := &mapTypeEntry{
+		Name:  fmt.Sprintf("MapType%d", len(r.mapTypeList)+1),
+		Key:   keyToken,
+		Value: valueToken,
+	}
+	r.mapTypes[key] = e
+	r.mapTypeList = append(r.mapTypeList, e)
+	return "^" + e.Name
+}
+
+// mapTypeDecls returns every registered map-type shape's MPTYPE
+// declaration line, in first-seen order (stable, deterministic output).
+func (r *typeRegistry) mapTypeDecls() []string {
+	decls := make([]string, len(r.mapTypeList))
+	for i, e := range r.mapTypeList {
+		decls[i] = fmt.Sprintf("MPTYPE\t^%s\t%s\t%s", e.Name, e.Key, e.Value)
+	}
+	return decls
+}
+
 // listTypeToken is the AMIVM-IR type token for elemName's list form, e.g.
 // "int" -> "^intlist". Cascade lists compile to Go slices (SLTYPE+
 // SLMAKE), not Go's fixed-size array type — cascade_spec.md §4.3's `let
@@ -102,12 +149,12 @@ func listTypeToken(elemName string) string {
 	return "^" + elemName + "list"
 }
 
-// typeToIR maps any Cascade type (scalar, struct, list, pointer, or
-// function) to its AMIVM-IR type token, registering the element type
-// with reg if t is a list or the whole shape if t is a function type.
-// Nested list types (`[][]T`) aren't supported yet — cascade_spec.md
-// never shows one — so t.Elem itself being a list is an error here;
-// likewise a pointer to a list or another pointer.
+// typeToIR maps any Cascade type (scalar, struct, list, pointer,
+// function, or map) to its AMIVM-IR type token, registering the element
+// type with reg if t is a list, or the whole shape if t is a function or
+// map type. Nested list types (`[][]T`) aren't supported yet —
+// cascade_spec.md never shows one — so t.Elem itself being a list is an
+// error here; likewise a pointer to a list or another pointer.
 func typeToIR(reg *typeRegistry, t ast.Type) (string, error) {
 	if t.Elem != nil {
 		if t.Elem.Elem != nil {
@@ -144,6 +191,17 @@ func typeToIR(reg *typeRegistry, t ast.Type) (string, error) {
 		}
 		return reg.useFuncType(paramTokens, resultTokens), nil
 	}
+	if t.Map != nil {
+		keyTok, err := typeToIR(reg, t.Map.Key)
+		if err != nil {
+			return "", err
+		}
+		valTok, err := typeToIR(reg, t.Map.Value)
+		if err != nil {
+			return "", err
+		}
+		return reg.useMapType(keyTok, valTok), nil
+	}
 	return scalarTypeToIR(t)
 }
 
@@ -171,23 +229,43 @@ func genListLiteralInit(g *funcGen, ref varRef, lit *ast.ListLit) error {
 	return nil
 }
 
-// genIndexRead compiles `xs[i]` (cascade_spec.md §5) into a fresh temp of
-// e.ResultType (the list's element type, filled in by sema.Check).
+// genIndexRead compiles `xs[i]` (list index, cascade_spec.md §5) or
+// `m[k]` (map key read, §4.5) into a fresh temp of e.ResultType (the
+// list's element type, or the map's value type, filled in by
+// sema.Check). e.ResultType.Nullable distinguishes the two: a list read
+// is never nullable (elements aren't independently nullable — see
+// ast.Type's doc), while a map read always is (`m[k]` returns `V?` via
+// MGET's comma-ok form — see ast.IndexExpr's exprType case in sema),
+// so it's a clean, already-available discriminator with no extra field
+// needed. This value-only MGET form (no ok flag) is only reached where
+// sema has already guaranteed the isset flag doesn't matter for this
+// particular read — see genNullableOperands's IndexExpr case for the
+// comma-ok form used everywhere the result's nullability is actually
+// significant (e.g. assigning into a `V?`-typed variable).
 func genIndexRead(g *funcGen, e *ast.IndexExpr) (string, error) {
-	listOp, err := genValue(g, e.X)
+	xOp, err := genValue(g, e.X)
 	if err != nil {
 		return "", err
 	}
-	idxOp, err := genValue(g, e.Index)
+	keyOrIdxOp, err := genValue(g, e.Index)
 	if err != nil {
 		return "", err
+	}
+	if e.ResultType.Nullable {
+		irType, err := typeToIR(g.types, e.ResultType)
+		if err != nil {
+			return "", err
+		}
+		tmp := g.newTemp(irType)
+		g.emit("\tMGET\t%s\t%s\t%s\n", tmp, xOp, keyOrIdxOp)
+		return tmp, nil
 	}
 	irType, err := scalarTypeToIR(e.ResultType)
 	if err != nil {
 		return "", err
 	}
 	tmp := g.newTemp(irType)
-	g.emit("\tAGET\t%s\t%s\t%s\n", tmp, listOp, idxOp)
+	g.emit("\tAGET\t%s\t%s\t%s\n", tmp, xOp, keyOrIdxOp)
 	return tmp, nil
 }
 
@@ -312,7 +390,9 @@ func genAppendCall(g *funcGen, call *ast.CallExpr) (string, error) {
 
 // genForInStmt compiles `for x in List { ... }` (cascade_spec.md §7) as
 // an index-counted loop over len(List) — mirrors Seed's identical
-// genForInStmt (seed/internal/codegen/stmt.go).
+// genForInStmt (seed/internal/codegen/stmt.go). The two-variable map
+// form (`for k, v in m`) is a different shape entirely — see
+// genForInMapStmt.
 //
 //	CALL lenOp : ?len list; SET idxOp 0
 //	LABEL start; LT cmp idxOp lenOp; IF cmp body; GOTO end
@@ -326,6 +406,9 @@ func genAppendCall(g *funcGen, call *ast.CallExpr) (string, error) {
 // targets a dedicated label positioned right before that increment,
 // which the body's normal (non-break/continue) fallthrough also reaches.
 func genForInStmt(g *funcGen, stmt *ast.ForInStmt) error {
+	if stmt.ValueVarName != "" {
+		return genForInMapStmt(g, stmt)
+	}
 	listOp, err := genValue(g, stmt.List)
 	if err != nil {
 		return err

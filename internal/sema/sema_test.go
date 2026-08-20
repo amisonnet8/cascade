@@ -1519,3 +1519,202 @@ func main(): int {
 		})
 	}
 }
+
+func TestCheck_ValidMaps(t *testing.T) {
+	src := `
+func main(): int {
+	let counts: map<string, int> = {"a": 1, "b": 2}
+	counts["c"] = 3
+	print(string(len(counts)))
+
+	let a = counts["a"]
+	if a is not none {
+		print(string(a))
+	}
+
+	delete(counts, "b")
+
+	let total = 0
+	for k, v in counts {
+		total += v
+		print(k)
+	}
+	print(string(total))
+
+	let empty: map<string, int>
+	empty["x"] = 1
+	print(string(len(empty)))
+
+	let scores = {"alice": 90, "bob": 75}
+	print(string(len(scores)))
+
+	return 0
+}
+`
+	if err := check(t, src); err != nil {
+		t.Fatalf("Check() = %v, want nil", err)
+	}
+}
+
+func TestCheck_MapErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		src     string
+		wantErr string
+	}{
+		{
+			name: "map key type must be scalar",
+			src: `
+struct Point { x: int }
+func main(): int {
+	let m: map<Point, int>
+	return 0
+}
+`,
+			wantErr: "map key type must be a non-nullable scalar",
+		},
+		{
+			name: "map key type cannot be nullable",
+			src: `
+func main(): int {
+	let m: map<string?, int>
+	return 0
+}
+`,
+			wantErr: "map key type must be a non-nullable scalar",
+		},
+		{
+			name: "map value type cannot itself be nullable",
+			src: `
+func main(): int {
+	let m: map<string, int?>
+	return 0
+}
+`,
+			wantErr: "map value type cannot itself be nullable",
+		},
+		{
+			name: "map literal key type mismatch",
+			src: `
+func main(): int {
+	let m: map<string, int> = {"a": 1, 2: 3}
+	return 0
+}
+`,
+			wantErr: "cannot assign",
+		},
+		{
+			name: "cannot infer type from an empty map literal",
+			src: `
+func main(): int {
+	let m = {}
+	return 0
+}
+`,
+			wantErr: "cannot infer a type from an empty map literal",
+		},
+		{
+			name: "map index key type mismatch",
+			src: `
+func main(): int {
+	let m: map<string, int> = {"a": 1}
+	let v = m[1]
+	return 0
+}
+`,
+			wantErr: "map key must be string",
+		},
+		{
+			name: "map index-assignment key type mismatch",
+			src: `
+func main(): int {
+	let m: map<string, int> = {"a": 1}
+	m[1] = 5
+	return 0
+}
+`,
+			wantErr: "map key must be string",
+		},
+		{
+			name: "map index-assignment value type mismatch",
+			src: `
+func main(): int {
+	let m: map<string, int> = {"a": 1}
+	m["b"] = "oops"
+	return 0
+}
+`,
+			wantErr: "cannot assign",
+		},
+		{
+			name: "delete requires a map first argument",
+			src: `
+func main(): int {
+	delete(5, "a")
+	return 0
+}
+`,
+			wantErr: "delete() expects a map as its first argument",
+		},
+		{
+			name: "delete key type mismatch",
+			src: `
+func main(): int {
+	let m: map<string, int> = {"a": 1}
+	delete(m, 5)
+	return 0
+}
+`,
+			wantErr: "delete() key must be string",
+		},
+		{
+			name: "single-variable for-in over a map is rejected",
+			src: `
+func main(): int {
+	let m: map<string, int> = {"a": 1}
+	for k in m {
+		print(k)
+	}
+	return 0
+}
+`,
+			wantErr: "for-in requires a list",
+		},
+		{
+			name: "two-variable for-in over a list is rejected",
+			src: `
+func main(): int {
+	let xs = [1, 2, 3]
+	for k, v in xs {
+		print(string(v))
+	}
+	return 0
+}
+`,
+			wantErr: "for-in with two variables requires a map",
+		},
+		{
+			name: "indexing into a non-map, non-list type",
+			src: `
+func main(): int {
+	let x = 5
+	let v = x["a"]
+	return 0
+}
+`,
+			wantErr: "cannot index into int",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := check(t, tt.src)
+			if err == nil {
+				t.Fatalf("Check() = nil, want error containing %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Check() = %q, want error containing %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}

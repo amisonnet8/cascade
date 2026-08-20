@@ -10,24 +10,27 @@
 // declarations (including the multi-value `let n1, n2 = call(...)`
 // form), a call-expression statement (plain or `obj.method(...)`), a
 // dereferencing assignment `*ptr = value` (§4.4), scalar/list-element/
-// struct-field/compound assignment, `++`/`--`, `return`, `if`/`elif`/
-// `else`, `while`, `for x in list`, `switch` (tagged and untagged), and
-// `break`/`continue`; and a full operator-precedence expression grammar
-// (§6, including unary `&`/`*` for address-of/dereference, §4.4),
-// literals (including nullable-type `T?` declarations, pointer types
-// `*T`, function types `func(T1, T2, ...): R` (§2.2, §8.3) and closure
-// literals `func(name: Type, ...): R { body }` in expression position,
-// the `none` literal, list literals `[1, 2, 3]`/`[]`, and struct literals
-// `Name{field: value, ...}`), variable references, function/method/
-// closure calls, field access `x.field`, list indexing `xs[i]`, and `is
-// none`/`is not none` (§7) directly on an atom (the only place the spec
-// actually uses it — as an `if`/`switch` condition). A struct literal is
+// map-element/struct-field/compound assignment, `++`/`--`, `return`,
+// `if`/`elif`/`else`, `while`, `for x in list`/`for k, v in map`,
+// `switch` (tagged and untagged), and `break`/`continue`; and a full
+// operator-precedence expression grammar (§6, including unary `&`/`*`
+// for address-of/dereference, §4.4), literals (including nullable-type
+// `T?` declarations, pointer types `*T`, function types `func(T1, T2,
+// ...): R` (§2.2, §8.3), closure literals `func(name: Type, ...): R {
+// body }` in expression position, map types `map<K, V>` (§2.2, §4.5),
+// the `none` literal, list literals `[1, 2, 3]`/`[]`, map literals
+// `{"a": 1, "b": 2}`/`{}`, and struct literals `Name{field: value,
+// ...}`), variable references, function/method/closure calls, field
+// access `x.field`, list/map indexing `xs[i]`/`m[k]`, and `is none`/`is
+// not none` (§7) directly on an atom (the only place the spec actually
+// uses it — as an `if`/`switch` condition). A struct or map literal is
 // only recognized where `{` cannot instead open a block (see
-// withStructLitForbidden/withStructLitAllowed), mirroring Go's identical
-// restriction — a closure literal needs no such guard, since seeing
-// `func` in expression position is never itself ambiguous with anything
-// else. Later development steps extend this grammar further (maps,
-// channels/pipelines, ...) one feature at a time.
+// withStructLitForbidden/withStructLitAllowed — the same guard covers
+// both, despite the name), mirroring Go's identical restriction — a
+// closure literal needs no such guard, since seeing `func` in expression
+// position is never itself ambiguous with anything else. Later
+// development steps extend this grammar further (channels/pipelines,
+// ...) one feature at a time.
 package parser
 
 import (
@@ -351,6 +354,9 @@ func (p *parser) parseTypeBase() (ast.Type, error) {
 	if p.cur().Kind == lexer.KwFunc {
 		return p.parseFuncType()
 	}
+	if p.cur().Kind == lexer.KwMap {
+		return p.parseMapType()
+	}
 	if name, ok := typeKeywords[p.cur().Kind]; ok {
 		p.advance()
 		return ast.Type{Name: name}, nil
@@ -404,6 +410,32 @@ func (p *parser) parseFuncType() (ast.Type, error) {
 	// A function value's zero value is always `none` (cascade_spec.md
 	// §2.2), with no `?` written — see ast.Type's doc.
 	return ast.Type{Func: ft, Nullable: true}, nil
+}
+
+// parseMapType parses a map type (cascade_spec.md §2.2, §4.5):
+// `map<K, V>`. Unlike func types, a map's own zero value is a real,
+// non-nullable empty map `{}` (see ast.Type's doc), so no Nullable is
+// forced here.
+func (p *parser) parseMapType() (ast.Type, error) {
+	p.advance() // 'map'
+	if _, err := p.expect(lexer.Lt, "'<'"); err != nil {
+		return ast.Type{}, err
+	}
+	keyType, err := p.parseType()
+	if err != nil {
+		return ast.Type{}, err
+	}
+	if _, err := p.expect(lexer.Comma, "','"); err != nil {
+		return ast.Type{}, err
+	}
+	valueType, err := p.parseType()
+	if err != nil {
+		return ast.Type{}, err
+	}
+	if _, err := p.expect(lexer.Gt, "'>'"); err != nil {
+		return ast.Type{}, err
+	}
+	return ast.Type{Map: &ast.MapType{Key: keyType, Value: valueType}}, nil
 }
 
 func (p *parser) parseBlock() ([]ast.Stmt, error) {
@@ -517,14 +549,23 @@ func (p *parser) parseWhileStmt() (ast.Stmt, error) {
 	return &ast.WhileStmt{Cond: cond, Body: body, Line: kw.Line}, nil
 }
 
-// parseForInStmt parses `for x in List { ... }` (cascade_spec.md §7). The
-// two-variable map form (`for k, v in m`) is parsed starting in Step 10,
-// the step that introduces `map<K, V>`.
+// parseForInStmt parses `for x in List { ... }` over a list, or `for k, v
+// in M { ... }` over a map (cascade_spec.md §7) when a comma-separated
+// second variable name follows the first.
 func (p *parser) parseForInStmt() (ast.Stmt, error) {
 	kw := p.advance() // 'for'
 	varName, err := p.expect(lexer.Ident, "loop variable name")
 	if err != nil {
 		return nil, err
+	}
+	var valueVarName string
+	if p.cur().Kind == lexer.Comma {
+		p.advance()
+		valueVar, err := p.expect(lexer.Ident, "value loop variable name")
+		if err != nil {
+			return nil, err
+		}
+		valueVarName = valueVar.Literal
 	}
 	if _, err := p.expect(lexer.KwIn, "'in'"); err != nil {
 		return nil, err
@@ -537,7 +578,7 @@ func (p *parser) parseForInStmt() (ast.Stmt, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &ast.ForInStmt{VarName: varName.Literal, List: list, Body: body, Line: kw.Line}, nil
+	return &ast.ForInStmt{VarName: varName.Literal, ValueVarName: valueVarName, List: list, Body: body, Line: kw.Line}, nil
 }
 
 // parseSwitchStmt parses both switch forms (cascade_spec.md §7): tagged
@@ -1086,13 +1127,24 @@ func (p *parser) parsePrimaryAtom() (ast.Expr, error) {
 		return &ast.NoneLit{Line: tok.Line}, nil
 	case lexer.LBracket:
 		return p.parseListLit()
+	case lexer.LBrace:
+		// A map literal (cascade_spec.md §3, §4.5) — only recognized
+		// where `{` cannot instead open a block, the same struct-literal
+		// ambiguity noStructLit already guards (see its doc); unlike a
+		// struct literal, there's no fallback interpretation for a bare
+		// `{` when forbidden, so it falls through to the same "unexpected
+		// token" error every other unhandled token gets.
+		if !p.noStructLit {
+			return p.parseMapLit()
+		}
+		return nil, fmt.Errorf("line %d: unexpected token %q", tok.Line, tok.Literal)
 	case lexer.KwFunc:
 		return p.parseClosureLit()
 	case lexer.KwString, lexer.KwInt, lexer.KwFloat, lexer.KwBool, lexer.KwMap:
 		// A type keyword can also name a builtin conversion/collection
 		// call, e.g. string(x) (cascade_spec.md §13) or map(list, f)
-		// (§8.4) — "map" is reserved for the future map<K, V> type
-		// (Step 10), so like string/int/float/bool it's still a keyword
+		// (§8.4) — "map" is reserved for the map<K, V> type (§2.2, §4.5,
+		// Step 10), so like string/int/float/bool it's still a keyword
 		// (not an Ident), needing its own case here rather than falling
 		// through to the Ident case below.
 		name := p.advance()
@@ -1178,6 +1230,37 @@ func (p *parser) parseListLit() (ast.Expr, error) {
 		lit.Elems = append(lit.Elems, elem)
 	}
 	if _, err := p.expect(lexer.RBracket, "']'"); err != nil {
+		return nil, err
+	}
+	return lit, nil
+}
+
+// parseMapLit parses a map literal, e.g. `{"a": 1, "b": 2}` or `{}`
+// (cascade_spec.md §3, §4.5). Its key/value types aren't determined
+// here — see ast.MapLit's doc.
+func (p *parser) parseMapLit() (ast.Expr, error) {
+	kw := p.advance() // '{'
+	lit := &ast.MapLit{Line: kw.Line}
+	for p.cur().Kind != lexer.RBrace {
+		if len(lit.Pairs) > 0 {
+			if _, err := p.expect(lexer.Comma, "','"); err != nil {
+				return nil, err
+			}
+		}
+		key, err := p.withStructLitAllowed(p.parseExpr)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(lexer.Colon, "':'"); err != nil {
+			return nil, err
+		}
+		val, err := p.withStructLitAllowed(p.parseExpr)
+		if err != nil {
+			return nil, err
+		}
+		lit.Pairs = append(lit.Pairs, ast.MapPairInit{Key: key, Value: val})
+	}
+	if _, err := p.expect(lexer.RBrace, "'}'"); err != nil {
 		return nil, err
 	}
 	return lit, nil

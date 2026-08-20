@@ -1,21 +1,25 @@
 // Package sema performs semantic analysis on a Cascade ast.File, since
 // amivm delegates all type/scope checking to go/types and does not check
 // anything itself (see CLAUDE.md "意味検証の責任分担"). Only the checks
-// Steps 1-9 need are implemented so far: a single well-formed `main` plus
-// any number of other functions (§8.1) — including multi-value returns
-// (§8.5) — scope-resolved `let`/`const` declarations and scalar/list-
-// element/struct-field/compound assignment, nullable-type (`T?`)
-// compatibility and narrowing (§2.3, §4.2, §5, §7), the full operator set
-// (§6), control flow (if/elif/else, while, for-in, switch,
-// break/continue), lists (`[]T` — literals, indexing, append/range/len),
-// structs/pointers/receiver functions (§4.1, §4.4, §8.2 — struct
-// declarations, struct literals requiring every field, field read/write
-// on a struct or a pointer to one, `&`/`*` address-of/dereference, and
-// method calls with automatic address-of/dereference between value and
-// pointer receivers), and closures/higher-order functions (§8.3, §8.4 —
-// closure literals capturing the surrounding scope, calling a closure-
-// valued local variable, and the filter/map/reduce builtins). Later steps
-// add maps, channels/pipelines, and everything past that.
+// Steps 1-10 need are implemented so far: a single well-formed `main`
+// plus any number of other functions (§8.1) — including multi-value
+// returns (§8.5) — scope-resolved `let`/`const` declarations and scalar/
+// list-element/map-element/struct-field/compound assignment,
+// nullable-type (`T?`) compatibility and narrowing (§2.3, §4.2, §5, §7),
+// the full operator set (§6), control flow (if/elif/else, while, for-in
+// over a list or a map, switch, break/continue), lists (`[]T` —
+// literals, indexing, append/range/len), structs/pointers/receiver
+// functions (§4.1, §4.4, §8.2 — struct declarations, struct literals
+// requiring every field, field read/write on a struct or a pointer to
+// one, `&`/`*` address-of/dereference, and method calls with automatic
+// address-of/dereference between value and pointer receivers),
+// closures/higher-order functions (§8.3, §8.4 — closure literals
+// capturing the surrounding scope, calling a closure-valued local
+// variable, and the filter/map/reduce builtins), and maps (§2.2, §4.5 —
+// `map<K, V>` with a non-nullable scalar key and non-nullable value,
+// literals, `m[k]` returning `V?`, `m[k] = v`, `delete`, and the
+// two-variable `for k, v in m` form). Later steps add channels/
+// pipelines and everything past that.
 //
 // A function whose non-void body doesn't obviously return on every path
 // isn't checked here (no control-flow reachability analysis is
@@ -99,6 +103,7 @@ var reservedBuiltinNames = map[string]bool{
 	"append": true,
 	"filter": true,
 	"reduce": true,
+	"delete": true,
 }
 
 // Check validates f. cascade_spec.md §12 requires exactly one `main`
@@ -301,10 +306,11 @@ func (c *checker) checkFuncBody(fn *ast.FuncDecl) error {
 // validateType reports whether t names a type sema recognizes: a builtin
 // scalar (int/float/string/bool), a list of a valid type, a pointer to a
 // valid type, a function type whose every parameter/result is itself
-// valid, or a declared struct name (cascade_spec.md §2, §4.1). The parser
-// accepts any identifier as a type name (see parseTypeBase) since it
-// cannot know which ones are declared structs — that check happens here
-// instead, once every struct is registered.
+// valid, a map type whose key is a non-nullable scalar and whose value is
+// a valid non-nullable type, or a declared struct name (cascade_spec.md
+// §2, §4.1). The parser accepts any identifier as a type name (see
+// parseTypeBase) since it cannot know which ones are declared structs —
+// that check happens here instead, once every struct is registered.
 func (c *checker) validateType(t ast.Type, line int) error {
 	if t.Elem != nil {
 		return c.validateType(*t.Elem, line)
@@ -325,6 +331,18 @@ func (c *checker) validateType(t ast.Type, line int) error {
 		}
 		return nil
 	}
+	if t.Map != nil {
+		if err := c.validateMapKeyType(t.Map.Key, line); err != nil {
+			return err
+		}
+		if err := c.validateType(t.Map.Value, line); err != nil {
+			return err
+		}
+		if t.Map.Value.Nullable {
+			return fmt.Errorf("line %d: map value type cannot itself be nullable (m[k] already returns V?)", line)
+		}
+		return nil
+	}
 	switch t.Name {
 	case "int", "float", "string", "bool":
 		return nil
@@ -333,6 +351,20 @@ func (c *checker) validateType(t ast.Type, line int) error {
 		return nil
 	}
 	return fmt.Errorf("line %d: unknown type %q", line, t.Name)
+}
+
+// validateMapKeyType reports whether t is a valid map key type
+// (cascade_spec.md §4.5: "map<K, V>のKにはスカラー型(int/float/string/bool)
+// のみ使える") — a non-nullable int/float/string/bool, nothing else
+// (struct/list/pointer/func/map, or a nullable scalar, are all rejected).
+func (c *checker) validateMapKeyType(t ast.Type, line int) error {
+	if !t.Nullable && t.Elem == nil && t.Ptr == nil && t.Func == nil && t.Map == nil {
+		switch t.Name {
+		case "int", "float", "string", "bool":
+			return nil
+		}
+	}
+	return fmt.Errorf("line %d: map key type must be a non-nullable scalar (int/float/string/bool), got %s", line, typeString(t))
 }
 
 // structTypeName reports the struct name t refers to, directly or
@@ -594,16 +626,38 @@ func (c *checker) checkSwitchStmt(sc *scope, stmt *ast.SwitchStmt, want []ast.Ty
 	return nil
 }
 
-// checkForInStmt checks `for x in List { ... }` (cascade_spec.md §7):
-// List must be a non-nullable list, and the loop variable x is declared
-// with its element type in a fresh scope wrapping the body (loopDepth+1,
-// breakDepth+1, same as while — see checkStmt's doc).
+// checkForInStmt checks `for x in List { ... }` over a list, or `for k,
+// v in M { ... }` over a map when ValueVarName is set (cascade_spec.md
+// §7): List/M must be non-nullable, and the loop variable(s) are
+// declared with their element (or key/value) type(s) in a fresh scope
+// wrapping the body (loopDepth+1, breakDepth+1, same as while — see
+// checkStmt's doc).
 func (c *checker) checkForInStmt(sc *scope, stmt *ast.ForInStmt, want []ast.Type, loopDepth, breakDepth int) error {
 	t, err := c.exprType(sc, stmt.List)
 	if err != nil {
 		return err
 	}
-	if t.Nullable || t.Elem == nil {
+	if t.Nullable {
+		return fmt.Errorf("line %d: for-in requires a list or map, got %s", ast.ExprLine(stmt.List), typeString(t))
+	}
+
+	if stmt.ValueVarName != "" {
+		if t.Map == nil {
+			return fmt.Errorf("line %d: for-in with two variables requires a map, got %s", ast.ExprLine(stmt.List), typeString(t))
+		}
+		stmt.ElemType = t.Map.Key
+		stmt.ValueType = t.Map.Value
+		inner := newScope(sc)
+		if !inner.declareLocal(stmt.VarName, varInfo{Type: stmt.ElemType}) {
+			return fmt.Errorf("line %d: %q is already declared in this scope (cascade_spec.md §10)", stmt.Line, stmt.VarName)
+		}
+		if !inner.declareLocal(stmt.ValueVarName, varInfo{Type: stmt.ValueType}) {
+			return fmt.Errorf("line %d: %q is already declared in this scope (cascade_spec.md §10)", stmt.Line, stmt.ValueVarName)
+		}
+		return c.checkStmtsIn(inner, stmt.Body, want, loopDepth+1, breakDepth+1)
+	}
+
+	if t.Elem == nil {
 		return fmt.Errorf("line %d: for-in requires a list, got %s", ast.ExprLine(stmt.List), typeString(t))
 	}
 	stmt.ElemType = *t.Elem
@@ -739,7 +793,20 @@ func (c *checker) checkAssignStmt(sc *scope, stmt *ast.AssignStmt) error {
 		return fmt.Errorf("line %d: undefined name %q", stmt.Line, stmt.Name)
 	}
 	if stmt.Index != nil {
-		if info.Type.Nullable || info.Type.Elem == nil {
+		if info.Type.Nullable {
+			return fmt.Errorf("line %d: cannot index into %s", stmt.Line, typeString(info.Type))
+		}
+		if info.Type.Map != nil {
+			kt, err := c.exprType(sc, stmt.Index)
+			if err != nil {
+				return err
+			}
+			if kt.Nullable || !typeShapeEqual(kt, info.Type.Map.Key) {
+				return fmt.Errorf("line %d: map key must be %s, got %s", ast.ExprLine(stmt.Index), typeString(info.Type.Map.Key), typeString(kt))
+			}
+			return c.checkAssignable(sc, info.Type.Map.Value, stmt.Value)
+		}
+		if info.Type.Elem == nil {
 			return fmt.Errorf("line %d: cannot index into %s", stmt.Line, typeString(info.Type))
 		}
 		it, err := c.exprType(sc, stmt.Index)
@@ -820,6 +887,25 @@ func (c *checker) checkExprStmt(sc *scope, stmt *ast.ExprStmt) error {
 			return fmt.Errorf("line %d: print expects string, got %s", call.Line, typeString(t))
 		}
 		return nil
+	case "delete":
+		if len(call.Args) != 2 {
+			return fmt.Errorf("line %d: delete() expects exactly 2 arguments, got %d", call.Line, len(call.Args))
+		}
+		mt, err := c.exprType(sc, call.Args[0])
+		if err != nil {
+			return err
+		}
+		if mt.Nullable || mt.Map == nil {
+			return fmt.Errorf("line %d: delete() expects a map as its first argument, got %s", ast.ExprLine(call.Args[0]), typeString(mt))
+		}
+		kt, err := c.exprType(sc, call.Args[1])
+		if err != nil {
+			return err
+		}
+		if kt.Nullable || !typeShapeEqual(kt, mt.Map.Key) {
+			return fmt.Errorf("line %d: delete() key must be %s, got %s", ast.ExprLine(call.Args[1]), typeString(mt.Map.Key), typeString(kt))
+		}
+		return nil
 	default:
 		sig, ok := c.sigs[call.Callee]
 		if !ok {
@@ -865,6 +951,9 @@ func (c *checker) checkAssignable(sc *scope, target ast.Type, value ast.Expr) er
 	}
 	if lit, isList := value.(*ast.ListLit); isList {
 		return c.checkListLiteralAgainst(sc, lit, target)
+	}
+	if lit, isMap := value.(*ast.MapLit); isMap {
+		return c.checkMapLiteralAgainst(sc, lit, target)
 	}
 	vt, err := c.exprType(sc, value)
 	if err != nil {
@@ -1001,6 +1090,50 @@ func (c *checker) checkListLiteralAgainst(sc *scope, lit *ast.ListLit, target as
 		}
 	}
 	return nil
+}
+
+// checkMapLiteralAgainst validates a map literal's pairs against target's
+// key/value types (cascade_spec.md §3, §4.5). target must itself be a map
+// type — an empty `{}` is valid here (the loop simply doesn't run),
+// unlike through exprType's context-free inference (see checkMapLit).
+func (c *checker) checkMapLiteralAgainst(sc *scope, lit *ast.MapLit, target ast.Type) error {
+	if target.Map == nil {
+		return fmt.Errorf("line %d: cannot assign a map literal to non-map type %s", lit.Line, typeString(target))
+	}
+	for _, pair := range lit.Pairs {
+		if err := c.checkAssignable(sc, target.Map.Key, pair.Key); err != nil {
+			return err
+		}
+		if err := c.checkAssignable(sc, target.Map.Value, pair.Value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkMapLit infers a map literal's type with no target context
+// (cascade_spec.md §3), by inferring its key/value types from Pairs[0]
+// and then checking every other pair matches — mirrors inferListLitType.
+// An empty `{}` has nothing to infer from and is always an error here —
+// callers with a target type instead go through checkMapLiteralAgainst,
+// which allows an empty literal.
+func (c *checker) checkMapLit(sc *scope, lit *ast.MapLit) (ast.Type, error) {
+	if len(lit.Pairs) == 0 {
+		return ast.Type{}, fmt.Errorf("line %d: cannot infer a type from an empty map literal; give it an explicit map<K, V> type", lit.Line)
+	}
+	keyType, err := c.exprType(sc, lit.Pairs[0].Key)
+	if err != nil {
+		return ast.Type{}, err
+	}
+	valueType, err := c.exprType(sc, lit.Pairs[0].Value)
+	if err != nil {
+		return ast.Type{}, err
+	}
+	target := ast.Type{Map: &ast.MapType{Key: keyType, Value: valueType}}
+	if err := c.checkMapLiteralAgainst(sc, lit, target); err != nil {
+		return ast.Type{}, err
+	}
+	return target, nil
 }
 
 // checkStructLit validates a struct literal (cascade_spec.md §4.1): every
@@ -1144,6 +1277,12 @@ func typeShapeEqual(a, b ast.Type) bool {
 	if a.Func != nil {
 		return funcTypeShapeEqual(*a.Func, *b.Func)
 	}
+	if (a.Map == nil) != (b.Map == nil) {
+		return false
+	}
+	if a.Map != nil {
+		return typeShapeEqual(a.Map.Key, b.Map.Key) && typeShapeEqual(a.Map.Value, b.Map.Value)
+	}
 	return a.Name == b.Name
 }
 
@@ -1169,10 +1308,10 @@ func funcTypeShapeEqual(a, b ast.FuncType) bool {
 
 // typeGiven reports whether t is an explicitly written type (`let x: T`)
 // as opposed to the zero Type `let x = Init` leaves for inference — a
-// list, pointer, or function type has an empty Name, so checking Name
-// alone isn't enough once those exist.
+// list, pointer, function, or map type has an empty Name, so checking
+// Name alone isn't enough once those exist.
 func typeGiven(t ast.Type) bool {
-	return t.Name != "" || t.Elem != nil || t.Ptr != nil || t.Func != nil
+	return t.Name != "" || t.Elem != nil || t.Ptr != nil || t.Func != nil || t.Map != nil
 }
 
 // exprType infers e's type. NoneLit has no type of its own (see its doc
@@ -1192,12 +1331,35 @@ func (c *checker) exprType(sc *scope, e ast.Expr) (ast.Type, error) {
 		return ast.Type{}, fmt.Errorf("line %d: cannot infer a type from 'none' alone; give the variable an explicit nullable type (e.g. 'T?')", v.Line)
 	case *ast.ListLit:
 		return c.inferListLitType(sc, v)
+	case *ast.MapLit:
+		return c.checkMapLit(sc, v)
 	case *ast.IndexExpr:
 		xt, err := c.exprType(sc, v.X)
 		if err != nil {
 			return ast.Type{}, err
 		}
-		if xt.Nullable || xt.Elem == nil {
+		if xt.Nullable {
+			return ast.Type{}, fmt.Errorf("line %d: cannot index into %s", v.Line, typeString(xt))
+		}
+		if xt.Map != nil {
+			kt, err := c.exprType(sc, v.Index)
+			if err != nil {
+				return ast.Type{}, err
+			}
+			if kt.Nullable || !typeShapeEqual(kt, xt.Map.Key) {
+				return ast.Type{}, fmt.Errorf("line %d: map key must be %s, got %s", ast.ExprLine(v.Index), typeString(xt.Map.Key), typeString(kt))
+			}
+			// m[k] always returns V? (cascade_spec.md §4.5's comma-ok
+			// nullability), regardless of whether V itself was declared
+			// nullable — validateType already forbids V from being
+			// independently nullable, so this is the only nullability
+			// layer m[k] can ever have.
+			resultType := xt.Map.Value
+			resultType.Nullable = true
+			v.ResultType = resultType
+			return resultType, nil
+		}
+		if xt.Elem == nil {
 			return ast.Type{}, fmt.Errorf("line %d: cannot index into %s", v.Line, typeString(xt))
 		}
 		it, err := c.exprType(sc, v.Index)
@@ -1392,7 +1554,7 @@ func (c *checker) checkCallExprValue(sc *scope, call *ast.CallExpr) (ast.Type, e
 		if err != nil {
 			return ast.Type{}, err
 		}
-		if t.Nullable || (t.Name != "string" && t.Elem == nil) {
+		if t.Nullable || (t.Name != "string" && t.Elem == nil && t.Map == nil) {
 			return ast.Type{}, fmt.Errorf("line %d: len() does not support %s", call.Line, typeString(t))
 		}
 		return ast.Type{Name: "int"}, nil
@@ -1616,6 +1778,13 @@ func typeString(t ast.Type) string {
 	}
 	if t.Func != nil {
 		return funcTypeString(*t.Func)
+	}
+	if t.Map != nil {
+		base := "map<" + typeString(t.Map.Key) + ", " + typeString(t.Map.Value) + ">"
+		if t.Nullable {
+			return base + "?"
+		}
+		return base
 	}
 	if t.Nullable {
 		return t.Name + "?"
