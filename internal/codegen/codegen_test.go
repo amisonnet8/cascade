@@ -1342,8 +1342,12 @@ func main(): int {
 	return 0
 }
 `)
-	if !strings.Contains(ir, "CHSEND\t$1\t42\n") {
-		t.Fatalf("expected send(output, 42) inside 'numbers' to compile to CHSEND $1 42; got:\n%s", ir)
+	// Inside a stage body, send() compiles to a SEL between CASESEND (the
+	// real send) and a CASERECV on the hidden abort channel — a plain
+	// CHSEND would block forever if downstream ever aborts and nobody's
+	// left to receive (see pipeline.go's genSendCall).
+	if !strings.Contains(ir, "CASESEND\t$1\t42\t#") {
+		t.Fatalf("expected send(output, 42) inside 'numbers' to compile to a CASESEND $1 42 inside a SEL; got:\n%s", ir)
 	}
 }
 
@@ -1367,10 +1371,15 @@ func main(): int {
 	return 0
 }
 `)
-	if !strings.Contains(ir, "FUNC\t!numbers\t^ChanType1\t:\n\tDEFER\t?close\t$1\n") {
+	// Every source/stage/sink also gets two hidden trailing parameters
+	// (the abort-broadcast and close-once-guard channels, §9.4 — see
+	// genStageDecl), so FUNC's own declared parameter list is longer than
+	// just the user-written ones, but $1/$2 still refer to the same
+	// user-declared (output, in this case) parameters as before.
+	if !strings.Contains(ir, "FUNC\t!numbers\t^ChanType1\t^ChanType2\t^ChanType2\t:\n\tDEFER\t?close\t$1\n") {
 		t.Fatalf("expected 'numbers' (a source) to DEFER-close its own single (output) parameter as the first body instruction; got:\n%s", ir)
 	}
-	if !strings.Contains(ir, "FUNC\t!double\t^ChanType1\t^ChanType1\t:\n") || !strings.Contains(ir, "DEFER\t?close\t$2\n") {
+	if !strings.Contains(ir, "FUNC\t!double\t^ChanType1\t^ChanType1\t^ChanType2\t^ChanType2\t:\n") || !strings.Contains(ir, "DEFER\t?close\t$2\n") {
 		t.Fatalf("expected 'double' (a stage) to DEFER-close its second (output) parameter; got:\n%s", ir)
 	}
 	if strings.Contains(ir, "FUNC\t!printAll") && strings.Contains(ir[strings.Index(ir, "FUNC\t!printAll"):], "DEFER") {
@@ -1394,11 +1403,14 @@ func main(): int {
 }
 `)
 	printAllIR := ir[strings.Index(ir, "FUNC\t!printAll"):]
-	if !strings.Contains(printAllIR, "CHRECV\t%n_1\t%tmp_2\t$1\n") {
-		t.Fatalf("expected 'for n in input' to compile to a comma-ok CHRECV; got:\n%s", printAllIR)
+	// Inside a stage body, the receive is wrapped in a SEL alongside a
+	// CASERECV on the hidden abort channel (see pipeline.go's
+	// genForInChannelStmt) rather than a plain CHRECV.
+	if !strings.Contains(printAllIR, "CASERECV\t%n_1\t%tmp_2\t$1\t#") {
+		t.Fatalf("expected 'for n in input' to compile to a comma-ok CASERECV inside a SEL; got:\n%s", printAllIR)
 	}
 	if !strings.Contains(printAllIR, "IF\t%tmp_2\t#") {
-		t.Fatalf("expected the CHRECV's ok flag to drive the loop's IF; got:\n%s", printAllIR)
+		t.Fatalf("expected the CASERECV's ok flag to drive the loop's IF; got:\n%s", printAllIR)
 	}
 	if strings.Contains(printAllIR, "AGET") {
 		t.Fatalf("a channel for-in must not use AGET (that's the list form); got:\n%s", printAllIR)
@@ -1430,16 +1442,134 @@ func main(): int {
 	if !strings.Contains(mainIR, "CHMAKE\t%tmp_1\t^ChanType1\t0\n") || !strings.Contains(mainIR, "CHMAKE\t%tmp_2\t^ChanType1\t0\n") {
 		t.Fatalf("expected one CHMAKE per inter-stage channel; got:\n%s", mainIR)
 	}
-	if !strings.Contains(mainIR, "SPAWN\t!numbers\t%tmp_1\n") {
-		t.Fatalf("expected the source to be SPAWNed against the first channel; got:\n%s", mainIR)
+	// Every SPAWN/CALL to a source/stage/sink also carries the shared
+	// abort-broadcast and close-once-guard channels (§9.4) as two
+	// trailing arguments beyond the user-declared input/output ones —
+	// see genFreshAbortAndGuardChans/genPipelineStmt.
+	if !strings.Contains(mainIR, "SPAWN\t!numbers\t%tmp_1\t%tmp_3\t%tmp_4\n") {
+		t.Fatalf("expected the source to be SPAWNed against the first channel plus the abort/guard channels; got:\n%s", mainIR)
 	}
-	if !strings.Contains(mainIR, "SPAWN\t!double\t%tmp_1\t%tmp_2\n") {
-		t.Fatalf("expected the middle stage to be SPAWNed between both channels; got:\n%s", mainIR)
+	if !strings.Contains(mainIR, "SPAWN\t!double\t%tmp_1\t%tmp_2\t%tmp_3\t%tmp_4\n") {
+		t.Fatalf("expected the middle stage to be SPAWNed between both channels plus the abort/guard channels; got:\n%s", mainIR)
 	}
-	if !strings.Contains(mainIR, "CALL\t:\t!printAll\t%tmp_2\n") {
+	if !strings.Contains(mainIR, "CALL\t:\t!printAll\t%tmp_2\t%tmp_3\t%tmp_4\n") {
 		t.Fatalf("expected the sink to be called synchronously (not SPAWNed), blocking until the pipeline drains; got:\n%s", mainIR)
 	}
 	if strings.Contains(mainIR, "SPAWN\t!printAll") {
 		t.Fatalf("the sink must never be SPAWNed — the statement's own synchronous completion depends on calling it directly; got:\n%s", mainIR)
 	}
+}
+
+func TestGenerate_CollectSpawnsCollectorAndCHRECVsCommaOk(t *testing.T) {
+	ir := generate(t, `
+source numbers(output: chan<int>) {
+	send(output, 1)
+}
+func main(): int {
+	let results: []int? = numbers |> collect
+	if results is none {
+		return 1
+	}
+	return 0
+}
+`)
+	if !strings.Contains(ir, "SPAWN\t!__collect_1\t") {
+		t.Fatalf("expected collect to spawn a synthesized collector goroutine; got:\n%s", ir)
+	}
+	// The collector's own result channel is received from with a single
+	// comma-ok CHRECV — ok=false (channel closed with nothing sent) is
+	// what signals an aborted pipeline as `none` (cascade_spec.md §9.3/
+	// §9.4); ok=true carries the real collected list.
+	collectorIR := ir[strings.Index(ir, "FUNC\t!__collect_1"):]
+	if !strings.Contains(collectorIR, "SEL\n\tCASERECV\t%v\t%ok\t$1\t#") {
+		t.Fatalf("expected the collector to SEL-receive its input channel with comma-ok; got:\n%s", collectorIR)
+	}
+	if !strings.Contains(collectorIR, "CALL\t%result\t:\t?append\t%result\t%v\n") {
+		t.Fatalf("expected the collector to accumulate via raw append(); got:\n%s", collectorIR)
+	}
+	if !strings.Contains(collectorIR, "CHSEND\t$2\t%result\n") {
+		t.Fatalf("expected the collector to send its finished list out over its result channel; got:\n%s", collectorIR)
+	}
+	if !strings.Contains(collectorIR, "DEFER\t?close\t$2\n") {
+		t.Fatalf("expected the collector to DEFER-close its result channel (the abort-signals-none mechanism); got:\n%s", collectorIR)
+	}
+	assertLabelsResolve(t, ir)
+}
+
+func TestGenerate_AbortPrintsSignalsAndReturns(t *testing.T) {
+	ir := generate(t, `
+source numbers(output: chan<int>) {
+	abort("boom")
+}
+func main(): int {
+	let results: []int? = numbers |> collect
+	if results is none {
+		return 1
+	}
+	return 0
+}
+`)
+	numbersStart := strings.Index(ir, "FUNC\t!numbers")
+	numbersIR := ir[numbersStart : numbersStart+strings.Index(ir[numbersStart:], "ENDFUNC")]
+	if !strings.Contains(numbersIR, "CONCAT\t%tmp_") || !strings.Contains(numbersIR, `"abort: "`) {
+		t.Fatalf("expected abort() to prefix and print its message; got:\n%s", numbersIR)
+	}
+	if !strings.Contains(numbersIR, "CALL\t:\t?fmt.Println\t") {
+		t.Fatalf("expected abort() to print via fmt.Println; got:\n%s", numbersIR)
+	}
+	// The close-once guard: a non-blocking SEL (CASESEND with DEFAULT) on
+	// the guard channel, only the winner of which actually closes the
+	// shared abort-broadcast channel — see genAbortCall's doc for why a
+	// plain send can't safely broadcast to multiple concurrently-selecting
+	// stages, only a close can.
+	if !strings.Contains(numbersIR, "SEL\n\tCASESEND\t") || !strings.Contains(numbersIR, "\tDEFAULT\t#") {
+		t.Fatalf("expected abort() to use a non-blocking SEL+DEFAULT guard before closing; got:\n%s", numbersIR)
+	}
+	if !strings.Contains(numbersIR, "CALL\t:\t?close\t") {
+		t.Fatalf("expected abort()'s winning path to close the abort-broadcast channel; got:\n%s", numbersIR)
+	}
+	if !strings.Contains(numbersIR, "\tRET\n") {
+		t.Fatalf("expected abort() to unconditionally return from the enclosing stage; got:\n%s", numbersIR)
+	}
+	assertLabelsResolve(t, ir)
+}
+
+func TestGenerate_MergeSpawnsBothSourcesAndFanIn(t *testing.T) {
+	ir := generate(t, `
+source numsA(output: chan<int>) {
+	send(output, 1)
+}
+source numsB(output: chan<int>) {
+	send(output, 2)
+}
+func main(): int {
+	let combined: chan<int> = merge(numsA, numsB)
+	for v in combined {
+		print(string(v))
+	}
+	return 0
+}
+`)
+	mainIR := ir[:strings.Index(ir, "ENDFUNC")]
+	if !strings.Contains(mainIR, "SPAWN\t!numsA\t") || !strings.Contains(mainIR, "SPAWN\t!numsB\t") {
+		t.Fatalf("expected merge() to spawn both named sources; got:\n%s", mainIR)
+	}
+	if !strings.Contains(mainIR, "SPAWN\t!__merge_1\t") {
+		t.Fatalf("expected merge() to spawn a synthesized fan-in goroutine; got:\n%s", mainIR)
+	}
+	mergeIR := ir[strings.Index(ir, "FUNC\t!__merge_1"):]
+	// The nil-channel idiom: once an input is observed closed, its own
+	// channel variable is set to nil so its SEL case can never fire
+	// again, without needing to restructure the SEL itself (see
+	// genMergeFunc's doc) — and both going nil is what ends the loop.
+	if !strings.Contains(mergeIR, "EQ\t%doneA\t%chA\tnil\n") || !strings.Contains(mergeIR, "EQ\t%doneB\t%chB\tnil\n") {
+		t.Fatalf("expected the fan-in to detect each input going nil; got:\n%s", mergeIR)
+	}
+	if !strings.Contains(mergeIR, "SET\t%chA\tnil\n") || !strings.Contains(mergeIR, "SET\t%chB\tnil\n") {
+		t.Fatalf("expected the fan-in to nil out a closed input's own channel variable; got:\n%s", mergeIR)
+	}
+	if !strings.Contains(mergeIR, "SEL\n\tCASERECV\t%v\t%ok\t%chA\t#") {
+		t.Fatalf("expected the fan-in to SEL-receive from both inputs; got:\n%s", mergeIR)
+	}
+	assertLabelsResolve(t, ir)
 }

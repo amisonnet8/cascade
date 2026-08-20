@@ -2060,7 +2060,7 @@ func main(): int {
 			wantErr: "pipeline type mismatch",
 		},
 		{
-			name: "collect is not implemented yet",
+			name: "collect used as a bare statement is rejected (it only makes sense as a value)",
 			src: `
 source numbers(output: chan<int>) {
 	send(output, 1)
@@ -2070,7 +2070,7 @@ func main(): int {
 	return 0
 }
 `,
-			wantErr: "'collect' is not implemented yet (Step 13)",
+			wantErr: "a pipeline used as a statement must end with a sink",
 		},
 		{
 			name: "undefined source/stage/sink in a pipeline",
@@ -2097,5 +2097,241 @@ func main(): int {
 				t.Fatalf("Check() = %q, want error containing %q", err.Error(), tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestCheck_ValidCollect(t *testing.T) {
+	src := `
+source numbers(output: chan<int>) {
+	send(output, 1)
+}
+stage double(input: chan<int>, output: chan<int>) {
+	for n in input {
+		send(output, n * 2)
+	}
+}
+func main(): int {
+	let results: []int? = numbers |> double |> collect
+	if results is none {
+		return 1
+	}
+	for r in results {
+		print(string(r))
+	}
+	return 0
+}
+`
+	if err := check(t, src); err != nil {
+		t.Fatalf("Check() = %v, want nil", err)
+	}
+}
+
+func TestCheck_ValidAbort(t *testing.T) {
+	src := `
+source numbers(output: chan<int>) {
+	send(output, -1)
+}
+stage validate(input: chan<int>, output: chan<int>) {
+	for n in input {
+		if n < 0 {
+			abort("negative: " + string(n))
+		}
+		send(output, n)
+	}
+}
+sink printAll(input: chan<int>) {
+	for n in input {
+		print(string(n))
+	}
+}
+func main(): int {
+	numbers |> validate |> printAll
+	return 0
+}
+`
+	if err := check(t, src); err != nil {
+		t.Fatalf("Check() = %v, want nil", err)
+	}
+}
+
+func TestCheck_ValidMerge(t *testing.T) {
+	src := `
+source numsA(output: chan<int>) {
+	send(output, 1)
+}
+source numsB(output: chan<int>) {
+	send(output, 2)
+}
+func main(): int {
+	let combined: chan<int> = merge(numsA, numsB)
+	for v in combined {
+		print(string(v))
+	}
+	return 0
+}
+`
+	if err := check(t, src); err != nil {
+		t.Fatalf("Check() = %v, want nil", err)
+	}
+}
+
+func TestCheck_CollectAbortMergeErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		src     string
+		wantErr string
+	}{
+		{
+			name: "collect used as a value must be a valid element-carrying chain",
+			src: `
+stage double(input: chan<int>, output: chan<int>) {
+	for n in input {
+		send(output, n * 2)
+	}
+}
+func main(): int {
+	let results: []int? = double |> collect
+	return 0
+}
+`,
+			wantErr: "a pipeline must begin with a source",
+		},
+		{
+			name: "a sink used in value position is rejected in favor of collect",
+			src: `
+source numbers(output: chan<int>) {
+	send(output, 1)
+}
+sink printAll(input: chan<int>) {
+	for n in input {
+		print(string(n))
+	}
+}
+func main(): int {
+	let x: []int? = numbers |> printAll
+	return 0
+}
+`,
+			wantErr: "a pipeline used as a value must end with 'collect'",
+		},
+		{
+			name: "abort outside a stage body is rejected",
+			src: `
+func main(): int {
+	abort("oops")
+	return 0
+}
+`,
+			wantErr: "abort() can only be called inside a source/stage/sink body",
+		},
+		{
+			name: "abort requires exactly 1 argument",
+			src: `
+source numbers(output: chan<int>) {
+	abort()
+}
+func main(): int {
+	return 0
+}
+`,
+			wantErr: "abort() expects exactly 1 argument",
+		},
+		{
+			name: "merge requires exactly 2 arguments",
+			src: `
+source numsA(output: chan<int>) {
+	send(output, 1)
+}
+func main(): int {
+	let combined: chan<int> = merge(numsA)
+	return 0
+}
+`,
+			wantErr: "merge() expects exactly 2 arguments",
+		},
+		{
+			name: "merge arguments must name declared sources",
+			src: `
+stage double(input: chan<int>, output: chan<int>) {
+	for n in input {
+		send(output, n * 2)
+	}
+}
+func main(): int {
+	let x: int = 1
+	let combined: chan<int> = merge(x, double)
+	return 0
+}
+`,
+			wantErr: "merge() argument 1 must name a declared source",
+		},
+		{
+			name: "merge requires both sources to carry the same type",
+			src: `
+source numsA(output: chan<int>) {
+	send(output, 1)
+}
+source strs(output: chan<string>) {
+	send(output, "x")
+}
+func main(): int {
+	let combined: chan<int> = merge(numsA, strs)
+	return 0
+}
+`,
+			wantErr: "merge() requires both sources to carry the same type",
+		},
+		{
+			name: "a channel-typed let without a merge initializer is rejected",
+			src: `
+source numsA(output: chan<int>) {
+	send(output, 1)
+}
+func main(): int {
+	let x: chan<int> = numsA
+	return 0
+}
+`,
+			wantErr: "a channel-typed 'let' is only supported with a merge(...) initializer",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := check(t, tt.src)
+			if err == nil {
+				t.Fatalf("Check() = nil, want error containing %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Check() = %q, want error containing %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestCheck_NullableListNarrowingPreservesElemType is a regression test
+// for a bug found while building Step 13's own worked example
+// (cascade_spec.md §15's collect + narrowing combination):
+// narrowedVarInfo used to reconstruct a narrowed variable's type as
+// ast.Type{Name: orig.Type.Name, Nullable: false}, which silently
+// dropped Elem for a nullable *list* (Name is empty for a list type) —
+// producing a broken, shapeless type once narrowed, so using the
+// narrowed list afterward (indexing, for-in, passing to another
+// function) failed as if it had no type at all.
+func TestCheck_NullableListNarrowingPreservesElemType(t *testing.T) {
+	src := `
+func main(): int {
+	let xs: []int? = [1, 2, 3]
+	if xs is none {
+		return 1
+	}
+	for x in xs {
+		print(string(x))
+	}
+	return 0
+}
+`
+	if err := check(t, src); err != nil {
+		t.Fatalf("Check() = %v, want nil", err)
 	}
 }

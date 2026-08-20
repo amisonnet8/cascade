@@ -132,24 +132,14 @@ amivm <IRファイルパス> [-o|--output <出力ファイルパス>] [-v|--verb
 | `FNTYPE` `CLOS` `ENDCLOS` | `func(...): R`型・クロージャーリテラル(8.3節)。Step 9で実装・実地検証済み | 確定 |
 | `CHTYPE` `CHMAKE` `CHSEND` `CHRECV` | `chan<T>`・`send()`・`for v in someChannel`(9節) | 確定 |
 | `SPAWN` | `source`/`stage`/`sink`を`|>`で連結した際の各段の並行実行(9.2節) | 確定 |
-| `SEL` `CASESEND` `CASERECV` `DEFAULT` | `merge()`のファンイン実装(9.5節)。2チャネルのどちらか先に来た方を受け取るselect相当 | 確定(実装方針は下記オープン課題参照) |
+| `SEL` `CASESEND` `CASERECV` `DEFAULT` | `merge()`のファンイン実装(9.5節。2チャネルのどちらか先に来た方を受け取るselect相当)に加え、`abort()`(9.4節)の中断通知・各ステージの`for-in`/`send()`の中断監視でも使用。Step 13で実装・実地検証済み(下記「確定した設計判断」参照) | 確定 |
 | `DEFER` | ユーザー向け構文としては存在しない。`source`/`stage`のFUNC本体先頭で`DEFER ?close $N`(出力チャネル)を無条件に発行し、関数(=ステージ)がどの経路で終了しても出力チャネルを自動closeして下流の`for-in`を終了させる、というコード生成側の内部利用。Step 12で実装・実地検証済み(下記「確定した設計判断」参照) | 確定 |
 
 ## オープンな設計課題(実装前に方針を確定させ、確定次第この節を書き換える)
 
 Seedと異なりCascadeは複数ファイル/パッケージ・null許容型・並行パイプラインという、Seedに無かった複雑さを持つ。以下は現時点で未確定の、最初に潰すべき設計課題。**[[Seed]]の「確定した設計判断」節(`seed/CLAUDE.md`)に倣い、決まったらここに確定内容として書き残すこと。仮説のまま放置しない。**
 
-### 1. パイプライン(9節)の並行実行モデル(collect/abort/mergeのみ残課題)
-
-最も設計コストが高い箇所。基礎部分(source/stage/sink・`|>`連結・send・for-inでのチャネル走査)はStep 12で確定・実装済み(下記「確定した設計判断」参照)。残るのは以下の3つ(Step 13で確定させる)。`amivm/test_ir/11_spawn_channel_sel.ir`を実装前に必ず読むこと。
-
-- `collect`(9.3節): 終端チャネルを受信し続けて`[]T`に溜め込む専用のcollector goroutineを内部生成し、結果を`main`側が別チャネル経由で同期的に受け取る、という形が候補
-- `abort`(9.4節): 全ステージを即座に止める必要がある。**候補**: closeすることが一度きりの安全なブロードキャストになるGoの性質を使い、専用の`chan<bool>`(またはstring)をcloseすることで中断を通知し、各ステージの`for-in`ループを`SEL`(`CASERECV input` vs `CASERECV abortChan`)に変える
-- `merge`(9.5節): 2入力チャネルを`SEL`の`CASERECV`×2でファンインする専用goroutineとして実装する候補
-
-いずれも**実装したら`amivm`→`go build`→実行まで必ず確認する**(seed_implementation_notes.md §6.1の教訓)。並行処理はロジック上正しく見えても実地検証なしでは信用しない。
-
-### 2. パッケージ/モジュール解決(11節)
+### パッケージ/モジュール解決(11節)
 
 Seedには存在しなかった、Cascade固有の追加コンパイル工程。`import`文の解決・循環import検出(11.5節)・パッケージ内の複数ファイル統合(11.1節)は、字句解析・構文解析より**前**、あるいはAST構築後・sema前の独立したフェーズ(パッケージローダー)として実装する必要がある。AMIVM-IRへ落とす際の識別子一意化(`パッケージ名_識別子`、11.6節)はcodegenの命名規則に組み込む。
 
@@ -318,6 +308,22 @@ Cascadeの`func main(): int`をamivmの`!main`へ直接対応させることは�
 
 `examples/12_pipelines.cas`(`numbers`/`double`/`toString`/`printAll`という4段パイプライン——`source`→`stage`→`stage`→`sink`——を`|>`で連結、`range`で生成した`[]int`を`send`で流し込み、`SPAWN`された3段と同期呼び出しされる`sink`が実際に協調動作することを実行時に確認)で`amivm`→`go build`→実行まで確認済み。
 
+### パイプライン拡張(collect/abort/merge)の設計、パイプラインの並行実行モデルの最終確定(Step 13)
+
+**`abort`(9.4節)の中断通知は、CLAUDE.mdの元の候補(`close`一発)ではなく、`close`を「一度だけ」安全に呼ぶための専用ガードチャネルを追加する2チャネル構成に変更して確定した。** 素朴に「`chan<bool>`を`close`するだけ」という候補は、**複数のステージが同時に`abort()`を呼ぶと`close of closed channel`でGoランタイムがパニックする**という欠陥を設計段階で発見した(実装前のレビューで気づいた——「実装したら実地検証」の一歩手前で、想定される並行アクセスパターンを机上で洗い出した結果)。解決策として、`abort`用のブロードキャストチャネル(`abortChan`、一度closeされたら二度と送信されない。`for-in`/`send`の`SEL`はこれを`CASERECV`で監視するだけで、closeが再現なく何度でも「即座に受信可能」であるというGoの性質をそのまま使う)とは別に、**「closeする権利を1つだけ配る」ための専用ガードチャネル(`guardChan`、バッファ1)を追加**した。`abort()`は`guardChan`への非ブロッキング送信(`SEL`+`CASESEND`+`DEFAULT`)を試み、勝った(送信できた)ゴルーチンだけが実際に`abortChan`を`close`する——`guardChan`自体は一切受信されないため、バッファが1つ埋まった時点で以降の送信は全て`DEFAULT`に落ちて安全に無視される。この設計により、`source`/`stage`/`sink`は全て**2つ**の隠しパラメータ(`abortChan`・`guardChan`)を無条件に追加で受け取る形になった(ユーザーの書くCascadeシグネチャには一切現れない、`DEFER ?close`と同じ「コード生成側だけの内部機構」)。
+
+**`for-in`(チャネル走査)と`send()`は、ステージ本体の中でだけ`SEL`ベースの中断監視版にコンパイルされる。** `funcGen`に`abortChanOp`/`guardChanOp`という2つの新フィールドを追加し、`genStageDecl`だけがこれをセットする(通常の`func`本体では空文字列のまま)。`genForInChannelStmt`/`genSendCall`はこのフィールドが空かどうかで2つの生成パスに分岐する: ステージ内では`SEL`(`CASERECV`/`CASESEND`いずれかの本来の操作 vs `abortChan`の`CASERECV`)に包み、中断を検知したら**即座に`RET`**する。ステージ外(例えば`merge()`の結果チャネルを`main`から直に読む場合)では中断機構自体が存在しないため、Step 12そのままの素朴な`CHRECV`/`CHSEND`にフォールバックする。**`send()`側も中断監視が必要**だという点は設計段階で見落としかけた——`CHMAKE`のバッファサイズが`0`(Step 12の選択)である以上、下流が中断で先に終了した場合、上流が`send()`でブロックしたまま永遠に取り残される(デッドロック)ため、受信側だけでなく送信側にも同じ中断監視が要ることに気づいた。実際に100件生成する`source`に対し6件目で`abort`する`stage`を実地検証し、`source`側が正しく`send()`のSELで中断を検知して即座に終了することを確認した(該当箇所が未検証のまま出荷されていたら本番でハングするクラスのバグだった)。
+
+**`abort(message)`は、メッセージの送り先が仕様に一切定義されていないため、`fmt.Println`で標準出力へ`"abort: " + message`として出力する、という実装判断を下した。** 9.4節は"エラー時の終了"としか説明しておらず、メッセージがどこへ届くべきかについて例も規定も無い。何も出力しない案(黙って握りつぶす)はデバッグ時に情報が失われるため却下し、`print`と同じ`?fmt.Println`経路に素直に乗せることにした——新しい出力先(`os.Stderr`等)を導入すると、`?os.Stderr`をCALLの通常の`value`オペランドとして渡す手段が無い(amivm-IRの`value`カテゴリは`?xxx`形式を含まない——`?xxx`は`callname`/`DEFER`/`SPAWN`の呼び出し対象専用)という制約にも実装中に気づき、標準出力への出力を選んだことでこの問題自体を回避できた。**`abort()`はメッセージ出力に続けて無条件に`RET`する**(9.4節の`validate`の例——`if n < 0 { abort(...) }`の直後に`send(output, n)`が続く——が、`abort`を呼んだらそのステージの残りの処理を一切実行してはならないことを暗に要求しているため、Cascade側の構文には現れない暗黙の早期returnをコード生成が挿入する)。
+
+**`collect`(9.3節)は、CLAUDE.mdの候補通り「専用のcollector goroutineを内部生成し、結果を別チャネル経由で同期的に受け取る」という設計で確定した。** `|>`チェーンの終端が`collect`の場合、それまでの`source`/`stage`群を通常の`|>`文と全く同じ手順で`SPAWN`した上で、コード生成が動的に合成する`!__collect_N`という専用`FUNC`(ユーザーの書いたCascadeソースには一切対応物が無い、`typeRegistry`に新設した`collectorFuncs`という蓄積機構経由でトップレベルFUNC群の末尾にまとめて出力される)を最終段の出力チャネルへ`SPAWN`する。このcollectorは受信した値をGo生ネイティブの`append`(Cascade標準の`append`組み込みとは違い、常に再確保する設計にはしていない——このアキュムレータは他のどこからも参照されない完全にプライベートな一時変数なので、エイリアシングの心配が構造的に発生しない)で溜め込み、入力チャネルがcloseされたら結果チャネルへ`CHSEND`して`RET`する。**`abort`されると`none`になる(9.3節の規定)という挙動は、追加のフラグや専用命令を一切使わず、既存の`DEFER ?close`とcomma-ok受信の組み合わせだけで自然に得られた**——collectorが`abort`検知で(結果を送らずに)`RET`すると、`DEFER`していた結果チャネルのcloseだけが起こり、呼び出し元の`CHRECV`のcomma-ok結果が`ok=false`になる。これは既存のnullable機構(値+issetペア)にそのまま合流するため、`genNullableOperands`に`*ast.PipelineExpr`用の分岐を1つ追加するだけで、`[]T?`という戻り値の型が持つ「成功/中断」の二値性を新しい概念を一切導入せずに表現できた。
+
+**`merge`(9.5節)は、仕様の`merge(channelA, channelB)`という最小限の例だけでは「channelA/channelBはどこから来るのか」が構築不能という問題に設計段階で突き当たり、判断を下して確定した。** Cascadeには`CHMAKE`/`SPAWN`をユーザーが直接書く手段が無く(`|>`が内部で使うだけの隠し機構)、`chan<T>`型の値を得る唯一の方法は`source`/`stage`/`sink`のパラメータ経由か`merge`自身の戻り値だけである。この制約下で「既存の2つのチャネル値を受け取って合流させる」という一般的な関数として実装するには、呼び出し元がまず何らかの方法で2つの独立したチャネルを用意できる必要があるが、Step 12の`|>`文法(`source`から始まり`sink`/`collect`で終わる単一の直線的な連結のみ)ではその手段が無い。**この不整合を解決するため、`merge`の2引数は「チャネルの値」ではなく「宣言済みの`source`の名前」として扱う設計に決めた**——`merge(sourceA, sourceB)`は、`sourceA`・`sourceB`という名前をsemaが(通常のスコープ変数としてではなく)`c.stages`テーブルから直接解決し(`checkCallExprValue`の専用分岐。`sourceA`はそもそも通常の変数として存在しないため、既存の`exprType`に一切通さない)、codegenは両方を自前でSPAWNしてから、2入力を1出力へ束ねる専用のファンインgoroutine(collectorと同様、`typeRegistry`に新設した`mergeFuncs`蓄積機構経由でトップレベルFUNC群として出力される`!__merge_N`)へ接続する。ファンインgoroutineは**「片方のチャネルがcloseされたら、そのチャネル変数自体をGoの`nil`にセットし、以降`SEL`のその節を実質的に無効化する」という定番のnilチャネルイディオムで実装した**(`EQ chA nil`で判定し、両方nilになったら終了)——`SEL`の節自体を動的に増減させる手段がAMIVM-IRには無いため、この「nilにして事実上無効化する」手法が唯一の自然な実装方法だった。`merge`自身のSPAWNする2つの`source`は、この呼び出し1回に閉じた独立の`abortChan`/`guardChan`ペアを持つ(呼び出し元が既にステージの中にいて既存の中断機構を持っていたとしても、それを再利用せず常に新規生成する)——**これは意図的なスコープ限定であり、「`merge`された片方の`source`で`abort()`を呼んでも、もう片方や外側のパイプラインには伝播しない」という制約を残したままにしている**(仕様例にこの組み合わせが無いため、Step 7以来の「仕様に無い組み合わせは先送りし、曖昧な動作にしない」方針に沿って、正しく動くが範囲の狭い実装にとどめた)。
+
+**副産物のバグ修正(6件目)**: 実装・検証の過程で2つの既存バグを発見・修正した。(1) `narrowedVarInfo`(if文の条件からの型絞り込み、Step 5由来。Step 8でポインタについて一度修正済み)が、絞り込み後の型を`ast.Type{Name: orig.Type.Name, Nullable: false}`という形で再構築する際、**リスト型・map型は`Name`が空文字列で`Elem`/`Map`フィールドに情報を持つことを全く考慮していなかった**——Step 8で発見したポインタ版と全く同じ根本原因のバグが、リスト・mapについては未発見のまま残っていた。仕様§15の完成サンプル(`collect`の結果`[]string?`を`is none`で絞り込んで`map()`/`for-in`に渡す)を自前の検証例として実装しようとして初めて発覚した——Step 2〜12のどのテストも「nullableなリスト/mapを絞り込んで使う」パターンを一度も検証していなかったため、6ステップ以上気づかれずに残っていたことになる。修正は「`Name`だけを個別にコピーする」のをやめ、「型全体をコピーしてから`Nullable`だけ`false`に上書きする」(`narrowed.Type = orig.Type; narrowed.Type.Nullable = false`)という、Elem/Map/Chan問わず正しく動く一般的な形に直した。(2) `typeGiven`(型注釈が明示されているかを判定するヘルパー、Step 6由来)が`t.Chan`をチェックしておらず、`let x: chan<int> = merge(...)`のような宣言が「型注釈なし、初期化式から推論しようとして`merge(...)`の特別扱いに一切到達しないまま`undefined name`」という誤ったエラーになっていた——`t.Elem`/`t.Ptr`/`t.Map`と同様に`t.Chan != nil`もチェックするよう修正した。いずれも該当する新規サンプル(後述)の実地検証中に発見し、`TestCheck_NullableListNarrowingPreservesElemType`等の回帰テストを追加した。
+
+`examples/13_pipeline_extensions.cas`(センサー読み取りの構造体パイプライン(`readings`→`validOnly`→`format`→`collect`、null許容リストの絞り込みを経て出力)・2つの`source`を`merge`でファンインして合計を求める例・負の値を検出して`abort`し`collect`が`none`を返すことを確認する例、の3パターンを1ファイルに統合)で`amivm`→`go build`→実行まで確認済み。加えて、仕様15節の完成サンプルプログラム自体も個別に実地検証し、`collect`・絞り込み・`map()`・`for-in`の組み合わせが仕様の記述通りに動作することを確認した。
+
 ## 意味検証の責任分担(重要)
 
 型の整合性・未定義識別子・関数シグネチャの不一致・メソッドの存在チェックなどは、**amivm側では検証せず`go/types`に全面的に委ねている。** amivmが保証するのは「構文的に妥当なGoコードを出力すること」だけ。
@@ -389,9 +395,9 @@ Seedは7〜8ステップ(git履歴上は「Step1: hello-worldパイプライン�
 | 9 ✅ | クロージャー・高階関数 | クロージャーリテラル(8.3節)、`filter`/`map`/`reduce`(8.4節)、参照捕捉の実地検証 | `FNTYPE` `CLOS` `ENDCLOS` | — |
 | 10 ✅ | map(`map<K, V>`) | リテラル・`m[k]`(`V?`化)・`m[k]=v`・`delete`・`for k, v in m` | `MPTYPE` `MPMAKE` `MSET` `MGET` | `cascadert`ランタイムの初回導入(下記「確定した設計判断」参照) |
 | 11 ✅ | エラー処理 | `error`型・`(T, error?)`規約・後置`?`のsema展開(8.6節) | (新規命令なし。`STTYPE`+`IF`+`RET`の組み合わせ) | `error`型の表現を確定(下記「確定した設計判断」参照。旧「オープンな設計課題」課題2) |
-| 12 ✅ | パイプライン基礎 | `source`/`stage`/`sink`、`chan<T>`、`send`、`for v in channel`、`\|>`連結(9.1/9.2節) | `CHTYPE` `CHMAKE` `CHSEND` `CHRECV` `SPAWN` `DEFER` | 課題1(並行実行モデル)の一次決定。基礎部分を確定・実装(下記「確定した設計判断」参照。collect/abort/mergeはStep 13へ) |
-| 13 | パイプライン拡張(collect/abort/merge) | `collect`(9.3節)・`abort`(9.4節)・`merge`(9.5節) | `SEL` `CASESEND` `CASERECV` `DEFAULT` `ENDSEL` `DEFER` | 課題1の最終確定 |
-| 14 | パッケージ/複数ファイル | ディレクトリ=パッケージの統合(11.1節)、`import`/`pub`(11.2/11.3節)、循環import検出(11.5節)、識別子一意化(11.6節) | (新規命令なし。codegenの命名規則) | 課題2(パッケージ/モジュール解決)の確定 |
+| 12 ✅ | パイプライン基礎 | `source`/`stage`/`sink`、`chan<T>`、`send`、`for v in channel`、`\|>`連結(9.1/9.2節) | `CHTYPE` `CHMAKE` `CHSEND` `CHRECV` `SPAWN` `DEFER` | パイプラインの並行実行モデルの一次決定。基礎部分を確定・実装(下記「確定した設計判断」参照。collect/abort/mergeはStep 13へ) |
+| 13 ✅ | パイプライン拡張(collect/abort/merge) | `collect`(9.3節)・`abort`(9.4節)・`merge`(9.5節) | `SEL` `CASESEND` `CASERECV` `DEFAULT` `ENDSEL` | パイプラインの並行実行モデルを最終確定(下記「確定した設計判断」参照) |
+| 14 | パッケージ/複数ファイル | ディレクトリ=パッケージの統合(11.1節)、`import`/`pub`(11.2/11.3節)、循環import検出(11.5節)、識別子一意化(11.6節) | (新規命令なし。codegenの命名規則) | パッケージ/モジュール解決(下記「オープンな設計課題」参照)の確定 |
 | 15 | CLI・配布 | `cascade build/run/emit-ir/emit-go/help`、`cascadert`の`go:embed`配布、README作成 | — | — |
 
 特にStep4(ビット演算)・Step8(ポインタ・構造体)・Step9(クロージャー)・Step10(map)・Step12/13(チャネル・SPAWN・SEL)はSeedで未実証だった命令なので、「ロジック上正しそうに見える」だけで次のステップへ進まないこと。上記「オープンな設計課題」の各項目は、対応するステップ着手時に方針を確定し、その節を書き換える(仮説のまま放置しない)。

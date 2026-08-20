@@ -111,6 +111,14 @@ type checker struct {
 	// closureDepth) so a closure's own result types don't leak back out
 	// to whatever encloses it.
 	currentFuncResults []ast.Type
+
+	// inStageBody is true while checking a source/stage/sink's own body
+	// (set/cleared by checkStageBody) — abort() (§9.4) requires this,
+	// since codegen's own abort-broadcast channel only exists as an
+	// implicit parameter on a compiled source/stage/sink FUNC (see
+	// CLAUDE.md's "確定した設計判断" for Step 13): calling abort() from an
+	// ordinary function would have no channel to signal on at all.
+	inStageBody bool
 }
 
 // errorStructDecl is the built-in `error` type's synthetic struct
@@ -147,6 +155,8 @@ var reservedBuiltinNames = map[string]bool{
 	"filter": true,
 	"reduce": true,
 	"delete": true,
+	"abort":  true,
+	"merge":  true,
 }
 
 // Check validates f. cascade_spec.md §12 requires exactly one `main`
@@ -427,7 +437,11 @@ func (c *checker) validateChanParamType(t ast.Type, line int) (ast.Type, error) 
 // parameters (cascade_spec.md §9.1) — mirrors checkFuncBody, except a
 // source/stage/sink never returns a value (want is nil, so a bare
 // `return` is the only form checkReturnStmt will accept) and has no
-// receiver.
+// receiver. c.inStageBody is set for the duration (mirroring
+// closureDepth's save/restore pattern), since abort() (§9.4) is only
+// meaningful — and only compilable, codegen needs an abort channel that
+// only a source/stage/sink actually has — from inside one of these
+// bodies.
 func (c *checker) checkStageBody(sd *ast.StageDecl) error {
 	sc := newScope(nil)
 	for _, p := range sd.Params {
@@ -436,6 +450,8 @@ func (c *checker) checkStageBody(sd *ast.StageDecl) error {
 		}
 	}
 	c.currentFuncResults = nil
+	c.inStageBody = true
+	defer func() { c.inStageBody = false }()
 	for _, stmt := range sd.Body {
 		if err := c.checkStmt(sc, stmt, nil, 0, 0); err != nil {
 			return err
@@ -444,44 +460,93 @@ func (c *checker) checkStageBody(sd *ast.StageDecl) error {
 	return nil
 }
 
-// checkPipelineStmt validates a `|>`-chained pipeline statement
-// (cascade_spec.md §9.2): the first name must be a declared source, the
-// last a declared sink, every name in between a declared stage, and each
-// adjacent pair's channel element types must match exactly (Cascade never
-// does implicit conversion — the same rule every other type check in this
-// compiler follows). The value-producing `collect` terminal (§9.3) is
-// rejected outright here with an explicit "not implemented yet" error
-// (see ast.PipelineStmt's doc) rather than silently mistyped as an
-// undefined sink.
-func (c *checker) checkPipelineStmt(stmt *ast.PipelineStmt) error {
-	if len(stmt.Stages) < 2 {
-		return fmt.Errorf("line %d: a pipeline needs at least a source and a sink", stmt.Line)
+// validatePipelineStages validates every stage but the last in a
+// `|>`-chained pipeline (cascade_spec.md §9.2) — stages[0] must be a
+// declared source, stages[1:len-1] must each be a declared stage, and
+// each adjacent pair's channel element types must match exactly (Cascade
+// never does implicit conversion — the same rule every other type check
+// in this compiler follows). The final entry is deliberately left
+// unchecked here: a sink (checkPipelineStmt) and the literal `collect`
+// (checkPipelineCollectExpr) need different validation, so each caller
+// checks stages[len-1] itself once this returns. Returns the last
+// checked stage's own OutputElem — what the (as yet unchecked) final
+// entry must itself accept as input.
+func (c *checker) validatePipelineStages(stages []ast.PipelineStageRef) (lastOutputElem ast.Type, err error) {
+	if len(stages) < 2 {
+		return ast.Type{}, fmt.Errorf("line %d: a pipeline needs at least a source and a sink/collect", stages[0].Line)
 	}
-	for i, ref := range stmt.Stages {
-		if ref.Name == "collect" {
-			return fmt.Errorf("line %d: 'collect' is not implemented yet (Step 13)", ref.Line)
-		}
+	prefix := stages[:len(stages)-1]
+	for i, ref := range prefix {
 		sig, ok := c.stages[ref.Name]
 		if !ok {
-			return fmt.Errorf("line %d: undefined source/stage/sink %q", ref.Line, ref.Name)
+			return ast.Type{}, fmt.Errorf("line %d: undefined source/stage/sink %q", ref.Line, ref.Name)
 		}
-		switch {
-		case i == 0 && sig.Kind != ast.SourceStage:
-			return fmt.Errorf("line %d: a pipeline must begin with a source, got %q", ref.Line, ref.Name)
-		case i == len(stmt.Stages)-1 && sig.Kind != ast.SinkStage:
-			return fmt.Errorf("line %d: a pipeline used as a statement must end with a sink (%q is not one) — use 'collect' to receive a value instead (not yet implemented, Step 13)", ref.Line, ref.Name)
-		case i > 0 && i < len(stmt.Stages)-1 && sig.Kind != ast.MiddleStage:
-			return fmt.Errorf("line %d: only a stage may appear in the middle of a pipeline, got %q", ref.Line, ref.Name)
-		}
-		if i > 0 {
-			prev := stmt.Stages[i-1]
-			prevSig := c.stages[prev.Name]
-			if !typeShapeEqual(prevSig.OutputElem, sig.InputElem) {
-				return fmt.Errorf("line %d: pipeline type mismatch: %q outputs chan<%s> but %q expects chan<%s>", ref.Line, prev.Name, typeString(prevSig.OutputElem), ref.Name, typeString(sig.InputElem))
+		if i == 0 {
+			if sig.Kind != ast.SourceStage {
+				return ast.Type{}, fmt.Errorf("line %d: a pipeline must begin with a source, got %q", ref.Line, ref.Name)
 			}
+			continue
+		}
+		if sig.Kind != ast.MiddleStage {
+			return ast.Type{}, fmt.Errorf("line %d: only a stage may appear in the middle of a pipeline, got %q", ref.Line, ref.Name)
+		}
+		prev := prefix[i-1]
+		prevSig := c.stages[prev.Name]
+		if !typeShapeEqual(prevSig.OutputElem, sig.InputElem) {
+			return ast.Type{}, fmt.Errorf("line %d: pipeline type mismatch: %q outputs chan<%s> but %q expects chan<%s>", ref.Line, prev.Name, typeString(prevSig.OutputElem), ref.Name, typeString(sig.InputElem))
 		}
 	}
+	last := prefix[len(prefix)-1]
+	return c.stages[last.Name].OutputElem, nil
+}
+
+// checkPipelineStmt validates a `|>`-chained pipeline used as a bare
+// statement (cascade_spec.md §9.2): everything validatePipelineStages
+// checks, plus its own final entry must be a declared sink (the literal
+// `collect`, §9.3, only makes sense as a value — see
+// checkPipelineCollectExpr — so it's rejected here with a message
+// pointing at that alternative instead).
+func (c *checker) checkPipelineStmt(expr *ast.PipelineExpr) error {
+	outputElem, err := c.validatePipelineStages(expr.Stages)
+	if err != nil {
+		return err
+	}
+	last := expr.Stages[len(expr.Stages)-1]
+	if last.Name == "collect" {
+		return fmt.Errorf("line %d: a pipeline used as a statement must end with a sink — use 'collect' in an expression instead (e.g. 'let x = ... |> collect')", last.Line)
+	}
+	sig, ok := c.stages[last.Name]
+	if !ok {
+		return fmt.Errorf("line %d: undefined source/stage/sink %q", last.Line, last.Name)
+	}
+	if sig.Kind != ast.SinkStage {
+		return fmt.Errorf("line %d: a pipeline used as a statement must end with a sink, got %q", last.Line, last.Name)
+	}
+	if !typeShapeEqual(outputElem, sig.InputElem) {
+		return fmt.Errorf("line %d: pipeline type mismatch: outputs chan<%s> but %q expects chan<%s>", last.Line, typeString(outputElem), last.Name, typeString(sig.InputElem))
+	}
 	return nil
+}
+
+// checkPipelineCollectExpr validates a `|>`-chained pipeline used as a
+// value, ending in the built-in `collect` (cascade_spec.md §9.3):
+// everything validatePipelineStages checks, plus its own final entry
+// must be exactly the literal "collect" (a sink used here is rejected
+// with a message pointing at the statement form instead). Returns —and
+// records onto expr.ResultType — the nullable list `[]T?` collect
+// produces, T being the pipeline's own carried element type.
+func (c *checker) checkPipelineCollectExpr(expr *ast.PipelineExpr) (ast.Type, error) {
+	outputElem, err := c.validatePipelineStages(expr.Stages)
+	if err != nil {
+		return ast.Type{}, err
+	}
+	last := expr.Stages[len(expr.Stages)-1]
+	if last.Name != "collect" {
+		return ast.Type{}, fmt.Errorf("line %d: a pipeline used as a value must end with 'collect' (e.g. inside a 'let') — %q is a sink, only valid as a bare statement", last.Line, last.Name)
+	}
+	resultType := ast.Type{Elem: &outputElem, Nullable: true}
+	expr.ResultType = resultType
+	return resultType, nil
 }
 
 // validateType reports whether t names a type sema recognizes: a builtin
@@ -616,8 +681,6 @@ func (c *checker) checkStmt(sc *scope, stmt ast.Stmt, want []ast.Type, loopDepth
 		return c.checkSwitchStmt(sc, s, want, loopDepth, breakDepth)
 	case *ast.ForInStmt:
 		return c.checkForInStmt(sc, s, want, loopDepth, breakDepth)
-	case *ast.PipelineStmt:
-		return c.checkPipelineStmt(s)
 	case *ast.BreakStmt:
 		if breakDepth == 0 {
 			return fmt.Errorf("line %d: break outside of a loop or switch", s.Line)
@@ -733,7 +796,13 @@ func narrowedVarInfo(sc *scope, cond ast.Expr, wantNot bool) (name string, info 
 		return "", varInfo{}, false
 	}
 	narrowed := orig
-	narrowed.Type = ast.Type{Name: orig.Type.Name, Nullable: false}
+	// Copy the whole type, not just Name — an earlier version reconstructed
+	// ast.Type{Name: orig.Type.Name, Nullable: false} here, which silently
+	// dropped Elem/Map for a nullable list/map (Name is empty for both),
+	// producing a broken, shapeless ast.Type{} once narrowed. Only Nullable
+	// itself needs to flip; every other field (Elem, Map, Name for a
+	// scalar/struct) carries over unchanged.
+	narrowed.Type.Nullable = false
 	return id.Name, narrowed, true
 }
 
@@ -909,6 +978,14 @@ func (c *checker) checkIncDecStmt(sc *scope, stmt *ast.IncDecStmt) error {
 // §4.2) and records its resolved type both in sc (for later statements to
 // look up) and on the AST node itself (ResolvedType, so codegen doesn't
 // have to re-infer it — see LetDecl's doc comment).
+// isMergeCall reports whether e is exactly a merge(...) call (cascade_spec.md
+// §9.5) — the one expression shape checkLetDecl allows into a
+// channel-typed 'let' (see its own doc for why).
+func isMergeCall(e ast.Expr) bool {
+	call, ok := e.(*ast.CallExpr)
+	return ok && call.Receiver == nil && call.Callee == "merge"
+}
+
 func (c *checker) checkLetDecl(sc *scope, decl *ast.LetDecl) error {
 	if decl.Const && decl.Init == nil {
 		return fmt.Errorf("line %d: 'const %s' requires an initializer", decl.Line, decl.Name)
@@ -928,6 +1005,25 @@ func (c *checker) checkLetDecl(sc *scope, decl *ast.LetDecl) error {
 			return err
 		}
 		typ = t
+	} else if typ.Chan != nil {
+		// chan<T> is otherwise rejected everywhere by validateType (see
+		// its own Chan case) — a `let` with an explicit chan<T> type is
+		// the one deliberate exception, and only when initialized from
+		// merge(...) specifically (cascade_spec.md §9.5's own example:
+		// `let combined: chan<int> = merge(channelA, channelB)`), the
+		// only builtin that actually produces a chan<T> value. This was
+		// flagged as a deferred case back in Step 12 (see CLAUDE.md's
+		// "確定した設計判断") rather than opening chan<T> up as a
+		// general-purpose local-variable type.
+		if !isMergeCall(decl.Init) {
+			return fmt.Errorf("line %d: a channel-typed 'let' is only supported with a merge(...) initializer (cascade_spec.md §9.1, §9.5)", decl.Line)
+		}
+		if err := c.validateType(*typ.Chan, decl.Line); err != nil {
+			return err
+		}
+		if err := c.checkAssignable(sc, typ, decl.Init); err != nil {
+			return err
+		}
 	} else {
 		if err := c.validateType(typ, decl.Line); err != nil {
 			return err
@@ -1059,6 +1155,9 @@ func (c *checker) checkExprStmt(sc *scope, stmt *ast.ExprStmt) error {
 		_, err := c.checkErrorPropExpr(sc, prop)
 		return err
 	}
+	if pipe, isPipe := stmt.X.(*ast.PipelineExpr); isPipe {
+		return c.checkPipelineStmt(pipe)
+	}
 	call, ok := stmt.X.(*ast.CallExpr)
 	if !ok {
 		return fmt.Errorf("line %d: expected a call expression", ast.ExprLine(stmt.X))
@@ -1100,6 +1199,14 @@ func (c *checker) checkExprStmt(sc *scope, stmt *ast.ExprStmt) error {
 			return fmt.Errorf("line %d: send() expects a channel as its first argument, got %s", ast.ExprLine(call.Args[0]), typeString(ct))
 		}
 		return c.checkAssignable(sc, *ct.Chan, call.Args[1])
+	case "abort":
+		if !c.inStageBody {
+			return fmt.Errorf("line %d: abort() can only be called inside a source/stage/sink body (cascade_spec.md §9.4)", call.Line)
+		}
+		if len(call.Args) != 1 {
+			return fmt.Errorf("line %d: abort() expects exactly 1 argument, got %d", call.Line, len(call.Args))
+		}
+		return c.checkAssignable(sc, ast.Type{Name: "string"}, call.Args[0])
 	case "delete":
 		if len(call.Args) != 2 {
 			return fmt.Errorf("line %d: delete() expects exactly 2 arguments, got %d", call.Line, len(call.Args))
@@ -1564,10 +1671,16 @@ func funcTypeShapeEqual(a, b ast.FuncType) bool {
 
 // typeGiven reports whether t is an explicitly written type (`let x: T`)
 // as opposed to the zero Type `let x = Init` leaves for inference — a
-// list, pointer, function, or map type has an empty Name, so checking
-// Name alone isn't enough once those exist.
+// list, pointer, function, map, or channel type has an empty Name, so
+// checking Name alone isn't enough once those exist. Missing the Chan
+// case here was a real bug found while adding Step 13's channel-typed
+// `let` (merge(...)'s own result): `let x: chan<int> = merge(...)` fell
+// through to the *inference* branch (since Chan alone didn't count as
+// "given"), which tried to exprType the initializer as if no target type
+// existed at all, rather than reaching checkLetDecl's dedicated
+// channel-typed branch.
 func typeGiven(t ast.Type) bool {
-	return t.Name != "" || t.Elem != nil || t.Ptr != nil || t.Func != nil || t.Map != nil
+	return t.Name != "" || t.Elem != nil || t.Ptr != nil || t.Func != nil || t.Map != nil || t.Chan != nil
 }
 
 // exprType infers e's type. NoneLit has no type of its own (see its doc
@@ -1589,6 +1702,8 @@ func (c *checker) exprType(sc *scope, e ast.Expr) (ast.Type, error) {
 		return c.inferListLitType(sc, v)
 	case *ast.MapLit:
 		return c.checkMapLit(sc, v)
+	case *ast.PipelineExpr:
+		return c.checkPipelineCollectExpr(v)
 	case *ast.IndexExpr:
 		xt, err := c.exprType(sc, v.X)
 		if err != nil {
@@ -1815,6 +1930,40 @@ func (c *checker) checkCallExprValue(sc *scope, call *ast.CallExpr) (ast.Type, e
 			return ast.Type{}, err
 		}
 		return ast.Type{Name: "error"}, nil
+	case "merge":
+		// merge(a: chan<T>, b: chan<T>): chan<T> (cascade_spec.md §9.5) —
+		// unlike every other builtin's arguments, a/b are not evaluated as
+		// ordinary expressions: chan<T> is a pipeline-only type
+		// (validateType rejects it everywhere else, see CLAUDE.md's
+		// "確定した設計判断" for Step 12), so the *only* place a chan<T>
+		// value could come from is a source's own output — meaning a/b
+		// must each be a bare identifier naming a declared source
+		// specifically (never a stage or sink, both of which require an
+		// input they wouldn't have if spawned standalone here). merge
+		// itself is responsible for spawning both (see codegen's
+		// genMergeCall), fanning their output into one freshly created
+		// channel.
+		if len(call.Args) != 2 {
+			return ast.Type{}, fmt.Errorf("line %d: merge() expects exactly 2 arguments, got %d", call.Line, len(call.Args))
+		}
+		var elemType ast.Type
+		for i, arg := range call.Args {
+			id, isIdent := arg.(*ast.Ident)
+			if !isIdent {
+				return ast.Type{}, fmt.Errorf("line %d: merge() argument %d must be a declared source name", ast.ExprLine(arg), i+1)
+			}
+			sig, ok := c.stages[id.Name]
+			if !ok || sig.Kind != ast.SourceStage {
+				return ast.Type{}, fmt.Errorf("line %d: merge() argument %d must name a declared source, got %q", id.Line, i+1, id.Name)
+			}
+			if i == 0 {
+				elemType = sig.OutputElem
+			} else if !typeShapeEqual(elemType, sig.OutputElem) {
+				return ast.Type{}, fmt.Errorf("line %d: merge() requires both sources to carry the same type, got %s and %s", call.Line, typeString(elemType), typeString(sig.OutputElem))
+			}
+		}
+		call.ArgType = elemType
+		return ast.Type{Chan: &elemType}, nil
 	case "len":
 		if len(call.Args) != 1 {
 			return ast.Type{}, fmt.Errorf("line %d: len() expects exactly 1 argument, got %d", call.Line, len(call.Args))

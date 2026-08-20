@@ -881,17 +881,18 @@ func (p *parser) parseSendStmt() (ast.Stmt, error) {
 }
 
 // parsePipelineTail parses the `|> name |> name ...` continuation of a
-// `|>`-chained pipeline statement (cascade_spec.md §9.2) whose first
-// stage's identifier token `first` has already been consumed by
-// parseIdentStmt. Each `|>` must be followed by another stage's name, or
-// the built-in `collect` keyword (§9.3) — accepted grammatically here
-// even though sema.Check's checkPipelineStmt currently rejects it with an
-// explicit "not implemented until Step 13" error (see ast.PipelineStmt's
-// doc), so the parser never has to be revisited once collect's
-// value-producing form lands.
-func (p *parser) parsePipelineTail(first lexer.Token) (ast.Stmt, error) {
-	stmt := &ast.PipelineStmt{Line: first.Line}
-	stmt.Stages = append(stmt.Stages, ast.PipelineStageRef{Name: first.Literal, Line: first.Line})
+// `|>`-chained pipeline (cascade_spec.md §9.2) whose first stage's
+// identifier token `first` has already been consumed — shared by the
+// bare-statement form (called from parseIdentStmt, wrapped in an
+// ExprStmt there) and the value-producing collect-terminated form (§9.3,
+// called from parseExpr). Each `|>` must be followed by another stage's
+// name, or the built-in `collect` keyword — sema.Check tells the two
+// forms apart afterward (checkPipelineStmt requires a sink terminal,
+// checkPipelineCollectExpr requires exactly "collect" — see
+// ast.PipelineExpr's doc).
+func (p *parser) parsePipelineTail(first lexer.Token) (*ast.PipelineExpr, error) {
+	expr := &ast.PipelineExpr{Line: first.Line}
+	expr.Stages = append(expr.Stages, ast.PipelineStageRef{Name: first.Literal, Line: first.Line})
 	for p.cur().Kind == lexer.PipeArrow {
 		p.advance()
 		var nameTok lexer.Token
@@ -901,9 +902,9 @@ func (p *parser) parsePipelineTail(first lexer.Token) (ast.Stmt, error) {
 		default:
 			return nil, fmt.Errorf("line %d: expected a stage name or 'collect' after '|>', got %q", p.cur().Line, p.cur().Literal)
 		}
-		stmt.Stages = append(stmt.Stages, ast.PipelineStageRef{Name: nameTok.Literal, Line: nameTok.Line})
+		expr.Stages = append(expr.Stages, ast.PipelineStageRef{Name: nameTok.Literal, Line: nameTok.Line})
 	}
-	return stmt, nil
+	return expr, nil
 }
 
 // parseIdentStmt parses a statement starting with an identifier: a call
@@ -921,7 +922,11 @@ func (p *parser) parseIdentStmt() (ast.Stmt, error) {
 		}
 		return p.exprStmtFromCall(call), nil
 	case p.cur().Kind == lexer.PipeArrow:
-		return p.parsePipelineTail(name)
+		expr, err := p.parsePipelineTail(name)
+		if err != nil {
+			return nil, err
+		}
+		return &ast.ExprStmt{X: expr, Line: expr.Line}, nil
 	case p.cur().Kind == lexer.Dot:
 		return p.parseFieldOrMethodStmt(name)
 	case p.cur().Kind == lexer.LBracket:
@@ -1040,11 +1045,26 @@ func (p *parser) parseReturnStmt() (ast.Stmt, error) {
 // parseExpr parses a full expression, following cascade_spec.md §6's
 // precedence table (lowest to highest so far): ||, &&, ==/!=, </<=/>/>=,
 // | (and ^ as XOR), & (and &^), <</>>, +/-, */%, unary !/-/~, then
-// primaries. Postfix "?" (§8.6, Step 11), "."/"[]" (Steps 6/8), and the
-// "|>" pipeline operator (Step 12) extend parsePrimary/parseExpr further
-// in their own steps.
+// primaries. Postfix "?" (§8.6) and "."/"[]" extend parsePrimary further.
+// The "|>" pipeline-connect operator (§9.2, Step 12/13) sits outside this
+// precedence chain entirely — a `|>` chain is always a bare sequence of
+// stage names (never a general sub-expression on either side), so it's
+// simplest to check for it only once, right here, after parseOr returns:
+// if the result is a bare identifier (the only shape a stage name can
+// take) and `|>` immediately follows, hand off to parsePipelineTail
+// instead of returning the identifier — this is what lets `numbers |>
+// double |> toString |> collect` appear as a LetDecl's Init (the
+// value-producing form, §9.3), symmetric with parseIdentStmt's identical
+// check for the bare-statement form (§9.2, sink-terminated).
 func (p *parser) parseExpr() (ast.Expr, error) {
-	return p.parseOr()
+	x, err := p.parseOr()
+	if err != nil {
+		return nil, err
+	}
+	if id, ok := x.(*ast.Ident); ok && p.cur().Kind == lexer.PipeArrow {
+		return p.parsePipelineTail(lexer.Token{Literal: id.Name, Line: id.Line})
+	}
+	return x, nil
 }
 
 // binOpNames maps a binary/logical operator token to its ast.BinaryExpr

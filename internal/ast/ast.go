@@ -130,29 +130,41 @@ type StageDecl struct {
 }
 
 // PipelineStageRef is one name in a `|>`-chained pipeline (cascade_spec.md
-// §9.2) — a source/stage/sink's own declared Name, kept with its own
-// source line for precise error messages (see sema's checkPipelineStmt).
+// §9.2) — a source/stage/sink's own declared Name (or the built-in
+// `collect`, §9.3, as the final entry), kept with its own source line for
+// precise error messages (see sema's checkPipelineStmt/
+// checkPipelineCollectExpr).
 type PipelineStageRef struct {
 	Name string
 	Line int
 }
 
-// PipelineStmt is a `|>`-chained pipeline used as a statement
-// (cascade_spec.md §9.2): `source |> stage1 |> ... |> sink`. Stages holds
-// every name in source order, beginning with the source and ending with
-// the sink. The value-producing form ending in the built-in `collect`
-// (§9.3) is grammatically accepted here too (see parser's
-// parsePipelineTail) but sema.Check's checkPipelineStmt rejects it with an
-// explicit "not implemented until Step 13" error — collect only makes
-// sense as an expression (`let x = ... |> collect`), which this
-// statement-only node can't represent; that form lands once Step 13
-// implements collect itself (see CLAUDE.md's step plan).
-type PipelineStmt struct {
-	Stages []PipelineStageRef
-	Line   int
+// PipelineExpr is a `|>`-chained pipeline (cascade_spec.md §9.2): `source
+// |> stage1 |> ... |> sink` (used as a bare statement — wrapped in an
+// ExprStmt exactly like a CallExpr/ErrorPropExpr used as a statement, see
+// parser's parsePipelineTail — and checked by sema's checkPipelineStmt,
+// which requires the last Stages entry to be a declared sink), or `source
+// |> stage1 |> ... |> collect` (§9.3, used as a value — e.g. a LetDecl's
+// Init — and checked by checkPipelineCollectExpr, which requires the last
+// entry to be exactly the literal "collect" and computes ResultType).
+// Sharing one AST node for both forms (rather than a separate
+// statement-only type) mirrors how CallExpr/ErrorPropExpr already serve
+// double duty.
+//
+// ResultType is filled in by sema.Check only for the collect form — the
+// nullable list `[]T?` collect produces (§9.3: "全ステージが正常に完了
+// すれば集められた値のリスト...途中で中断した場合はnoneになる" — see
+// codegen's genNullableOperands, which uses this to compile collect's
+// abort-vs-success duality as a single CHRECV comma-ok receive from a
+// synthesized collector goroutine). It's the zero Type for the
+// sink-terminated statement form, which produces no value at all.
+type PipelineExpr struct {
+	Stages     []PipelineStageRef
+	Line       int
+	ResultType Type
 }
 
-func (*PipelineStmt) stmtNode() {}
+func (*PipelineExpr) exprNode() {}
 
 // File is the root node of a parsed Cascade source file.
 type File struct {
@@ -661,8 +673,6 @@ func StmtLine(s Stmt) int {
 		return v.Line
 	case *ForInStmt:
 		return v.Line
-	case *PipelineStmt:
-		return v.Line
 	default:
 		return 0
 	}
@@ -704,6 +714,8 @@ func ExprLine(e Expr) int {
 	case *ClosureLit:
 		return v.Line
 	case *ErrorPropExpr:
+		return v.Line
+	case *PipelineExpr:
 		return v.Line
 	default:
 		return 0

@@ -163,6 +163,12 @@ func Generate(f *ast.File) (string, error) {
 		b.WriteString("\n")
 	}
 	b.WriteString(funcsIR.String())
+	for _, ir := range types.collectorFuncs {
+		b.WriteString(ir)
+	}
+	for _, ir := range types.mergeFuncs {
+		b.WriteString(ir)
+	}
 
 	b.WriteString("FUNC\t!main\t:\n")
 	b.WriteString("\tVAR\t%exitcode\t^int\n")
@@ -196,6 +202,8 @@ type funcGen struct {
 	methods       map[string]map[string]funcSig // struct name -> method name -> sig, for struct.go's method-call codegen
 	stages        map[string]stageInfo          // source/stage/sink name -> channel shape, for pipeline.go's genPipelineStmt (§9.2)
 	results       []ast.Type                    // this FUNC/CLOS's own declared result types, for genReturnStmt's nullable-result expansion and error.go's genErrorProp (§8.6's postfix `?`)
+	abortChanOp   string                        // this source/stage/sink's own hidden abort-broadcast channel operand (§9.4); empty outside a stage body (see genStageDecl/genForInChannelStmt/genSendCall)
+	guardChanOp   string                        // this source/stage/sink's own hidden close-once guard channel operand (§9.4, only used by genAbortCall); empty outside a stage body
 	seq           int
 	labelSeq      int
 	breakStack    []string // break targets: pushed by both while and switch
@@ -301,8 +309,6 @@ func genStmt(g *funcGen, stmt ast.Stmt) error {
 		return genSwitchStmt(g, s)
 	case *ast.ForInStmt:
 		return genForInStmt(g, s)
-	case *ast.PipelineStmt:
-		return genPipelineStmt(g, s)
 	case *ast.BreakStmt:
 		return genBreakStmt(g, s)
 	case *ast.ContinueStmt:
@@ -689,6 +695,9 @@ func genExprStmt(g *funcGen, stmt *ast.ExprStmt) error {
 		_, err := genErrorProp(g, prop)
 		return err
 	}
+	if pipe, isPipe := stmt.X.(*ast.PipelineExpr); isPipe {
+		return genPipelineStmt(g, pipe)
+	}
 	call, ok := stmt.X.(*ast.CallExpr)
 	if !ok {
 		return fmt.Errorf("codegen: unsupported expression statement %T", stmt.X)
@@ -712,6 +721,8 @@ func genExprStmt(g *funcGen, stmt *ast.ExprStmt) error {
 		return nil
 	case "send":
 		return genSendCall(g, call)
+	case "abort":
+		return genAbortCall(g, call)
 	case "delete":
 		return genDeleteCall(g, call)
 	default:
@@ -868,6 +879,8 @@ func genCallValue(g *funcGen, call *ast.CallExpr) (string, error) {
 		return genReduceCall(g, call)
 	case "error":
 		return genErrorCall(g, call)
+	case "merge":
+		return genMergeCall(g, call)
 	default:
 		sig, ok := g.sigs[call.Callee]
 		if !ok {

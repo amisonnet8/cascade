@@ -1,0 +1,86 @@
+struct Reading {
+    sensorId: int
+    value: float
+}
+
+func (r: Reading) isValid(): bool {
+    return r.value >= 0.0
+}
+
+source readings(output: chan<Reading>) {
+    let raw: []Reading = [Reading{sensorId: 1, value: 12.5}, Reading{sensorId: 2, value: -3.0}, Reading{sensorId: 3, value: 8.0}]
+    for r in raw {
+        send(output, r)
+    }
+}
+
+stage validOnly(input: chan<Reading>, output: chan<Reading>) {
+    for r in input {
+        if r.isValid() {
+            send(output, r)
+        }
+    }
+}
+
+stage format(input: chan<Reading>, output: chan<string>) {
+    for r in input {
+        send(output, "sensor " + string(r.sensorId) + ": " + string(r.value))
+    }
+}
+
+source numsA(output: chan<int>) {
+    for n in range(1, 4) {
+        send(output, n)
+    }
+}
+
+source numsB(output: chan<int>) {
+    for n in range(11, 14) {
+        send(output, n)
+    }
+}
+
+source badNumbers(output: chan<int>) {
+    for n in range(-2, 4) {
+        send(output, n)
+    }
+}
+
+stage rejectNegative(input: chan<int>, output: chan<int>) {
+    for n in input {
+        if n < 0 {
+            abort("negative value: " + string(n))
+        }
+        send(output, n)
+    }
+}
+
+func main(): int {
+    // collect (§9.3)
+    let lines: []string? = readings |> validOnly |> format |> collect
+    if lines is none {
+        print("readings pipeline failed")
+        return 1
+    }
+    for line in lines {
+        print(line)
+    }
+
+    // merge (§9.5)
+    let combined: chan<int> = merge(numsA, numsB)
+    let total: int = 0
+    for v in combined {
+        total = total + v
+    }
+    print("merged total: " + string(total))
+
+    // abort (§9.4)
+    let results: []int? = badNumbers |> rejectNegative |> collect
+    if results is none {
+        print("badNumbers pipeline aborted as expected")
+    } else {
+        print("badNumbers pipeline did not abort (unexpected)")
+    }
+
+    return 0
+}

@@ -156,6 +156,9 @@ func genNullableOperands(g *funcGen, expr ast.Expr, targetType ast.Type) (val, i
 			return ref.ValOp, ref.SetOp, nil
 		}
 	}
+	if pipe, isPipe := expr.(*ast.PipelineExpr); isPipe {
+		return genPipelineCollect(g, pipe)
+	}
 	if idx, isIndex := expr.(*ast.IndexExpr); isIndex && idx.ResultType.Nullable {
 		xOp, err := genValue(g, idx.X)
 		if err != nil {

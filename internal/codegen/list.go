@@ -27,6 +27,49 @@ type typeRegistry struct {
 
 	chanTypes    map[string]*chanTypeEntry // canonical shape key -> entry
 	chanTypeList []*chanTypeEntry          // first-seen order, for stable CHTYPE emission
+
+	// collectorSeq/collectorFuncs and mergeSeq/mergeFuncs accumulate the
+	// raw FUNC IR text for every synthesized collect (§9.3) collector and
+	// merge (§9.5) fan-in goroutine (see pipeline.go's genCollectorFunc/
+	// genMergeFunc) — generated as a side effect of compiling whichever
+	// ordinary function body contains a `... |> collect` expression or a
+	// merge(...) call, exactly like SLTYPE/FNTYPE/MPTYPE/CHTYPE
+	// registration happens as a side effect of typeToIR calls. Unlike
+	// those, shapes aren't deduplicated here -- each call site gets its
+	// own freshly named FUNC (__collect_N/__merge_N) -- a deliberate
+	// simplicity trade-off (see CLAUDE.md's "確定した設計判断" for Step 13).
+	collectorSeq   int
+	collectorFuncs []string
+	mergeSeq       int
+	mergeFuncs     []string
+}
+
+// newCollectorName mints a fresh, unique top-level FUNC name for one
+// collect (§9.3) collector goroutine.
+func (r *typeRegistry) newCollectorName() string {
+	r.collectorSeq++
+	return fmt.Sprintf("__collect_%d", r.collectorSeq)
+}
+
+// addCollectorFunc records ir (a complete FUNC...ENDFUNC block) as one
+// more synthesized collector to emit alongside every other top-level
+// FUNC.
+func (r *typeRegistry) addCollectorFunc(ir string) {
+	r.collectorFuncs = append(r.collectorFuncs, ir)
+}
+
+// newMergeName mints a fresh, unique top-level FUNC name for one merge
+// (§9.5) fan-in goroutine.
+func (r *typeRegistry) newMergeName() string {
+	r.mergeSeq++
+	return fmt.Sprintf("__merge_%d", r.mergeSeq)
+}
+
+// addMergeFunc records ir (a complete FUNC...ENDFUNC block) as one more
+// synthesized fan-in goroutine to emit alongside every other top-level
+// FUNC.
+func (r *typeRegistry) addMergeFunc(ir string) {
+	r.mergeFuncs = append(r.mergeFuncs, ir)
 }
 
 // use registers elemName (a scalar type name — nested list element types
