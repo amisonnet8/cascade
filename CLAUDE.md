@@ -336,6 +336,14 @@ Cascadeの`func main(): int`をamivmの`!main`へ直接対応させることは�
 
 `examples/14_packages/`(ルートパッケージ`main.cas`が`mathutil`という別パッケージをインポートし、`pub`な関数(`Clamp`)・構造体+レシーバー関数(`Vector`/`magnitudeSquared`)・トップレベル`const`(`Version`)の3種類全てを修飾参照する、仕様11.2/11.3節の例をほぼそのまま再現したサンプル)で`amivm`→`go build`→実行まで確認済み。加えて、`pub`でない宣言への他パッケージからの参照・循環import・非ルートパッケージでの`main`宣言という3つのエラーケースをそれぞれ個別に確認し、いずれも意図通り拒否されることを確認した。
 
+### CLI・配布(Step 15)
+
+**CLI(`cmd/cascade`)・Makefile・`cascadert`のgo:embed配布は、いずれもStep 1〜10の時点で[[Seed]]の`cmd/seed`/`seedrt`パターンをそのまま踏襲する形で既に実装済みだったため、Step 15で新たに設計すべき事項はほぼ無く、実質的には「Seedと同じ方針で進めてよいか」というユーザーへの確認と、既存実装の点検・README作成に限られた。** `cascade <build|run|emit-ir|emit-go|help> [-o file] [-v] <file.cas | package-dir>`というコマンド体系、`compileToIR`→`compileToGo`→`compileToBinary`という3段の共通関数への分割、`-v`がamivm自身の`-v`トレースをそのまま素通しする方式は、いずれもSeedの`seed/CLAUDE.md`「確定した設計判断」に記された内容と一致している。
+
+**CLI点検の過程で、Step 14(パッケージ)がディレクトリ引数への対応を追加した際に見落としていた実バグを1件発見・修正した。** `defaultOutPath`(`-o`省略時の出力パス導出)が、単一ファイル(`foo.cas` → `foo.ir`)の場合しか想定しておらず、ディレクトリ引数(`examples/14_packages`)を渡すと`.cas`拡張子が無いため何も変換されず、出力パスが**入力ディレクトリと全く同じ文字列**になっていた。`go build -o <既存ディレクトリ>`はGo自身の挙動として「そのディレクトリの中に、ビルドしたパッケージ名を使ったバイナリを書き込む」という意味になるため、`cascade build examples/14_packages`を実行すると**ソースディレクトリの中にビルド成果物(`cascadebuild`という名前のバイナリ)が紛れ込む**という、サイレントにソースツリーを汚染する形の不具合になっていた(`examples/14_packages`を実際に`cascade build`してみて初めて発覚)。修正として、`defaultOutPath`がディレクトリを検出した場合は`filepath.Base`(ディレクトリ自身の名前)だけをカレントディレクトリに対する相対パスとして使うようにした——`go build ./mypackage`(引数無し)がカレントディレクトリに`mypackage`という実行ファイルを作るのと同じ挙動に合わせている。Step 14時点で「ディレクトリを渡せる」ことは`pkgloader.Load`・`compileToIR`側では確認済みだったが、**CLIの`-o`省略時のデフォルトパス計算という、一見無関係な既存コードとの組み合わせ**までは検証していなかったための見落としだった——「新しい構文・機能を実装したら、既存の周辺コードとの組み合わせも含めて実地検証する」という、本プロジェクトで繰り返し確認されてきた教訓が、機能追加ではなくCLIの引数解釈という一見地味な箇所でも同様に当てはまる例だった。
+
+`README.md`/`README_ja.md`はSeedの同名ファイルの構成(ステータス・パイプライン図・要件・インストール・使い方・例・言語仕様・リポジトリ構成)をそのまま踏襲し、Cascade固有の内容(3本柱・実装済み機能一覧・パイプライン記法を使った例)に差し替えて作成した。掲載したコード例(`Hello, Cascade!`・4段抜きの並行パイプライン)はどちらも実際に`cascade run`へ通して動作確認済み。
+
 ## 意味検証の責任分担(重要)
 
 型の整合性・未定義識別子・関数シグネチャの不一致・メソッドの存在チェックなどは、**amivm側では検証せず`go/types`に全面的に委ねている。** amivmが保証するのは「構文的に妥当なGoコードを出力すること」だけ。
@@ -415,7 +423,7 @@ Seedは7〜8ステップ(git履歴上は「Step1: hello-worldパイプライン�
 | 12 ✅ | パイプライン基礎 | `source`/`stage`/`sink`、`chan<T>`、`send`、`for v in channel`、`\|>`連結(9.1/9.2節) | `CHTYPE` `CHMAKE` `CHSEND` `CHRECV` `SPAWN` `DEFER` | パイプラインの並行実行モデルの一次決定。基礎部分を確定・実装(下記「確定した設計判断」参照。collect/abort/mergeはStep 13へ) |
 | 13 ✅ | パイプライン拡張(collect/abort/merge) | `collect`(9.3節)・`abort`(9.4節)・`merge`(9.5節) | `SEL` `CASESEND` `CASERECV` `DEFAULT` `ENDSEL` | パイプラインの並行実行モデルを最終確定(下記「確定した設計判断」参照) |
 | 14 ✅ | パッケージ/複数ファイル | ディレクトリ=パッケージの統合(11.1節)、`import`/`pub`(11.2/11.3節)、循環import検出(11.5節)、識別子一意化(11.6節)、トップレベル`let`/`const`(11.3節) | `GVAR`。新規AMIVM命令は無いが`GVAR`が初めて実際に使われた | パッケージ/モジュール解決を確定(下記「確定した設計判断」参照) |
-| 15 | CLI・配布 | `cascade build/run/emit-ir/emit-go/help`、`cascadert`の`go:embed`配布、README作成 | — | — |
+| 15 ✅ | CLI・配布 | `cascade build/run/emit-ir/emit-go/help`、`cascadert`の`go:embed`配布、README作成 | — | — |
 
 特にStep4(ビット演算)・Step8(ポインタ・構造体)・Step9(クロージャー)・Step10(map)・Step12/13(チャネル・SPAWN・SEL)はSeedで未実証だった命令なので、「ロジック上正しそうに見える」だけで次のステップへ進まないこと。設計上の未確定事項に着手する際は、方針を確定させたら「確定した設計判断」節に記録し、仮説のまま放置しないこと。
 

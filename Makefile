@@ -1,4 +1,4 @@
-# Cascade: .cascadeソースをAMIVM-IR経由でGoにコンパイルする言語処理系
+# Cascade: .casソースをAMIVM-IR経由でGoにコンパイルする言語処理系
 
 BINARY := cascade
 PKG    := ./cmd/cascade

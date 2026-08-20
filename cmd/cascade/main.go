@@ -50,7 +50,11 @@ func printUsage(w io.Writer) {
 
 Usage:
 
-	cascade <command> [flags] <file.cas>
+	cascade <command> [flags] <file.cas | package-dir>
+
+The source argument is either a single .cas file (compiled alone, as its
+own implicit package) or a directory (compiled as a full package per
+cascade_spec.md §11.1, with its own imports resolved).
 
 Commands:
 
@@ -76,13 +80,13 @@ func outputFlags(name string) (fs *flag.FlagSet, out *string, verbose *bool) {
 }
 
 // parseOneSrcArg parses fs against args and returns the single required
-// <file.cas> positional argument.
+// <file.cas | package-dir> positional argument.
 func parseOneSrcArg(fs *flag.FlagSet, args []string) (string, error) {
 	if err := fs.Parse(args); err != nil {
 		return "", err
 	}
 	if fs.NArg() != 1 {
-		return "", fmt.Errorf("usage: cascade %s [-o file] [-v] <file.cas>", fs.Name())
+		return "", fmt.Errorf("usage: cascade %s [-o file] [-v] <file.cas | package-dir>", fs.Name())
 	}
 	return fs.Arg(0), nil
 }
@@ -106,7 +110,7 @@ func runBuild(args []string) error {
 
 func runRun(args []string) error {
 	if len(args) != 1 {
-		return fmt.Errorf("usage: cascade run <file.cas>")
+		return fmt.Errorf("usage: cascade run <file.cas | package-dir>")
 	}
 	srcPath := args[0]
 
@@ -185,9 +189,24 @@ func runEmitGo(args []string) error {
 	return nil
 }
 
-// defaultOutPath derives an output path from srcPath by stripping its
-// .cas extension and appending ext (e.g. ".ir", ".go", or "" for a
-// build's bare executable name).
+// defaultOutPath derives an output path from srcPath (a single .cas file
+// or a package directory — see pkgloader.Load's doc) and ext (e.g.
+// ".ir", ".go", or "" for a build's bare executable name).
+//
+// A directory srcPath is reduced to just its own base name, placed in
+// the current directory — mirroring `go build ./mypackage`, which
+// produces a `mypackage` executable in the caller's own directory, not
+// inside ./mypackage itself. Doing anything else here is actively
+// dangerous: passing srcPath itself straight through (as if it were a
+// file to strip ".cas" from) leaves the output path identical to the
+// already-existing source directory, and `go build -o <existing-dir>`
+// resolves that by writing the binary *inside* it — silently dropping a
+// build artifact into the user's own source tree. A real bug caught by
+// running `cascade build` against examples/14_packages during Step 15's
+// own verification (see CLAUDE.md's "確定した設計判断").
 func defaultOutPath(srcPath, ext string) string {
+	if info, err := os.Stat(srcPath); err == nil && info.IsDir() {
+		return filepath.Base(filepath.Clean(srcPath)) + ext
+	}
 	return strings.TrimSuffix(srcPath, ".cas") + ext
 }
