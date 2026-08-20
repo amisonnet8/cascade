@@ -25,11 +25,11 @@ func receiverStructName(t ast.Type) string {
 // ENDSTTYPE block (cascade_spec.md §4.1). Called directly from Generate,
 // not per-function like the rest of codegen — a struct declaration is
 // package-level, with nothing to hoist or scope-resolve.
-func genStructDecl(slices *sliceRegistry, sd *ast.StructDecl) (string, error) {
+func genStructDecl(types *typeRegistry, sd *ast.StructDecl) (string, error) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "STTYPE\t^%s\n", sd.Name)
 	for _, f := range sd.Fields {
-		irType, err := typeToIR(slices, f.Type)
+		irType, err := typeToIR(types, f.Type)
 		if err != nil {
 			return "", err
 		}
@@ -102,7 +102,7 @@ func genFieldRead(g *funcGen, e *ast.FieldExpr) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	irType, err := typeToIR(g.slices, e.ResultType)
+	irType, err := typeToIR(g.types, e.ResultType)
 	if err != nil {
 		return "", err
 	}
@@ -126,7 +126,7 @@ func genAddrOf(g *funcGen, e *ast.UnaryExpr) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("codegen: undefined name %q (sema bug)", id.Name)
 	}
-	irType, err := typeToIR(g.slices, e.ResultType)
+	irType, err := typeToIR(g.types, e.ResultType)
 	if err != nil {
 		return "", err
 	}
@@ -145,7 +145,7 @@ func genDeref(g *funcGen, e *ast.UnaryExpr) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	irType, err := typeToIR(g.slices, e.ResultType)
+	irType, err := typeToIR(g.types, e.ResultType)
 	if err != nil {
 		return "", err
 	}
@@ -225,7 +225,7 @@ func genMethodCallValue(g *funcGen, call *ast.CallExpr) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	resultIRType, err := typeToIR(g.slices, sig.Results[0])
+	resultIRType, err := typeToIR(g.types, sig.Results[0])
 	if err != nil {
 		return "", err
 	}

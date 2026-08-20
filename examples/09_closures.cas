@@ -1,0 +1,56 @@
+func makeAdder(base: int): func(int): int {
+    return func(n: int): int {
+        return base + n
+    }
+}
+
+func makeCounter(): func(): int {
+    let count = 0
+    return func(): int {
+        count += 1
+        return count
+    }
+}
+
+func applyTwice(f: func(int): int, x: int): int {
+    return f(f(x))
+}
+
+func main(): int {
+    let add5 = makeAdder(5)
+    print("add5(10)=" + string(add5(10)))
+
+    let counter = makeCounter()
+    print("counter()=" + string(counter()))
+    print("counter()=" + string(counter()))
+    print("counter()=" + string(counter()))
+
+    print("applyTwice(add5, 1)=" + string(applyTwice(add5, 1)))
+
+    let numbers: []int = [1, 2, 3, 4, 5, 6]
+
+    let evens: []int = filter(numbers, func(n: int): bool {
+        return n % 2 == 0
+    })
+    let evensTotal = 0
+    for e in evens {
+        evensTotal += e
+    }
+    print("evensTotal=" + string(evensTotal))
+
+    let doubled: []int = map(numbers, func(n: int): int {
+        return n * 2
+    })
+    let doubledTotal = 0
+    for d in doubled {
+        doubledTotal += d
+    }
+    print("doubledTotal=" + string(doubledTotal))
+
+    let total: int = reduce(numbers, 0, func(acc: int, n: int): int {
+        return acc + n
+    })
+    print("total=" + string(total))
+
+    return 0
+}

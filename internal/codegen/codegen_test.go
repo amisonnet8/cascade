@@ -935,3 +935,124 @@ func main(): int {
 		t.Fatalf("expected ptr.sum() to auto-PGET ptr before the call; got:\n%s", ir)
 	}
 }
+
+func TestGenerate_ClosureLitEmitsFNTYPEAndCLOS(t *testing.T) {
+	ir := generate(t, `
+func makeAdder(base: int): func(int): int {
+	return func(n: int): int {
+		return base + n
+	}
+}
+func main(): int {
+	let add5 = makeAdder(5)
+	print(string(add5(10)))
+	return 0
+}
+`)
+	if !strings.Contains(ir, "FNTYPE\t^FuncType1\t^int\t:\t^int\n") {
+		t.Fatalf("expected an FNTYPE deftype for func(int): int; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "CLOS\t%tmp_1\t^int\t:\t^int\n") {
+		t.Fatalf("expected the closure literal to compile to a CLOS block; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "ADD\t%tmp_1\t$1\t&1\n") {
+		t.Fatalf("expected the closure body to reference its own param via &1 and the captured outer param via $1; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "ENDCLOS\n") {
+		t.Fatalf("expected the CLOS block to be closed with ENDCLOS; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_ClosureCapturesAndMutatesOuterVariable(t *testing.T) {
+	// Regression test for real Go closure capture (cascade_spec.md §8.3):
+	// a captured variable must be referenced by the *same* token inside
+	// the CLOS body as outside it, with no copying — see genClosureLit's
+	// doc, mirroring amivm/test_ir/15_closure.ir's %count example.
+	ir := generate(t, `
+func makeCounter(): func(): int {
+	let count = 0
+	return func(): int {
+		count += 1
+		return count
+	}
+}
+func main(): int {
+	let counter = makeCounter()
+	print(string(counter()))
+	return 0
+}
+`)
+	if !strings.Contains(ir, "VAR\t%count_1\t^int\n") {
+		t.Fatalf("expected count to be hoisted in makeCounter's own outer scope; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "ADD\t%count_1\t%count_1\t1\n") {
+		t.Fatalf("expected the closure body to mutate the captured %%count_1 directly, not a copy; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_ClosureCallThroughParameterUsesTempNotDollarToken(t *testing.T) {
+	// Regression test: amivm's CALL callname category only accepts
+	// %xxx/@xxx/!xxx/?xxx, never $N or &N (a real constraint found by
+	// actually running this program through amivm — see
+	// closureCallTarget's doc) — calling a closure held in a plain
+	// function parameter must copy it into a local temp first.
+	ir := generate(t, `
+func applyTwice(f: func(int): int, x: int): int {
+	return f(f(x))
+}
+func main(): int {
+	return 0
+}
+`)
+	if strings.Contains(ir, "CALL\t%tmp_1\t:\t$1\t") {
+		t.Fatalf("must not call a closure through a bare $N parameter token; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "SET\t%tmp_2\t$1\n") {
+		t.Fatalf("expected the closure parameter to be copied into a local temp before being called; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_FilterMapReduce(t *testing.T) {
+	ir := generate(t, `
+func main(): int {
+	let numbers: []int = [1, 2, 3, 4, 5, 6]
+	let evens = filter(numbers, func(n: int): bool {
+		return n % 2 == 0
+	})
+	let doubled = map(numbers, func(n: int): int {
+		return n * 2
+	})
+	let total = reduce(numbers, 0, func(acc: int, n: int): int {
+		return acc + n
+	})
+	print(string(len(evens)) + string(len(doubled)) + string(total))
+	return 0
+}
+`)
+	if !strings.Contains(ir, "\tSLICE\t") {
+		t.Fatalf("expected filter() to trim its over-allocated result via SLICE; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "\tSLMAKE\t") {
+		t.Fatalf("expected map()/filter() to SLMAKE their result lists; got:\n%s", ir)
+	}
+	assertLabelsResolve(t, ir)
+}
+
+func TestGenerate_PointerEqualityUsesEQ(t *testing.T) {
+	ir := generate(t, `
+struct Point {
+	x: int
+}
+func main(): int {
+	let p: Point = Point{x: 1}
+	let a: *Point = &p
+	let b: *Point = &p
+	let same = a == b
+	print(string(same))
+	return 0
+}
+`)
+	if !strings.Contains(ir, "\tEQ\t") {
+		t.Fatalf("expected pointer equality to compile to EQ; got:\n%s", ir)
+	}
+}

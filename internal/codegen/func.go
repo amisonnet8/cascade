@@ -47,13 +47,13 @@ func funcAmivmName(name string) string {
 // own, explicit second parameter, filled in by the caller (see
 // genCallArgs) — it cannot be synthesized locally the way Seed
 // synthesized `true` for its own (always-assigned) parameters.
-func genFuncDecl(fn *ast.FuncDecl, slices *sliceRegistry, structs map[string]*ast.StructDecl, sigs map[string]funcSig, methods map[string]map[string]funcSig) (string, error) {
-	g := &funcGen{scope: newScope(nil), slices: slices, structs: structs, sigs: sigs, methods: methods}
+func genFuncDecl(fn *ast.FuncDecl, types *typeRegistry, structs map[string]*ast.StructDecl, sigs map[string]funcSig, methods map[string]map[string]funcSig) (string, error) {
+	g := &funcGen{scope: newScope(nil), types: types, structs: structs, sigs: sigs, methods: methods}
 
 	var paramIRTypes []string
 	argIdx := 0
 	if fn.Receiver != nil {
-		irType, err := typeToIR(slices, fn.Receiver.Type)
+		irType, err := typeToIR(types, fn.Receiver.Type)
 		if err != nil {
 			return "", err
 		}
@@ -62,7 +62,7 @@ func genFuncDecl(fn *ast.FuncDecl, slices *sliceRegistry, structs map[string]*as
 		g.scope.declare(fn.Receiver.Name, varRef{Type: fn.Receiver.Type, ValOp: fmt.Sprintf("$%d", argIdx)})
 	}
 	for _, p := range fn.Params {
-		irType, err := typeToIR(slices, p.Type)
+		irType, err := typeToIR(types, p.Type)
 		if err != nil {
 			return "", err
 		}
@@ -79,7 +79,7 @@ func genFuncDecl(fn *ast.FuncDecl, slices *sliceRegistry, structs map[string]*as
 
 	resultIRTypes := make([]string, len(fn.Results))
 	for i, r := range fn.Results {
-		irType, err := typeToIR(slices, r)
+		irType, err := typeToIR(types, r)
 		if err != nil {
 			return "", err
 		}
@@ -203,7 +203,7 @@ func genUserFuncCallValue(g *funcGen, call *ast.CallExpr, sig funcSig) (string, 
 	if err != nil {
 		return "", err
 	}
-	resultIRType, err := typeToIR(g.slices, sig.Results[0])
+	resultIRType, err := typeToIR(g.types, sig.Results[0])
 	if err != nil {
 		return "", err
 	}
@@ -257,7 +257,7 @@ func genMultiLetDecl(g *funcGen, decl *ast.MultiLetDecl) error {
 			continue
 		}
 		typ := decl.ResolvedTypes[i]
-		irType, err := typeToIR(g.slices, typ)
+		irType, err := typeToIR(g.types, typ)
 		if err != nil {
 			return err
 		}

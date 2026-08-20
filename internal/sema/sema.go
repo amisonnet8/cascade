@@ -1,19 +1,21 @@
 // Package sema performs semantic analysis on a Cascade ast.File, since
 // amivm delegates all type/scope checking to go/types and does not check
 // anything itself (see CLAUDE.md "意味検証の責任分担"). Only the checks
-// Steps 1-8 need are implemented so far: a single well-formed `main` plus
+// Steps 1-9 need are implemented so far: a single well-formed `main` plus
 // any number of other functions (§8.1) — including multi-value returns
 // (§8.5) — scope-resolved `let`/`const` declarations and scalar/list-
 // element/struct-field/compound assignment, nullable-type (`T?`)
 // compatibility and narrowing (§2.3, §4.2, §5, §7), the full operator set
 // (§6), control flow (if/elif/else, while, for-in, switch,
 // break/continue), lists (`[]T` — literals, indexing, append/range/len),
-// and structs/pointers/receiver functions (§4.1, §4.4, §8.2 — struct
+// structs/pointers/receiver functions (§4.1, §4.4, §8.2 — struct
 // declarations, struct literals requiring every field, field read/write
 // on a struct or a pointer to one, `&`/`*` address-of/dereference, and
 // method calls with automatic address-of/dereference between value and
-// pointer receivers). Later steps add closures, maps, channels/pipelines,
-// and everything past that.
+// pointer receivers), and closures/higher-order functions (§8.3, §8.4 —
+// closure literals capturing the surrounding scope, calling a closure-
+// valued local variable, and the filter/map/reduce builtins). Later steps
+// add maps, channels/pipelines, and everything past that.
 //
 // A function whose non-void body doesn't obviously return on every path
 // isn't checked here (no control-flow reachability analysis is
@@ -23,6 +25,8 @@
 package sema
 
 import (
+	"strings"
+
 	"fmt"
 
 	"github.com/amisonnet8/cascade/internal/ast"
@@ -66,23 +70,35 @@ type checker struct {
 	sigs    map[string]funcSig
 	structs map[string]*ast.StructDecl
 	methods map[string]map[string]methodSig // struct name -> method name -> sig
+
+	// closureDepth counts enclosing closure-literal bodies currently being
+	// checked (0 outside any closure). amivm's CLOS cannot itself contain
+	// another CLOS (amivm_spec.md §2.1's "CLOSはFUNC本体内にのみ出現し、ネ
+	// スト不可") — see checkClosureLit, which rejects a ClosureLit found
+	// while this is already > 0, so codegen never has to guard against it.
+	closureDepth int
 }
 
 // reservedBuiltinNames are plain identifiers (not lexer keywords, unlike
 // print/string/int/float/bool are not, but see below) that sema/codegen
 // dispatch on directly by name (cascade_spec.md §13). A user-defined
-// function reusing one of these names would be silently unreachable —
+// *function* reusing one of these names would be silently unreachable —
 // shadowed by the builtin's own dispatch, which always checks first — so
-// it's rejected outright instead. "string"/"int"/"float"/"bool" need no
-// entry here: they're lexer keywords, so the parser already can't parse
-// them as a function name in the first place (see parser's
-// parsePrimaryAtom), and likewise for "send"/"chan"/"collect"/"map"/
-// "error".
+// it's rejected outright instead. A *local variable* is not restricted
+// this way: a closure-valued variable is deliberately allowed to shadow
+// a same-named builtin (cascade_spec.md §10's ordinary shadowing rules,
+// extended to the "callable" namespace — see resolveClosureCall).
+// "string"/"int"/"float"/"bool"/"map" need no entry here: they're lexer
+// keywords, so the parser already can't parse them as a function (or
+// variable) name in the first place (see parser's parsePrimaryAtom), and
+// likewise for "send"/"chan"/"collect"/"error".
 var reservedBuiltinNames = map[string]bool{
 	"print":  true,
 	"len":    true,
 	"range":  true,
 	"append": true,
+	"filter": true,
+	"reduce": true,
 }
 
 // Check validates f. cascade_spec.md §12 requires exactly one `main`
@@ -214,7 +230,7 @@ func (c *checker) checkFuncSig(fn *ast.FuncDecl) error {
 		}
 	}
 	for _, r := range fn.Results {
-		if r.Nullable {
+		if needsRetIssetExpansion(r) {
 			return fmt.Errorf("line %d: function %q: nullable return types are not supported yet", fn.Line, fn.Name)
 		}
 		if err := c.validateType(r, fn.Line); err != nil {
@@ -222,6 +238,22 @@ func (c *checker) checkFuncSig(fn *ast.FuncDecl) error {
 		}
 	}
 	return nil
+}
+
+// needsRetIssetExpansion reports whether a nullable result type t would
+// need the same value+isset two-operand expansion across a CALL/RET
+// boundary that a nullable *parameter* already gets (see codegen's
+// identically-reasoned needsIssetSlot) — every nullable type except a
+// pointer or a function value, both of which represent "none" via Go's
+// native nil in a single operand, needing no flag at all. Nothing
+// through Step 9 implements that expansion for *results* (see this
+// function's callers, checkFuncSig and checkClosureLit), so only this
+// narrower set is rejected — a pointer- or function-typed return was
+// never blocked by the underlying problem in the first place (an
+// ordinary single-value RET/CALL already handles it, exactly like any
+// other non-nullable-shaped result).
+func needsRetIssetExpansion(t ast.Type) bool {
+	return t.Nullable && t.Ptr == nil && t.Func == nil
 }
 
 // receiverStructName resolves a receiver's declared type to the struct
@@ -268,16 +300,30 @@ func (c *checker) checkFuncBody(fn *ast.FuncDecl) error {
 
 // validateType reports whether t names a type sema recognizes: a builtin
 // scalar (int/float/string/bool), a list of a valid type, a pointer to a
-// valid type, or a declared struct name (cascade_spec.md §2, §4.1). The
-// parser accepts any identifier as a type name (see parseTypeBase) since
-// it cannot know which ones are declared structs — that check happens
-// here instead, once every struct is registered.
+// valid type, a function type whose every parameter/result is itself
+// valid, or a declared struct name (cascade_spec.md §2, §4.1). The parser
+// accepts any identifier as a type name (see parseTypeBase) since it
+// cannot know which ones are declared structs — that check happens here
+// instead, once every struct is registered.
 func (c *checker) validateType(t ast.Type, line int) error {
 	if t.Elem != nil {
 		return c.validateType(*t.Elem, line)
 	}
 	if t.Ptr != nil {
 		return c.validateType(*t.Ptr, line)
+	}
+	if t.Func != nil {
+		for _, p := range t.Func.Params {
+			if err := c.validateType(p, line); err != nil {
+				return err
+			}
+		}
+		for _, r := range t.Func.Results {
+			if err := c.validateType(r, line); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	switch t.Name {
 	case "int", "float", "string", "bool":
@@ -440,17 +486,21 @@ func (c *checker) checkIfStmt(sc *scope, stmt *ast.IfStmt, want []ast.Type, loop
 // nullable) in sc — wantNot selects which of the two (true for "is not
 // none", false for "is none") cond must be for narrowing to apply.
 //
-// A pointer is deliberately excluded even though it's always Nullable
-// (see ast.Type's doc): there is no distinct "non-nullable pointer" type
-// to narrow into — *T is *T whether or not it happens to be nil right
-// now — so reconstructing ast.Type{Name: orig.Type.Name, ...} below would
-// silently drop its Ptr field and produce a broken, nameless type (a real
-// bug caught by TestGenerate_PointerNullCheckUsesEQNilNotIssetFlag).
-// Nothing is lost by skipping it: field/method access through a pointer
-// is already unconditionally allowed regardless of nullness, mirroring
-// Go's own "a nil-pointer method call only panics on actual dereference"
-// behavior (see structTypeName's callers) — narrowing was never load-
-// bearing for pointers in the first place.
+// A pointer or a function value is deliberately excluded even though
+// both are always Nullable (see ast.Type's doc): there is no distinct
+// "non-nullable pointer"/"non-nullable func" type to narrow into — *T is
+// *T and func(...): R is func(...): R whether or not either happens to
+// be nil right now — so reconstructing ast.Type{Name: orig.Type.Name,
+// ...} below would silently drop the Ptr/Func field and produce a
+// broken, nameless type (a real bug caught by
+// TestGenerate_PointerNullCheckUsesEQNilNotIssetFlag). Nothing is lost by
+// skipping it: field/method access through a pointer is already
+// unconditionally allowed regardless of nullness, mirroring Go's own "a
+// nil-pointer method call only panics on actual dereference" behavior
+// (see structTypeName's callers), and a closure call through a nil
+// closure variable panics the same way at runtime regardless of
+// narrowing — narrowing was never load-bearing for either in the first
+// place.
 func narrowedVarInfo(sc *scope, cond ast.Expr, wantNot bool) (name string, info varInfo, ok bool) {
 	nc, isCheck := cond.(*ast.NullCheckExpr)
 	if !isCheck || nc.Not != wantNot {
@@ -461,7 +511,7 @@ func narrowedVarInfo(sc *scope, cond ast.Expr, wantNot bool) (name string, info 
 		return "", varInfo{}, false
 	}
 	orig, found := sc.lookup(id.Name)
-	if !found || !orig.Type.Nullable || orig.Type.Ptr != nil {
+	if !found || !orig.Type.Nullable || orig.Type.Ptr != nil || orig.Type.Func != nil {
 		return "", varInfo{}, false
 	}
 	narrowed := orig
@@ -752,6 +802,11 @@ func (c *checker) checkExprStmt(sc *scope, stmt *ast.ExprStmt) error {
 		}
 		return c.checkCallArgs(sc, call, sig)
 	}
+	if sig, ok, err := c.resolveClosureCall(sc, call); err != nil {
+		return err
+	} else if ok {
+		return c.checkCallArgs(sc, call, sig)
+	}
 	switch call.Callee {
 	case "print":
 		if len(call.Args) != 1 {
@@ -841,6 +896,34 @@ func (c *checker) checkCallArgs(sc *scope, call *ast.CallExpr, sig funcSig) erro
 	return nil
 }
 
+// checkListAndHOFArg validates the shape every filter/map/reduce call
+// shares (cascade_spec.md §8.4, §13): exactly wantArgs arguments, a
+// non-nullable list at listArgIdx, and a function value at hofArgIdx.
+// The specific parameter/result shape each builtin's own function
+// argument must have — which differs between filter/map's one-parameter
+// predicate/mapper and reduce's two-parameter folder — is left to the
+// caller to check against the returned *ast.FuncType.
+func (c *checker) checkListAndHOFArg(sc *scope, call *ast.CallExpr, name string, wantArgs, listArgIdx, hofArgIdx int) (ast.Type, *ast.FuncType, error) {
+	if len(call.Args) != wantArgs {
+		return ast.Type{}, nil, fmt.Errorf("line %d: %s() expects exactly %d argument(s), got %d", call.Line, name, wantArgs, len(call.Args))
+	}
+	lt, err := c.exprType(sc, call.Args[listArgIdx])
+	if err != nil {
+		return ast.Type{}, nil, err
+	}
+	if lt.Nullable || lt.Elem == nil {
+		return ast.Type{}, nil, fmt.Errorf("line %d: %s() expects a list as its first argument, got %s", ast.ExprLine(call.Args[listArgIdx]), name, typeString(lt))
+	}
+	ft, err := c.exprType(sc, call.Args[hofArgIdx])
+	if err != nil {
+		return ast.Type{}, nil, err
+	}
+	if ft.Func == nil {
+		return ast.Type{}, nil, fmt.Errorf("line %d: %s() expects a function as its last argument, got %s", ast.ExprLine(call.Args[hofArgIdx]), name, typeString(ft))
+	}
+	return lt, ft.Func, nil
+}
+
 // resolveMethodCall resolves a method call's receiver (cascade_spec.md
 // §8.2): the receiver expression's type must name a known struct
 // (directly or through a pointer), that struct must declare a method
@@ -883,13 +966,19 @@ func (c *checker) resolveMethodCall(sc *scope, call *ast.CallExpr) (funcSig, err
 	return funcSig{Params: sig.Params, Results: sig.Results}, nil
 }
 
-// callSig resolves call's signature, whether it's a plain function call
-// or a method call (Receiver non-nil) — shared by checkMultiLetDecl,
-// the one call site that needs a signature without also wanting
-// checkCallExprValue/checkExprStmt's single-/void-value restrictions.
+// callSig resolves call's signature — a method call (Receiver non-nil), a
+// closure-valued local variable, or a plain global function, in that
+// priority order — shared by checkMultiLetDecl, the one call site that
+// needs a signature without also wanting checkCallExprValue/
+// checkExprStmt's single-/void-value restrictions.
 func (c *checker) callSig(sc *scope, call *ast.CallExpr) (funcSig, error) {
 	if call.Receiver != nil {
 		return c.resolveMethodCall(sc, call)
+	}
+	if sig, ok, err := c.resolveClosureCall(sc, call); err != nil {
+		return funcSig{}, err
+	} else if ok {
+		return sig, nil
 	}
 	sig, ok := c.sigs[call.Callee]
 	if !ok {
@@ -945,6 +1034,78 @@ func (c *checker) checkStructLit(sc *scope, lit *ast.StructLit) (ast.Type, error
 	return ast.Type{Name: lit.TypeName}, nil
 }
 
+// checkClosureLit validates a closure literal (cascade_spec.md §8.3):
+// every parameter/result type must be one validateType recognizes (the
+// same restriction checkFuncSig applies to a top-level function), and its
+// body is checked exactly like a function body (checkFuncBody) with two
+// differences — the closure's own scope is a *child* of sc rather than a
+// fresh root scope, so the body can read and mutate every surrounding-
+// scope variable it references (real Go closure capture, requiring no
+// separate capture-analysis pass here — see CLAUDE.md's "確定した設計判
+// 断"), and loopDepth/breakDepth reset to 0 (a closure body is its own
+// function-like boundary: `break`/`continue` inside it can never reach a
+// loop outside it, mirroring Go's own func-literal semantics). Rejects a
+// closure literal found while already checking another closure's body —
+// see checker.closureDepth's doc for why.
+func (c *checker) checkClosureLit(sc *scope, lit *ast.ClosureLit) (ast.Type, error) {
+	if c.closureDepth > 0 {
+		return ast.Type{}, fmt.Errorf("line %d: a closure literal cannot itself contain another closure literal (amivm's CLOS cannot nest)", lit.Line)
+	}
+
+	paramTypes := make([]ast.Type, len(lit.Params))
+	inner := newScope(sc)
+	for i, p := range lit.Params {
+		if err := c.validateType(p.Type, p.Line); err != nil {
+			return ast.Type{}, err
+		}
+		paramTypes[i] = p.Type
+		if !inner.declareLocal(p.Name, varInfo{Type: p.Type}) {
+			return ast.Type{}, fmt.Errorf("line %d: duplicate parameter name %q", p.Line, p.Name)
+		}
+	}
+	for _, r := range lit.Results {
+		if needsRetIssetExpansion(r) {
+			return ast.Type{}, fmt.Errorf("line %d: closure literal: nullable return types are not supported yet", lit.Line)
+		}
+		if err := c.validateType(r, lit.Line); err != nil {
+			return ast.Type{}, err
+		}
+	}
+
+	c.closureDepth++
+	err := c.checkStmtsIn(inner, lit.Body, lit.Results, 0, 0)
+	c.closureDepth--
+	if err != nil {
+		return ast.Type{}, err
+	}
+
+	rt := ast.Type{Func: &ast.FuncType{Params: paramTypes, Results: lit.Results}, Nullable: true}
+	lit.ResolvedType = rt
+	return rt, nil
+}
+
+// resolveClosureCall reports whether call.Callee names a closure-valued
+// local variable (rather than a builtin or a global function) — if so,
+// it takes priority over both, matching cascade_spec.md §10's ordinary
+// shadowing rules extended to the "callable" namespace, and its
+// signature is returned with ok=true; ok=false with a nil error means
+// call.Callee isn't in scope at all, letting the caller fall through to
+// builtin/global-function dispatch as usual. A same-named variable that
+// isn't a function value is a hard error either way — no silent
+// fallthrough to some other same-named callable, since writing `x(...)`
+// for a non-callable local `x` is almost certainly a mistake.
+func (c *checker) resolveClosureCall(sc *scope, call *ast.CallExpr) (sig funcSig, ok bool, err error) {
+	info, found := sc.lookup(call.Callee)
+	if !found {
+		return funcSig{}, false, nil
+	}
+	if info.Type.Func == nil {
+		return funcSig{}, false, fmt.Errorf("line %d: %q is not callable (%s)", call.Line, call.Callee, typeString(info.Type))
+	}
+	call.IsClosureVar = true
+	return funcSig{Params: info.Type.Func.Params, Results: info.Type.Func.Results}, true, nil
+}
+
 // structFieldType looks up name among sd's declared fields.
 func structFieldType(sd *ast.StructDecl, name string) (ast.Type, bool) {
 	for _, f := range sd.Fields {
@@ -958,7 +1119,12 @@ func structFieldType(sd *ast.StructDecl, name string) (ast.Type, bool) {
 // typeShapeEqual reports whether a and b are the same type, ignoring
 // Nullable (checkAssignable already handles nullability separately: a
 // non-nullable value may widen into a nullable target, but never the
-// reverse).
+// reverse). Elem/Ptr/Func are compared recursively (a bare a.Name == b.Name
+// check would wrongly treat every pointer — or every func type — as
+// shape-equal to every other, since neither has a Name of its own; a
+// real bug this fixes, caught while adding func-type support and
+// verified to have been latent since Ptr landed in Step 8 — see
+// CLAUDE.md's "確定した設計判断").
 func typeShapeEqual(a, b ast.Type) bool {
 	if (a.Elem == nil) != (b.Elem == nil) {
 		return false
@@ -966,15 +1132,47 @@ func typeShapeEqual(a, b ast.Type) bool {
 	if a.Elem != nil {
 		return typeShapeEqual(*a.Elem, *b.Elem)
 	}
+	if (a.Ptr == nil) != (b.Ptr == nil) {
+		return false
+	}
+	if a.Ptr != nil {
+		return typeShapeEqual(*a.Ptr, *b.Ptr)
+	}
+	if (a.Func == nil) != (b.Func == nil) {
+		return false
+	}
+	if a.Func != nil {
+		return funcTypeShapeEqual(*a.Func, *b.Func)
+	}
 	return a.Name == b.Name
+}
+
+// funcTypeShapeEqual reports whether a and b have the same parameter and
+// result types, ignoring each one's own Nullable exactly like
+// typeShapeEqual does for every other type.
+func funcTypeShapeEqual(a, b ast.FuncType) bool {
+	if len(a.Params) != len(b.Params) || len(a.Results) != len(b.Results) {
+		return false
+	}
+	for i := range a.Params {
+		if !typeShapeEqual(a.Params[i], b.Params[i]) {
+			return false
+		}
+	}
+	for i := range a.Results {
+		if !typeShapeEqual(a.Results[i], b.Results[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 // typeGiven reports whether t is an explicitly written type (`let x: T`)
 // as opposed to the zero Type `let x = Init` leaves for inference — a
-// list or pointer type has an empty Name, so checking Name alone isn't
-// enough once those exist.
+// list, pointer, or function type has an empty Name, so checking Name
+// alone isn't enough once those exist.
 func typeGiven(t ast.Type) bool {
-	return t.Name != "" || t.Elem != nil || t.Ptr != nil
+	return t.Name != "" || t.Elem != nil || t.Ptr != nil || t.Func != nil
 }
 
 // exprType infers e's type. NoneLit has no type of its own (see its doc
@@ -1019,6 +1217,8 @@ func (c *checker) exprType(sc *scope, e ast.Expr) (ast.Type, error) {
 		return info.Type, nil
 	case *ast.CallExpr:
 		return c.checkCallExprValue(sc, v)
+	case *ast.ClosureLit:
+		return c.checkClosureLit(sc, v)
 	case *ast.StructLit:
 		return c.checkStructLit(sc, v)
 	case *ast.FieldExpr:
@@ -1131,30 +1331,44 @@ func (c *checker) inferListLitType(sc *scope, lit *ast.ListLit) (ast.Type, error
 	return target, nil
 }
 
+// checkCallSigAsValue validates call's arguments against sig and returns
+// its single result type — shared by every call kind used as a value
+// (plain function, method, closure variable): each must return exactly
+// one value in this position (cascade_spec.md §8.1 vs §8.5's multi-value
+// form, which only a MultiLetDecl's Init can receive).
+func (c *checker) checkCallSigAsValue(sc *scope, call *ast.CallExpr, sig funcSig) (ast.Type, error) {
+	if err := c.checkCallArgs(sc, call, sig); err != nil {
+		return ast.Type{}, err
+	}
+	if len(sig.Results) == 0 {
+		return ast.Type{}, fmt.Errorf("line %d: %s() returns no value", call.Line, call.Callee)
+	}
+	if len(sig.Results) > 1 {
+		return ast.Type{}, fmt.Errorf("line %d: %s() returns multiple values; use a multi-value let (e.g. 'let a, b = %s(...)') to receive them", call.Line, call.Callee, call.Callee)
+	}
+	return sig.Results[0], nil
+}
+
 // checkCallExprValue validates a call expression used as a value (as
 // opposed to a bare statement — see checkExprStmt): the `string()`
-// conversion, the list builtins `len()`/`range()`/`append()`
-// (cascade_spec.md §13), or a call to any known single-value-returning
-// function (§8.1) — a multi-value function (§8.5) can't produce one
-// value, so it's rejected here with a pointer to the multi-value `let`
-// form instead. The rest of §13's builtins (filter/map/reduce, which
-// need closures) land in the steps that need them.
+// conversion, the list/closure builtins `len()`/`range()`/`append()`/
+// `filter()`/`map()`/`reduce()` (cascade_spec.md §13), a call to a
+// closure-valued local variable (§8.3), or a call to any known
+// single-value-returning function (§8.1) — a multi-value function (§8.5)
+// can't produce one value, so it's rejected here with a pointer to the
+// multi-value `let` form instead (see checkCallSigAsValue).
 func (c *checker) checkCallExprValue(sc *scope, call *ast.CallExpr) (ast.Type, error) {
 	if call.Receiver != nil {
 		sig, err := c.resolveMethodCall(sc, call)
 		if err != nil {
 			return ast.Type{}, err
 		}
-		if err := c.checkCallArgs(sc, call, sig); err != nil {
-			return ast.Type{}, err
-		}
-		if len(sig.Results) == 0 {
-			return ast.Type{}, fmt.Errorf("line %d: %s() returns no value", call.Line, call.Callee)
-		}
-		if len(sig.Results) > 1 {
-			return ast.Type{}, fmt.Errorf("line %d: %s() returns multiple values; use a multi-value let (e.g. 'let a, b = %s(...)') to receive them", call.Line, call.Callee, call.Callee)
-		}
-		return sig.Results[0], nil
+		return c.checkCallSigAsValue(sc, call, sig)
+	}
+	if sig, ok, err := c.resolveClosureCall(sc, call); err != nil {
+		return ast.Type{}, err
+	} else if ok {
+		return c.checkCallSigAsValue(sc, call, sig)
 	}
 	switch call.Callee {
 	case "string":
@@ -1213,21 +1427,59 @@ func (c *checker) checkCallExprValue(sc *scope, call *ast.CallExpr) (ast.Type, e
 		}
 		call.ArgType = lt
 		return lt, nil
+	case "filter":
+		lt, ft, err := c.checkListAndHOFArg(sc, call, "filter", 2, 0, 1)
+		if err != nil {
+			return ast.Type{}, err
+		}
+		if len(ft.Params) != 1 || !typeShapeEqual(ft.Params[0], *lt.Elem) {
+			return ast.Type{}, fmt.Errorf("line %d: filter()'s function must take exactly one %s parameter", call.Line, typeString(*lt.Elem))
+		}
+		if len(ft.Results) != 1 || ft.Results[0].Name != "bool" || ft.Results[0].Nullable {
+			return ast.Type{}, fmt.Errorf("line %d: filter()'s function must return bool", call.Line)
+		}
+		call.ArgType = lt
+		call.HOFType = ft
+		return lt, nil
+	case "map":
+		lt, ft, err := c.checkListAndHOFArg(sc, call, "map", 2, 0, 1)
+		if err != nil {
+			return ast.Type{}, err
+		}
+		if len(ft.Params) != 1 || !typeShapeEqual(ft.Params[0], *lt.Elem) {
+			return ast.Type{}, fmt.Errorf("line %d: map()'s function must take exactly one %s parameter", call.Line, typeString(*lt.Elem))
+		}
+		if len(ft.Results) != 1 {
+			return ast.Type{}, fmt.Errorf("line %d: map()'s function must return exactly one value", call.Line)
+		}
+		call.ArgType = lt
+		call.HOFType = ft
+		resultElem := ft.Results[0]
+		return ast.Type{Elem: &resultElem}, nil
+	case "reduce":
+		lt, ft, err := c.checkListAndHOFArg(sc, call, "reduce", 3, 0, 2)
+		if err != nil {
+			return ast.Type{}, err
+		}
+		initType, err := c.exprType(sc, call.Args[1])
+		if err != nil {
+			return ast.Type{}, err
+		}
+		if len(ft.Params) != 2 || !typeShapeEqual(ft.Params[0], initType) || !typeShapeEqual(ft.Params[1], *lt.Elem) {
+			return ast.Type{}, fmt.Errorf("line %d: reduce()'s function must take (%s, %s) parameters", call.Line, typeString(initType), typeString(*lt.Elem))
+		}
+		if len(ft.Results) != 1 || !typeShapeEqual(ft.Results[0], initType) {
+			return ast.Type{}, fmt.Errorf("line %d: reduce()'s function must return %s (the accumulator type)", call.Line, typeString(initType))
+		}
+		call.ArgType = lt
+		call.HOFType = ft
+		return initType, nil
 	default:
 		sig, ok := c.sigs[call.Callee]
 		if !ok {
 			return ast.Type{}, fmt.Errorf("line %d: %q cannot be used as a value", call.Line, call.Callee)
 		}
-		if err := c.checkCallArgs(sc, call, sig); err != nil {
-			return ast.Type{}, err
-		}
-		if len(sig.Results) == 0 {
-			return ast.Type{}, fmt.Errorf("line %d: %s() returns no value", call.Line, call.Callee)
-		}
-		if len(sig.Results) > 1 {
-			return ast.Type{}, fmt.Errorf("line %d: %s() returns multiple values; use a multi-value let (e.g. 'let a, b = %s(...)') to receive them", call.Line, call.Callee, call.Callee)
-		}
-		return sig.Results[0], nil
+		return c.checkCallSigAsValue(sc, call, sig)
 	}
 }
 
@@ -1267,6 +1519,28 @@ func unaryResultType(op string, xt ast.Type, line int) (ast.Type, error) {
 // int/float, CONCAT for string — codegen reads ResultType.Name to tell
 // them apart, mirroring Seed's identical `+` dispatch).
 func binaryResultType(op string, xt, yt ast.Type, line int) (ast.Type, error) {
+	// A pointer or a function value is always Nullable (see ast.Type's
+	// doc) but can never be narrowed to satisfy the generic "narrow with
+	// 'is not none' first" rejection below — narrowedVarInfo deliberately
+	// excludes both (see its doc: *T is *T and func(...): R is
+	// func(...): R regardless of nilness) — so telling the user to narrow
+	// would send them chasing something structurally impossible. Each
+	// gets its own accurate rejection instead. Pointer equality (`p1 ==
+	// p2`, comparing addresses) is the one exception: Go allows it
+	// directly, with no narrowing involved at all, so it's let through
+	// before either check below would otherwise catch it.
+	if (op == "==" || op == "!=") && xt.Ptr != nil && yt.Ptr != nil {
+		if !typeShapeEqual(xt, yt) {
+			return ast.Type{}, fmt.Errorf("line %d: operator %q: mismatched operand types %s and %s", line, op, typeString(xt), typeString(yt))
+		}
+		return ast.Type{Name: "bool"}, nil
+	}
+	if xt.Func != nil || yt.Func != nil {
+		return ast.Type{}, fmt.Errorf("line %d: operator %q does not support function values (use 'is none'/'is not none' to check nullness)", line, op)
+	}
+	if xt.Ptr != nil || yt.Ptr != nil {
+		return ast.Type{}, fmt.Errorf("line %d: operator %q does not support pointer values (use 'is none'/'is not none' to check nullness, or '*' to dereference)", line, op)
+	}
 	if xt.Nullable || yt.Nullable {
 		return ast.Type{}, fmt.Errorf("line %d: operator %q needs non-nullable operands (narrow with 'is not none' first)", line, op)
 	}
@@ -1303,6 +1577,9 @@ func binaryResultType(op string, xt, yt ast.Type, line int) (ast.Type, error) {
 		}
 		return ast.Type{Name: "bool"}, nil
 	case "==", "!=":
+		// Func operands are already rejected above (before the generic
+		// nullable check), and pointer operands are already accepted and
+		// returned above too — neither can reach this case at all.
 		return ast.Type{Name: "bool"}, nil
 	case "&&", "||":
 		if xt.Name != "bool" {
@@ -1316,14 +1593,56 @@ func binaryResultType(op string, xt, yt ast.Type, line int) (ast.Type, error) {
 
 // typeString formats t for error messages, e.g. "int", "string?", or
 // "[]int" (the "?" always applies to the outermost type — see ast.Type's
-// doc — so it's appended after any "[]" recursion, never before it).
+// doc — so it's appended after any "[]" recursion, never before it). A
+// pointer prints as "*T" and a function type as "func(T1, T2): R" — both
+// with no trailing "?" of their own, since both are unconditionally
+// nullable already (see ast.Type's doc); printing one anyway would be
+// pure noise on every single pointer/func type, never actually
+// distinguishing anything. Previously this fell through to the bare
+// `base := t.Name` case for both (t.Name is "" for either), producing a
+// bare "?" with no type information at all — a real bug caught while
+// adding func-type support (see typeShapeEqual's doc for the sibling bug
+// this mirrors).
 func typeString(t ast.Type) string {
-	base := t.Name
 	if t.Elem != nil {
-		base = "[]" + typeString(*t.Elem)
+		base := "[]" + typeString(*t.Elem)
+		if t.Nullable {
+			return base + "?"
+		}
+		return base
+	}
+	if t.Ptr != nil {
+		return "*" + typeString(*t.Ptr)
+	}
+	if t.Func != nil {
+		return funcTypeString(*t.Func)
 	}
 	if t.Nullable {
-		return base + "?"
+		return t.Name + "?"
 	}
-	return base
+	return t.Name
+}
+
+// funcTypeString formats a function type's signature for error messages,
+// e.g. "func(int, int): bool" or "func(string)" (no `: ...` at all when
+// there's no return value, matching how the type itself is written —
+// cascade_spec.md §2.2).
+func funcTypeString(ft ast.FuncType) string {
+	params := make([]string, len(ft.Params))
+	for i, p := range ft.Params {
+		params[i] = typeString(p)
+	}
+	s := "func(" + strings.Join(params, ", ") + ")"
+	switch len(ft.Results) {
+	case 0:
+	case 1:
+		s += ": " + typeString(ft.Results[0])
+	default:
+		results := make([]string, len(ft.Results))
+		for i, r := range ft.Results {
+			results[i] = typeString(r)
+		}
+		s += ": (" + strings.Join(results, ", ") + ")"
+	}
+	return s
 }

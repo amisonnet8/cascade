@@ -4,15 +4,17 @@ package ast
 
 // Type is a Cascade type reference: a bare scalar or struct name
 // (cascade_spec.md §2.1/§4.1: int/float/string/bool/StructName — Name
-// set, Elem and Ptr nil), a list type (§2.2's `[]T`, Elem set to T), or a
-// pointer type (§2.2's `*T`, Ptr set to T), either optionally nullable
-// (§2.3) — except a pointer, which is *always* nullable regardless of
-// whether `?` was written (§2.2's own zero value for `*T` is `none`; see
-// CLAUDE.md's "確定した設計判断" for why a pointer's nullability is
-// represented via Go's native nil rather than a companion isset flag,
-// unlike every other nullable type). Map/func/error forms are added as
-// the steps that need them land (see CLAUDE.md's implementation step
-// plan).
+// set, Elem/Ptr/Func nil), a list type (§2.2's `[]T`, Elem set to T), a
+// pointer type (§2.2's `*T`, Ptr set to T), or a function type (§2.2's
+// `func(T1, T2, ...): R`, Func set), either optionally nullable (§2.3) —
+// except a pointer or a function type, which are *always* nullable
+// regardless of whether `?` was written (§2.2's own zero value for both
+// `*T` and `func(...): R` is `none`; see CLAUDE.md's "確定した設計判断" for
+// why a pointer's — and, by the same reasoning, a function value's —
+// nullability is represented via Go's native nil rather than a companion
+// isset flag, unlike every other nullable type). Map/error forms are
+// added as the steps that need them land (see CLAUDE.md's implementation
+// step plan).
 //
 // `?` always binds to the outermost type built so far — `[]int?` parses
 // as `([]int)?` (a nullable list), not `[](int?)` (a list of nullable
@@ -25,6 +27,19 @@ type Type struct {
 	Nullable bool
 	Elem     *Type
 	Ptr      *Type
+	Func     *FuncType
+}
+
+// FuncType is a function type's signature (cascade_spec.md §2.2, §8.3):
+// `func(T1, T2, ...): R` (Results has one entry) or `func(T1, T2, ...):
+// (R1, R2, ...)` (§8.5's multi-value form, Results has more than one
+// entry), or no `: ...` at all for a function with no return value
+// (Results empty) — the same three shapes a func declaration's own
+// result-type clause allows (see parseResultTypes), just detached from a
+// name and body.
+type FuncType struct {
+	Params  []Type
+	Results []Type
 }
 
 // Param is a single function parameter.
@@ -370,6 +385,20 @@ func (*IndexExpr) exprNode() {}
 // automatically address-of'd or dereferenced before the call, when its
 // own value/pointer kind doesn't already match the method's declared
 // receiver kind — at most one of the two is ever true.
+//
+// IsClosureVar is filled in by sema.Check when Receiver is nil and
+// Callee instead names a closure-valued local variable rather than a
+// global function (cascade_spec.md §8.3) — codegen then emits the CALL
+// against that variable's own value token directly (amivm's callname
+// category accepts a bare variable holding a function value — see
+// amivm_spec.md's "メソッド呼び出しのパターン") rather than a `!Callee`
+// reference.
+//
+// HOFType is filled in by sema.Check only for the higher-order builtins
+// that need their function-valued argument's own signature to generate
+// correct AMIVM-IR (cascade_spec.md §8.4): filter/map/reduce's own
+// predicate/mapper/folder argument — the resolved func type of Args[1]
+// (Args[2] for reduce). It's nil for every other call.
 type CallExpr struct {
 	Receiver       Expr // non-nil for obj.method(...); nil for a plain call
 	Callee         string
@@ -379,6 +408,8 @@ type CallExpr struct {
 	RecvStruct     string
 	RecvNeedsAddr  bool
 	RecvNeedsDeref bool
+	IsClosureVar   bool
+	HOFType        *FuncType
 }
 
 func (*CallExpr) exprNode() {}
@@ -456,6 +487,24 @@ type NullCheckExpr struct {
 
 func (*NullCheckExpr) exprNode() {}
 
+// ClosureLit is a closure literal (cascade_spec.md §8.3): `func(params...):
+// results { body }` used in expression position, as opposed to a
+// top-level FuncDecl. It captures every surrounding-scope variable it
+// references, the same as any Go func literal — sema/codegen need no
+// separate capture-analysis pass for this (see CLAUDE.md's "確定した設計
+// 判断"). ResolvedType is filled in by sema.Check with the closure's own
+// func type (so codegen doesn't have to re-derive it from Params/Results,
+// the same ast-annotation pattern LetDecl.ResolvedType uses).
+type ClosureLit struct {
+	Params       []Param
+	Results      []Type
+	Body         []Stmt
+	Line         int
+	ResolvedType Type
+}
+
+func (*ClosureLit) exprNode() {}
+
 // StmtLine returns the source line a statement node was parsed from.
 func StmtLine(s Stmt) int {
 	switch v := s.(type) {
@@ -522,6 +571,8 @@ func ExprLine(e Expr) int {
 	case *BinaryExpr:
 		return v.Line
 	case *NullCheckExpr:
+		return v.Line
+	case *ClosureLit:
 		return v.Line
 	default:
 		return 0

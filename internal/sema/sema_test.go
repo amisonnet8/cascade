@@ -1284,3 +1284,238 @@ func main(): int {
 		})
 	}
 }
+
+func TestCheck_ValidPointerEqualityComparison(t *testing.T) {
+	// Regression test: pointer equality (comparing addresses) is valid Go
+	// and was wrongly rejected before this fix — a pointer is always
+	// Nullable (ast.Type's doc), and binaryResultType used to reject any
+	// nullable operand outright with a "narrow first" message that isn't
+	// even actionable for a pointer (narrowedVarInfo deliberately excludes
+	// pointers from narrowing — see its doc). Found while adding an
+	// analogous guard for function-value comparison (Step 9).
+	src := `
+struct Point {
+	x: int
+	y: int
+}
+func main(): int {
+	let p: Point = Point{x: 1, y: 2}
+	let a: *Point = &p
+	let b: *Point = &p
+	let same = a == b
+	let different = a != b
+	print(string(same) + string(different))
+	return 0
+}
+`
+	if err := check(t, src); err != nil {
+		t.Fatalf("Check() = %v, want nil", err)
+	}
+}
+
+func TestCheck_ValidClosuresAndHigherOrderFunctions(t *testing.T) {
+	src := `
+func makeAdder(base: int): func(int): int {
+	return func(n: int): int {
+		return base + n
+	}
+}
+
+func applyTwice(f: func(int): int, x: int): int {
+	return f(f(x))
+}
+
+func main(): int {
+	let add5 = makeAdder(5)
+	print(string(add5(10)))
+
+	let count = 0
+	let inc = func(): int {
+		count += 1
+		return count
+	}
+	print(string(inc()))
+	print(string(inc()))
+
+	print(string(applyTwice(add5, 1)))
+
+	let numbers: []int = [1, 2, 3, 4, 5, 6]
+	let evens = filter(numbers, func(n: int): bool {
+		return n % 2 == 0
+	})
+	let doubled = map(numbers, func(n: int): int {
+		return n * 2
+	})
+	let total = reduce(numbers, 0, func(acc: int, n: int): int {
+		return acc + n
+	})
+	print(string(len(evens)) + string(len(doubled)) + string(total))
+
+	return 0
+}
+`
+	if err := check(t, src); err != nil {
+		t.Fatalf("Check() = %v, want nil", err)
+	}
+}
+
+func TestCheck_ClosureErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		src     string
+		wantErr string
+	}{
+		{
+			name: "closure literal cannot itself contain another closure literal",
+			src: `
+func main(): int {
+	let f = func(): int {
+		let g = func(): int {
+			return 1
+		}
+		return g()
+	}
+	return 0
+}
+`,
+			wantErr: "cannot itself contain another closure literal",
+		},
+		{
+			name: "closure parameter type mismatch",
+			src: `
+func main(): int {
+	let f: func(int): int = func(n: string): string {
+		return n
+	}
+	return 0
+}
+`,
+			wantErr: "cannot assign",
+		},
+		{
+			name: "calling a non-function local variable",
+			src: `
+func main(): int {
+	let x = 5
+	x(1)
+	return 0
+}
+`,
+			wantErr: "is not callable",
+		},
+		{
+			name: "break inside a closure cannot reach an enclosing loop",
+			src: `
+func main(): int {
+	while true {
+		let f = func(): int {
+			break
+			return 0
+		}
+	}
+	return 0
+}
+`,
+			wantErr: "break outside of a loop or switch",
+		},
+		{
+			name: "closure calling itself by name is undefined (no named self-reference)",
+			src: `
+func main(): int {
+	let f = func(n: int): int {
+		return f(n)
+	}
+	return 0
+}
+`,
+			wantErr: "\"f\" cannot be used as a value",
+		},
+		{
+			name: "filter requires a bool-returning function",
+			src: `
+func main(): int {
+	let xs = [1, 2, 3]
+	let ys = filter(xs, func(n: int): int {
+		return n
+	})
+	return 0
+}
+`,
+			wantErr: "filter()'s function must return bool",
+		},
+		{
+			name: "filter requires the predicate's parameter to match the element type",
+			src: `
+func main(): int {
+	let xs = [1, 2, 3]
+	let ys = filter(xs, func(n: string): bool {
+		return true
+	})
+	return 0
+}
+`,
+			wantErr: "filter()'s function must take exactly one int parameter",
+		},
+		{
+			name: "map requires a function argument",
+			src: `
+func main(): int {
+	let xs = [1, 2, 3]
+	let ys = map(xs, 5)
+	return 0
+}
+`,
+			wantErr: "map() expects a function as its last argument",
+		},
+		{
+			name: "reduce's function must return the accumulator type",
+			src: `
+func main(): int {
+	let xs = [1, 2, 3]
+	let total = reduce(xs, 0, func(acc: int, n: int): string {
+		return "oops"
+	})
+	return 0
+}
+`,
+			wantErr: "reduce()'s function must return int",
+		},
+		{
+			name: "reduce's function must take (accumulator, element) parameters",
+			src: `
+func main(): int {
+	let xs = [1, 2, 3]
+	let total = reduce(xs, 0, func(n: int): int {
+		return n
+	})
+	return 0
+}
+`,
+			wantErr: "reduce()'s function must take (int, int) parameters",
+		},
+		{
+			name: "function values cannot be compared with ==",
+			src: `
+func main(): int {
+	let f: func(): int = func(): int { return 1 }
+	let g: func(): int = func(): int { return 2 }
+	let same = f == g
+	return 0
+}
+`,
+			wantErr: "does not support function values",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := check(t, tt.src)
+			if err == nil {
+				t.Fatalf("Check() = nil, want error containing %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Check() = %q, want error containing %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}

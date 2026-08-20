@@ -15,15 +15,19 @@
 // `break`/`continue`; and a full operator-precedence expression grammar
 // (§6, including unary `&`/`*` for address-of/dereference, §4.4),
 // literals (including nullable-type `T?` declarations, pointer types
-// `*T`, the `none` literal, list literals `[1, 2, 3]`/`[]`, and struct
-// literals `Name{field: value, ...}`), variable references, function/
-// method calls, field access `x.field`, list indexing `xs[i]`, and `is
+// `*T`, function types `func(T1, T2, ...): R` (§2.2, §8.3) and closure
+// literals `func(name: Type, ...): R { body }` in expression position,
+// the `none` literal, list literals `[1, 2, 3]`/`[]`, and struct literals
+// `Name{field: value, ...}`), variable references, function/method/
+// closure calls, field access `x.field`, list indexing `xs[i]`, and `is
 // none`/`is not none` (§7) directly on an atom (the only place the spec
 // actually uses it — as an `if`/`switch` condition). A struct literal is
 // only recognized where `{` cannot instead open a block (see
 // withStructLitForbidden/withStructLitAllowed), mirroring Go's identical
-// restriction. Later development steps extend this grammar further
-// (closures, channels/pipelines, ...) one feature at a time.
+// restriction — a closure literal needs no such guard, since seeing
+// `func` in expression position is never itself ambiguous with anything
+// else. Later development steps extend this grammar further (maps,
+// channels/pipelines, ...) one feature at a time.
 package parser
 
 import (
@@ -344,6 +348,9 @@ func (p *parser) parseTypeBase() (ast.Type, error) {
 		// with no `?` written — see ast.Type's doc.
 		return ast.Type{Ptr: &elem, Nullable: true}, nil
 	}
+	if p.cur().Kind == lexer.KwFunc {
+		return p.parseFuncType()
+	}
 	if name, ok := typeKeywords[p.cur().Kind]; ok {
 		p.advance()
 		return ast.Type{Name: name}, nil
@@ -356,6 +363,47 @@ func (p *parser) parseTypeBase() (ast.Type, error) {
 		return ast.Type{Name: name.Literal}, nil
 	}
 	return ast.Type{}, fmt.Errorf("line %d: expected a type, got %q", p.cur().Line, p.cur().Literal)
+}
+
+// parseFuncType parses a function type (cascade_spec.md §2.2, §8.3):
+// `func(T1, T2, ...): R`, optionally with a multi-value result
+// (`: (R1, R2, ...)`, reusing parseResultTypes) or none at all (no `:` —
+// same "no return value" shape a func declaration allows). Unlike
+// parseParam, the parameter list here is bare types with no names — this
+// is a type, not a signature with a body (see parsePrimaryAtom's
+// KwFunc-with-a-body case for the closure-literal counterpart).
+func (p *parser) parseFuncType() (ast.Type, error) {
+	p.advance() // 'func'
+	if _, err := p.expect(lexer.LParen, "'('"); err != nil {
+		return ast.Type{}, err
+	}
+	ft := &ast.FuncType{}
+	for p.cur().Kind != lexer.RParen {
+		if len(ft.Params) > 0 {
+			if _, err := p.expect(lexer.Comma, "','"); err != nil {
+				return ast.Type{}, err
+			}
+		}
+		t, err := p.parseType()
+		if err != nil {
+			return ast.Type{}, err
+		}
+		ft.Params = append(ft.Params, t)
+	}
+	if _, err := p.expect(lexer.RParen, "')'"); err != nil {
+		return ast.Type{}, err
+	}
+	if p.cur().Kind == lexer.Colon {
+		p.advance()
+		results, err := p.parseResultTypes()
+		if err != nil {
+			return ast.Type{}, err
+		}
+		ft.Results = results
+	}
+	// A function value's zero value is always `none` (cascade_spec.md
+	// §2.2), with no `?` written — see ast.Type's doc.
+	return ast.Type{Func: ft, Nullable: true}, nil
 }
 
 func (p *parser) parseBlock() ([]ast.Stmt, error) {
@@ -1038,11 +1086,15 @@ func (p *parser) parsePrimaryAtom() (ast.Expr, error) {
 		return &ast.NoneLit{Line: tok.Line}, nil
 	case lexer.LBracket:
 		return p.parseListLit()
-	case lexer.KwString, lexer.KwInt, lexer.KwFloat, lexer.KwBool:
-		// A type keyword can also name a builtin conversion call, e.g.
-		// string(x) (cascade_spec.md §13) — it's still a reserved
-		// keyword (not an Ident), so it needs its own case here rather
-		// than falling through to the Ident case below.
+	case lexer.KwFunc:
+		return p.parseClosureLit()
+	case lexer.KwString, lexer.KwInt, lexer.KwFloat, lexer.KwBool, lexer.KwMap:
+		// A type keyword can also name a builtin conversion/collection
+		// call, e.g. string(x) (cascade_spec.md §13) or map(list, f)
+		// (§8.4) — "map" is reserved for the future map<K, V> type
+		// (Step 10), so like string/int/float/bool it's still a keyword
+		// (not an Ident), needing its own case here rather than falling
+		// through to the Ident case below.
 		name := p.advance()
 		if p.cur().Kind == lexer.LParen {
 			return p.parseCallExprFrom(name)
@@ -1060,6 +1112,51 @@ func (p *parser) parsePrimaryAtom() (ast.Expr, error) {
 	default:
 		return nil, fmt.Errorf("line %d: unexpected token %q", tok.Line, tok.Literal)
 	}
+}
+
+// parseClosureLit parses a closure literal (cascade_spec.md §8.3):
+// `func(name: Type, ...): results { body }`, syntactically identical to
+// parseFuncDecl's own param-list/result-type/body shape minus the name
+// (and, unlike a func declaration, never a receiver clause — a closure
+// isn't a method).
+func (p *parser) parseClosureLit() (ast.Expr, error) {
+	kw := p.advance() // 'func'
+	lit := &ast.ClosureLit{Line: kw.Line}
+
+	if _, err := p.expect(lexer.LParen, "'('"); err != nil {
+		return nil, err
+	}
+	for p.cur().Kind != lexer.RParen {
+		if len(lit.Params) > 0 {
+			if _, err := p.expect(lexer.Comma, "','"); err != nil {
+				return nil, err
+			}
+		}
+		param, err := p.parseParam()
+		if err != nil {
+			return nil, err
+		}
+		lit.Params = append(lit.Params, param)
+	}
+	if _, err := p.expect(lexer.RParen, "')'"); err != nil {
+		return nil, err
+	}
+
+	if p.cur().Kind == lexer.Colon {
+		p.advance()
+		results, err := p.parseResultTypes()
+		if err != nil {
+			return nil, err
+		}
+		lit.Results = results
+	}
+
+	body, err := p.parseBlock()
+	if err != nil {
+		return nil, err
+	}
+	lit.Body = body
+	return lit, nil
 }
 
 // parseListLit parses a list literal, e.g. `[1, 2, 3]` or `[]`
