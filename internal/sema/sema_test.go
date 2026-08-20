@@ -640,3 +640,196 @@ func main(): int {
 		})
 	}
 }
+
+func TestCheck_ValidLists(t *testing.T) {
+	src := `
+func main(): int {
+	let xs: []int = [1, 2, 3]
+	xs[0] = 100
+	print(string(xs[0]))
+
+	let ys = append(xs, 4)
+	print(string(len(xs)) + string(len(ys)))
+
+	let sum = 0
+	for x in ys {
+		sum += x
+	}
+
+	let rs = range(1, 6)
+	for r in rs {
+		sum += r
+	}
+
+	let empty: []int
+	print(string(len(empty)))
+
+	let names: []string = []
+	print(string(len(names)))
+
+	print(string(sum))
+	return 0
+}
+`
+	if err := check(t, src); err != nil {
+		t.Fatalf("Check() = %v, want nil", err)
+	}
+}
+
+func TestCheck_ListErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		src     string
+		wantErr string
+	}{
+		{
+			name: "list literal element type mismatch",
+			src: `
+func main(): int {
+	let xs: []int = [1, "two", 3]
+	return 0
+}
+`,
+			wantErr: "cannot assign string to int",
+		},
+		{
+			name: "cannot infer type from an empty list literal",
+			src: `
+func main(): int {
+	let xs = []
+	return 0
+}
+`,
+			wantErr: "cannot infer a type from an empty list literal",
+		},
+		{
+			name: "inferred list element types must match",
+			src: `
+func main(): int {
+	let xs = [1, 2.0]
+	return 0
+}
+`,
+			wantErr: "cannot assign float to int",
+		},
+		{
+			name: "indexing a non-list is rejected",
+			src: `
+func main(): int {
+	let x = 1
+	let y = x[0]
+	return 0
+}
+`,
+			wantErr: "cannot index into int",
+		},
+		{
+			name: "list index must be int",
+			src: `
+func main(): int {
+	let xs = [1, 2, 3]
+	let y = xs["0"]
+	return 0
+}
+`,
+			wantErr: "list index must be int, got string",
+		},
+		{
+			name: "index-assignment element type mismatch",
+			src: `
+func main(): int {
+	let xs = [1, 2, 3]
+	xs[0] = "oops"
+	return 0
+}
+`,
+			wantErr: "cannot assign string to int",
+		},
+		{
+			name: "for-in over a non-list is rejected",
+			src: `
+func main(): int {
+	for x in 1 {
+		print(string(x))
+	}
+	return 0
+}
+`,
+			wantErr: "for-in requires a list, got int",
+		},
+		{
+			name: "append requires a list first argument",
+			src: `
+func main(): int {
+	let x = append(1, 2)
+	return 0
+}
+`,
+			wantErr: "append() expects a list as its first argument",
+		},
+		{
+			name: "append value must match element type",
+			src: `
+func main(): int {
+	let xs = [1, 2, 3]
+	let ys = append(xs, "four")
+	return 0
+}
+`,
+			wantErr: "cannot assign string to int",
+		},
+		{
+			name: "range requires int arguments",
+			src: `
+func main(): int {
+	let rs = range(1, "6")
+	return 0
+}
+`,
+			wantErr: "range() requires int arguments, got string",
+		},
+		{
+			name: "len does not support int",
+			src: `
+func main(): int {
+	let n = len(1)
+	return 0
+}
+`,
+			wantErr: "len() does not support int",
+		},
+		{
+			name: "cannot assign a list literal to a non-list type",
+			src: `
+func main(): int {
+	let x: int = [1, 2, 3]
+	return 0
+}
+`,
+			wantErr: "cannot assign a list literal to non-list type int",
+		},
+		{
+			name: "nullable value cannot narrow implicitly into a non-nullable target",
+			src: `
+func main(): int {
+	let x: int? = 5
+	let y: int = x
+	return 0
+}
+`,
+			wantErr: "cannot assign int? to non-nullable int",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := check(t, tt.src)
+			if err == nil {
+				t.Fatalf("Check() = nil, want error containing %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Check() = %q, want error containing %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}

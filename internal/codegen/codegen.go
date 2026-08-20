@@ -27,12 +27,13 @@
 // `break` (loop or switch) and `continue` (loop only, skipping over any
 // enclosing switch) need separate target stacks.
 //
-// Only enough is implemented so far to compile Steps 1-5: a single `main`
-// function whose body is `let`/`const` declarations, scalar/compound
-// assignment, `print(...)`, `return`, the full operator set (cascade_spec.md
-// §6), and control flow (if/elif/else, while, switch, break/continue).
-// Later steps extend genStmt/genValue one feature at a time, the same way
-// parser's grammar grows.
+// Only enough is implemented so far to compile Steps 1-6: a single `main`
+// function whose body is `let`/`const` declarations, scalar/list-element/
+// compound assignment, `print(...)`, `return`, the full operator set
+// (cascade_spec.md §6), control flow (if/elif/else, while, for-in,
+// switch, break/continue), and lists (`[]T` — literals, indexing,
+// append/range/len; see list.go). Later steps extend genStmt/genValue one
+// feature at a time, the same way parser's grammar grows.
 package codegen
 
 import (
@@ -60,7 +61,8 @@ func Generate(f *ast.File) (string, error) {
 		return "", fmt.Errorf("codegen: no main function (run sema.Check first)")
 	}
 
-	g := &funcGen{scope: newScope(nil)}
+	slices := &sliceRegistry{used: map[string]bool{}}
+	g := &funcGen{scope: newScope(nil), slices: slices}
 	for _, stmt := range main.Body {
 		if err := genStmt(g, stmt); err != nil {
 			return "", err
@@ -68,6 +70,14 @@ func Generate(f *ast.File) (string, error) {
 	}
 
 	var b strings.Builder
+	for _, elemName := range slices.sorted() {
+		elemIRType, err := scalarTypeToIR(ast.Type{Name: elemName})
+		if err != nil {
+			return "", err
+		}
+		fmt.Fprintf(&b, "SLTYPE\t%s\t%s\n", listTypeToken(elemName), elemIRType)
+	}
+
 	fmt.Fprintf(&b, "FUNC\t!%s\t:\t^int\n", mainInternalName)
 	for _, d := range g.decls {
 		fmt.Fprintf(&b, "\tVAR\t%s\t%s\n", d.Op, d.IRType)
@@ -101,6 +111,7 @@ type funcGen struct {
 	decls         []varDecl
 	b             strings.Builder
 	scope         *scope
+	slices        *sliceRegistry
 	seq           int
 	labelSeq      int
 	breakStack    []string // break targets: pushed by both while and switch
@@ -200,6 +211,8 @@ func genStmt(g *funcGen, stmt ast.Stmt) error {
 		return genWhileStmt(g, s)
 	case *ast.SwitchStmt:
 		return genSwitchStmt(g, s)
+	case *ast.ForInStmt:
+		return genForInStmt(g, s)
 	case *ast.BreakStmt:
 		return genBreakStmt(g, s)
 	case *ast.ContinueStmt:
@@ -441,7 +454,7 @@ func genIncDecStmt(g *funcGen, stmt *ast.IncDecStmt) error {
 // than re-inferring it from decl.Init.
 func genLetDecl(g *funcGen, decl *ast.LetDecl) error {
 	typ := decl.ResolvedType
-	irType, err := scalarTypeToIR(typ)
+	irType, err := typeToIR(g.slices, typ)
 	if err != nil {
 		return err
 	}
@@ -458,16 +471,34 @@ func genLetDecl(g *funcGen, decl *ast.LetDecl) error {
 	return genInit(g, ref, decl.Init)
 }
 
+// genAssignStmt compiles `name = value` or, when Index is set,
+// `name[Index] = value` (cascade_spec.md §5), an ASET into the existing
+// list — unlike a whole-list reassignment (genInit), this never
+// reallocates, matching Go's own in-place slice-element-assignment
+// semantics.
 func genAssignStmt(g *funcGen, stmt *ast.AssignStmt) error {
 	ref, ok := g.scope.lookup(stmt.Name)
 	if !ok {
 		return fmt.Errorf("codegen: undefined name %q (sema bug)", stmt.Name)
 	}
+	if stmt.Index != nil {
+		idxOp, err := genValue(g, stmt.Index)
+		if err != nil {
+			return err
+		}
+		v, err := genValue(g, stmt.Value)
+		if err != nil {
+			return err
+		}
+		g.emit("\tASET\t%s\t%s\t%s\n", ref.ValOp, idxOp, v)
+		return nil
+	}
 	return genInit(g, ref, stmt.Value)
 }
 
-// genInit emits the SET(s) that give ref its value: the zero value (and,
-// if nullable, a false flag) when init is nil or the `none` literal, or
+// genInit emits the SET(s) (or, for a list literal, SLMAKE+ASET — see
+// genListLiteralInit) that give ref its value: the zero value (and, if
+// nullable, a false flag) when init is nil or the `none` literal, or
 // init's own value (and a true flag) otherwise.
 func genInit(g *funcGen, ref varRef, init ast.Expr) error {
 	if init == nil {
@@ -475,6 +506,9 @@ func genInit(g *funcGen, ref varRef, init ast.Expr) error {
 	}
 	if _, isNone := init.(*ast.NoneLit); isNone {
 		return genResetToZero(g, ref)
+	}
+	if lit, isList := init.(*ast.ListLit); isList {
+		return genListLiteralInit(g, ref, lit)
 	}
 	v, err := genValue(g, init)
 	if err != nil {
@@ -572,6 +606,8 @@ func genValue(g *funcGen, e ast.Expr) (string, error) {
 		return genCallValue(g, v)
 	case *ast.NullCheckExpr:
 		return genNullCheck(g, v)
+	case *ast.IndexExpr:
+		return genIndexRead(g, v)
 	default:
 		return "", fmt.Errorf("codegen: unsupported value expression %T", e)
 	}
@@ -604,13 +640,20 @@ func genNullCheck(g *funcGen, e *ast.NullCheckExpr) (string, error) {
 	return tmp, nil
 }
 
-// genCallValue compiles a call expression used as a value. Only the
-// `string()` builtin conversion (cascade_spec.md §13) is wired up so far
-// — see genExprStmt for calls used as a bare statement (print).
+// genCallValue compiles a call expression used as a value: the
+// `string()` conversion, and the list builtins `len()`/`range()`/
+// `append()` (cascade_spec.md §13, see list.go) — see genExprStmt for
+// calls used as a bare statement (print).
 func genCallValue(g *funcGen, call *ast.CallExpr) (string, error) {
 	switch call.Callee {
 	case "string":
 		return genStringConversion(g, call)
+	case "len":
+		return genLenCall(g, call)
+	case "range":
+		return genRangeCall(g, call)
+	case "append":
+		return genAppendCall(g, call)
 	default:
 		return "", fmt.Errorf("codegen: unsupported call to %q as a value", call.Callee)
 	}
@@ -748,9 +791,16 @@ func scalarTypeToIR(t ast.Type) (string, error) {
 }
 
 // zeroValueLiteral is the AMIVM-IR value token for t's Cascade base value
-// (cascade_spec.md §2.1), which happens to coincide with Go's zero value
-// in every case.
+// (cascade_spec.md §2.1, §2.2), which happens to coincide with Go's zero
+// value in every case: a list's base value is the empty list `[]`
+// (§2.2), and Go's nil slice already behaves as an empty one for every
+// operation Cascade exposes (len, range-over, append) — `nil` is also
+// what a nullable-and-unset variable of any type resets to, whether
+// scalar or list, so this one token serves both cases identically.
 func zeroValueLiteral(t ast.Type) (string, error) {
+	if t.Elem != nil {
+		return "nil", nil
+	}
 	switch t.Name {
 	case "int":
 		return "0", nil

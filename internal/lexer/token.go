@@ -57,6 +57,8 @@ const (
 	RParen
 	LBrace
 	RBrace
+	LBracket
+	RBracket
 	Colon
 	Comma
 	Question

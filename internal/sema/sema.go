@@ -1,12 +1,13 @@
 // Package sema performs semantic analysis on a Cascade ast.File, since
 // amivm delegates all type/scope checking to go/types and does not check
 // anything itself (see CLAUDE.md "意味検証の責任分担"). Only the checks
-// Steps 1-5 need are implemented so far: a single well-formed `main`,
-// scope-resolved `let`/`const` declarations and scalar/compound
-// assignment, nullable-type (`T?`) compatibility and narrowing
-// (cascade_spec.md §2.3, §4.2, §5, §7), the full operator set (§6), and
-// control flow (if/elif/else, while, switch, break/continue). Later steps
-// add lists, functions, structs, and everything past that.
+// Steps 1-6 need are implemented so far: a single well-formed `main`,
+// scope-resolved `let`/`const` declarations and scalar/list-element/
+// compound assignment, nullable-type (`T?`) compatibility and narrowing
+// (cascade_spec.md §2.3, §4.2, §5, §7), the full operator set (§6),
+// control flow (if/elif/else, while, for-in, switch, break/continue), and
+// lists (`[]T` — literals, indexing, append/range/len). Later steps add
+// functions, structs, and everything past that.
 package sema
 
 import (
@@ -83,6 +84,8 @@ func checkStmt(sc *scope, stmt ast.Stmt, want []ast.Type, loopDepth, breakDepth 
 		return checkWhileStmt(sc, s, want, loopDepth, breakDepth)
 	case *ast.SwitchStmt:
 		return checkSwitchStmt(sc, s, want, loopDepth, breakDepth)
+	case *ast.ForInStmt:
+		return checkForInStmt(sc, s, want, loopDepth, breakDepth)
 	case *ast.BreakStmt:
 		if breakDepth == 0 {
 			return fmt.Errorf("line %d: break outside of a loop or switch", s.Line)
@@ -261,6 +264,25 @@ func checkSwitchStmt(sc *scope, stmt *ast.SwitchStmt, want []ast.Type, loopDepth
 	return nil
 }
 
+// checkForInStmt checks `for x in List { ... }` (cascade_spec.md §7):
+// List must be a non-nullable list, and the loop variable x is declared
+// with its element type in a fresh scope wrapping the body (loopDepth+1,
+// breakDepth+1, same as while — see checkStmt's doc).
+func checkForInStmt(sc *scope, stmt *ast.ForInStmt, want []ast.Type, loopDepth, breakDepth int) error {
+	t, err := exprType(sc, stmt.List)
+	if err != nil {
+		return err
+	}
+	if t.Nullable || t.Elem == nil {
+		return fmt.Errorf("line %d: for-in requires a list, got %s", ast.ExprLine(stmt.List), typeString(t))
+	}
+	stmt.ElemType = *t.Elem
+
+	inner := newScope(sc)
+	inner.declareLocal(stmt.VarName, varInfo{Type: stmt.ElemType})
+	return checkStmtsIn(inner, stmt.Body, want, loopDepth+1, breakDepth+1)
+}
+
 // checkCompoundAssignStmt validates `name op= value` (cascade_spec.md
 // §5) by reusing binaryResultType as if it were `name = name op value` —
 // the same rules apply (e.g. `+=` on a string concatenates, `%=` requires
@@ -313,7 +335,7 @@ func checkLetDecl(sc *scope, decl *ast.LetDecl) error {
 	}
 
 	typ := decl.Type
-	if typ.Name == "" {
+	if !typeGiven(typ) {
 		// `let x = Init`: the type is inferred entirely from Init, which
 		// rules out `let x = none` (§2.3's whole point is that `T?` must
 		// be written explicitly) — exprType already rejects a bare
@@ -339,10 +361,28 @@ func checkLetDecl(sc *scope, decl *ast.LetDecl) error {
 	return nil
 }
 
+// checkAssignStmt validates `name = value` or, when Index is set,
+// `name[Index] = value` (cascade_spec.md §5). Index assignment mutates
+// element content rather than rebinding the variable itself, so it's
+// allowed even on a `const`-declared list (only `name = ...` itself is
+// forbidden there).
 func checkAssignStmt(sc *scope, stmt *ast.AssignStmt) error {
 	info, ok := sc.lookup(stmt.Name)
 	if !ok {
 		return fmt.Errorf("line %d: undefined name %q", stmt.Line, stmt.Name)
+	}
+	if stmt.Index != nil {
+		if info.Type.Nullable || info.Type.Elem == nil {
+			return fmt.Errorf("line %d: cannot index into %s", stmt.Line, typeString(info.Type))
+		}
+		it, err := exprType(sc, stmt.Index)
+		if err != nil {
+			return err
+		}
+		if it.Nullable || it.Name != "int" {
+			return fmt.Errorf("line %d: list index must be int, got %s", ast.ExprLine(stmt.Index), typeString(it))
+		}
+		return checkAssignable(sc, *info.Type.Elem, stmt.Value)
 	}
 	if info.Const {
 		return fmt.Errorf("line %d: cannot assign to %q (declared const)", stmt.Line, stmt.Name)
@@ -388,25 +428,76 @@ func checkReturnStmt(sc *scope, stmt *ast.ReturnStmt, want []ast.Type) error {
 }
 
 // checkAssignable validates that value may be assigned/initialized into a
-// variable of type target (cascade_spec.md §2.3, §5): `none` is only valid
-// against a nullable target, and otherwise value's own type must match
-// target's scalar name exactly (Cascade never does implicit conversion —
-// §6's note on `+` makes the same point for operators).
+// variable of type target (cascade_spec.md §2.3, §5, §3): `none` is only
+// valid against a nullable target; a list literal is checked recursively
+// against target's element type (see checkListLiteralAgainst) rather than
+// through the general exprType path, since an empty `[]` (and, less
+// obviously, a non-empty one) has no type of its own without a target —
+// mirroring how NoneLit is handled; otherwise value's own type must have
+// target's exact shape (ignoring nullability — Cascade never does
+// implicit conversion, and §6's note on `+` makes the same point for
+// operators), and a nullable value may only widen into a nullable target,
+// never narrow implicitly into a non-nullable one (narrowing requires an
+// explicit `is not none` check, §2.3).
 func checkAssignable(sc *scope, target ast.Type, value ast.Expr) error {
 	if _, isNone := value.(*ast.NoneLit); isNone {
 		if !target.Nullable {
-			return fmt.Errorf("line %d: cannot assign 'none' to non-nullable type %s", ast.ExprLine(value), target.Name)
+			return fmt.Errorf("line %d: cannot assign 'none' to non-nullable type %s", ast.ExprLine(value), typeString(target))
 		}
 		return nil
+	}
+	if lit, isList := value.(*ast.ListLit); isList {
+		return checkListLiteralAgainst(sc, lit, target)
 	}
 	vt, err := exprType(sc, value)
 	if err != nil {
 		return err
 	}
-	if vt.Name != target.Name {
+	if vt.Nullable && !target.Nullable {
+		return fmt.Errorf("line %d: cannot assign %s to non-nullable %s (narrow with 'is not none' first)", ast.ExprLine(value), typeString(vt), typeString(target))
+	}
+	if !typeShapeEqual(vt, target) {
 		return fmt.Errorf("line %d: cannot assign %s to %s", ast.ExprLine(value), typeString(vt), typeString(target))
 	}
 	return nil
+}
+
+// checkListLiteralAgainst validates a list literal's elements against
+// target's element type (cascade_spec.md §3, §4.3). target must itself be
+// a list type — an empty `[]` is valid here (the loop simply doesn't
+// run), unlike through exprType's context-free inference.
+func checkListLiteralAgainst(sc *scope, lit *ast.ListLit, target ast.Type) error {
+	if target.Elem == nil {
+		return fmt.Errorf("line %d: cannot assign a list literal to non-list type %s", lit.Line, typeString(target))
+	}
+	for _, e := range lit.Elems {
+		if err := checkAssignable(sc, *target.Elem, e); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// typeShapeEqual reports whether a and b are the same type, ignoring
+// Nullable (checkAssignable already handles nullability separately: a
+// non-nullable value may widen into a nullable target, but never the
+// reverse).
+func typeShapeEqual(a, b ast.Type) bool {
+	if (a.Elem == nil) != (b.Elem == nil) {
+		return false
+	}
+	if a.Elem != nil {
+		return typeShapeEqual(*a.Elem, *b.Elem)
+	}
+	return a.Name == b.Name
+}
+
+// typeGiven reports whether t is an explicitly written type (`let x: T`)
+// as opposed to the zero Type `let x = Init` leaves for inference — a
+// list type has an empty Name, so checking Name alone isn't enough once
+// list types exist.
+func typeGiven(t ast.Type) bool {
+	return t.Name != "" || t.Elem != nil
 }
 
 // exprType infers e's type. NoneLit has no type of its own (see its doc
@@ -424,6 +515,25 @@ func exprType(sc *scope, e ast.Expr) (ast.Type, error) {
 		return ast.Type{Name: "bool"}, nil
 	case *ast.NoneLit:
 		return ast.Type{}, fmt.Errorf("line %d: cannot infer a type from 'none' alone; give the variable an explicit nullable type (e.g. 'T?')", v.Line)
+	case *ast.ListLit:
+		return inferListLitType(sc, v)
+	case *ast.IndexExpr:
+		xt, err := exprType(sc, v.X)
+		if err != nil {
+			return ast.Type{}, err
+		}
+		if xt.Nullable || xt.Elem == nil {
+			return ast.Type{}, fmt.Errorf("line %d: cannot index into %s", v.Line, typeString(xt))
+		}
+		it, err := exprType(sc, v.Index)
+		if err != nil {
+			return ast.Type{}, err
+		}
+		if it.Nullable || it.Name != "int" {
+			return ast.Type{}, fmt.Errorf("line %d: list index must be int, got %s", ast.ExprLine(v.Index), typeString(it))
+		}
+		v.ResultType = *xt.Elem
+		return *xt.Elem, nil
 	case *ast.Ident:
 		info, ok := sc.lookup(v.Name)
 		if !ok {
@@ -476,11 +586,32 @@ func exprType(sc *scope, e ast.Expr) (ast.Type, error) {
 	}
 }
 
+// inferListLitType infers a list literal's type with no target context
+// (cascade_spec.md §3), by inferring its element type from Elems[0] and
+// then checking every other element matches it. An empty `[]` has
+// nothing to infer from and is always an error here — callers with a
+// target type instead go through checkListLiteralAgainst, which allows
+// an empty literal.
+func inferListLitType(sc *scope, lit *ast.ListLit) (ast.Type, error) {
+	if len(lit.Elems) == 0 {
+		return ast.Type{}, fmt.Errorf("line %d: cannot infer a type from an empty list literal; give it an explicit []T type", lit.Line)
+	}
+	elemType, err := exprType(sc, lit.Elems[0])
+	if err != nil {
+		return ast.Type{}, err
+	}
+	target := ast.Type{Elem: &elemType}
+	if err := checkListLiteralAgainst(sc, lit, target); err != nil {
+		return ast.Type{}, err
+	}
+	return target, nil
+}
+
 // checkCallExprValue validates a call expression used as a value (as
-// opposed to a bare statement — see checkExprStmt). Only the `string()`
-// builtin conversion (cascade_spec.md §13) is wired up so far, needed to
-// turn an operator's int/float/bool result into something print() can
-// take; the rest of §13's builtins land in the steps that need them.
+// opposed to a bare statement — see checkExprStmt): the `string()`
+// conversion, and the list builtins `len()`/`range()`/`append()`
+// (cascade_spec.md §13). The rest of §13's builtins (filter/map/reduce,
+// which need closures) land in the steps that need them.
 func checkCallExprValue(sc *scope, call *ast.CallExpr) (ast.Type, error) {
 	switch call.Callee {
 	case "string":
@@ -496,6 +627,49 @@ func checkCallExprValue(sc *scope, call *ast.CallExpr) (ast.Type, error) {
 		}
 		call.ArgType = t
 		return ast.Type{Name: "string"}, nil
+	case "len":
+		if len(call.Args) != 1 {
+			return ast.Type{}, fmt.Errorf("line %d: len() expects exactly 1 argument, got %d", call.Line, len(call.Args))
+		}
+		t, err := exprType(sc, call.Args[0])
+		if err != nil {
+			return ast.Type{}, err
+		}
+		if t.Nullable || (t.Name != "string" && t.Elem == nil) {
+			return ast.Type{}, fmt.Errorf("line %d: len() does not support %s", call.Line, typeString(t))
+		}
+		return ast.Type{Name: "int"}, nil
+	case "range":
+		if len(call.Args) != 2 {
+			return ast.Type{}, fmt.Errorf("line %d: range() expects exactly 2 arguments, got %d", call.Line, len(call.Args))
+		}
+		for _, a := range call.Args {
+			t, err := exprType(sc, a)
+			if err != nil {
+				return ast.Type{}, err
+			}
+			if t.Nullable || t.Name != "int" {
+				return ast.Type{}, fmt.Errorf("line %d: range() requires int arguments, got %s", ast.ExprLine(a), typeString(t))
+			}
+		}
+		elem := ast.Type{Name: "int"}
+		return ast.Type{Elem: &elem}, nil
+	case "append":
+		if len(call.Args) != 2 {
+			return ast.Type{}, fmt.Errorf("line %d: append() expects exactly 2 arguments, got %d", call.Line, len(call.Args))
+		}
+		lt, err := exprType(sc, call.Args[0])
+		if err != nil {
+			return ast.Type{}, err
+		}
+		if lt.Nullable || lt.Elem == nil {
+			return ast.Type{}, fmt.Errorf("line %d: append() expects a list as its first argument, got %s", ast.ExprLine(call.Args[0]), typeString(lt))
+		}
+		if err := checkAssignable(sc, *lt.Elem, call.Args[1]); err != nil {
+			return ast.Type{}, err
+		}
+		call.ArgType = lt
+		return lt, nil
 	default:
 		return ast.Type{}, fmt.Errorf("line %d: %q cannot be used as a value", call.Line, call.Callee)
 	}
@@ -512,17 +686,17 @@ func unaryResultType(op string, xt ast.Type, line int) (ast.Type, error) {
 	switch op {
 	case "!":
 		if xt.Name != "bool" {
-			return ast.Type{}, fmt.Errorf("line %d: unary ! requires bool, got %s", line, xt.Name)
+			return ast.Type{}, fmt.Errorf("line %d: unary ! requires bool, got %s", line, typeString(xt))
 		}
 		return xt, nil
 	case "-":
 		if xt.Name != "int" && xt.Name != "float" {
-			return ast.Type{}, fmt.Errorf("line %d: unary - requires int or float, got %s", line, xt.Name)
+			return ast.Type{}, fmt.Errorf("line %d: unary - requires int or float, got %s", line, typeString(xt))
 		}
 		return xt, nil
 	case "~":
 		if xt.Name != "int" {
-			return ast.Type{}, fmt.Errorf("line %d: unary ~ requires int, got %s", line, xt.Name)
+			return ast.Type{}, fmt.Errorf("line %d: unary ~ requires int, got %s", line, typeString(xt))
 		}
 		return xt, nil
 	default:
@@ -540,8 +714,8 @@ func binaryResultType(op string, xt, yt ast.Type, line int) (ast.Type, error) {
 	if xt.Nullable || yt.Nullable {
 		return ast.Type{}, fmt.Errorf("line %d: operator %q needs non-nullable operands (narrow with 'is not none' first)", line, op)
 	}
-	if xt.Name != yt.Name {
-		return ast.Type{}, fmt.Errorf("line %d: operator %q: mismatched operand types %s and %s", line, op, xt.Name, yt.Name)
+	if !typeShapeEqual(xt, yt) {
+		return ast.Type{}, fmt.Errorf("line %d: operator %q: mismatched operand types %s and %s", line, op, typeString(xt), typeString(yt))
 	}
 
 	switch op {
@@ -550,33 +724,33 @@ func binaryResultType(op string, xt, yt ast.Type, line int) (ast.Type, error) {
 		case "int", "float", "string":
 			return xt, nil
 		default:
-			return ast.Type{}, fmt.Errorf("line %d: operator + does not support %s", line, xt.Name)
+			return ast.Type{}, fmt.Errorf("line %d: operator + does not support %s", line, typeString(xt))
 		}
 	case "-", "*", "/":
 		if xt.Name != "int" && xt.Name != "float" {
-			return ast.Type{}, fmt.Errorf("line %d: operator %q requires int or float operands, got %s", line, op, xt.Name)
+			return ast.Type{}, fmt.Errorf("line %d: operator %q requires int or float operands, got %s", line, op, typeString(xt))
 		}
 		return xt, nil
 	case "%":
 		if xt.Name != "int" {
-			return ast.Type{}, fmt.Errorf("line %d: operator %% requires int operands, got %s", line, xt.Name)
+			return ast.Type{}, fmt.Errorf("line %d: operator %% requires int operands, got %s", line, typeString(xt))
 		}
 		return xt, nil
 	case "&", "|", "^", "&^", "<<", ">>":
 		if xt.Name != "int" {
-			return ast.Type{}, fmt.Errorf("line %d: operator %q requires int operands, got %s", line, op, xt.Name)
+			return ast.Type{}, fmt.Errorf("line %d: operator %q requires int operands, got %s", line, op, typeString(xt))
 		}
 		return xt, nil
 	case "<", "<=", ">", ">=":
 		if xt.Name != "int" && xt.Name != "float" && xt.Name != "string" {
-			return ast.Type{}, fmt.Errorf("line %d: operator %q requires int, float, or string operands, got %s", line, op, xt.Name)
+			return ast.Type{}, fmt.Errorf("line %d: operator %q requires int, float, or string operands, got %s", line, op, typeString(xt))
 		}
 		return ast.Type{Name: "bool"}, nil
 	case "==", "!=":
 		return ast.Type{Name: "bool"}, nil
 	case "&&", "||":
 		if xt.Name != "bool" {
-			return ast.Type{}, fmt.Errorf("line %d: operator %q requires bool operands, got %s", line, op, xt.Name)
+			return ast.Type{}, fmt.Errorf("line %d: operator %q requires bool operands, got %s", line, op, typeString(xt))
 		}
 		return ast.Type{Name: "bool"}, nil
 	default:
@@ -584,10 +758,16 @@ func binaryResultType(op string, xt, yt ast.Type, line int) (ast.Type, error) {
 	}
 }
 
-// typeString formats t for error messages, e.g. "int" or "string?".
+// typeString formats t for error messages, e.g. "int", "string?", or
+// "[]int" (the "?" always applies to the outermost type — see ast.Type's
+// doc — so it's appended after any "[]" recursion, never before it).
 func typeString(t ast.Type) string {
-	if t.Nullable {
-		return t.Name + "?"
+	base := t.Name
+	if t.Elem != nil {
+		base = "[]" + typeString(*t.Elem)
 	}
-	return t.Name
+	if t.Nullable {
+		return base + "?"
+	}
+	return base
 }

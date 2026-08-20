@@ -5,14 +5,16 @@
 // The grammar implemented here is intentionally a subset of
 // cascade_spec.md: top-level func declarations; a block of statements
 // covering `let`/`const` declarations, a call-expression statement,
-// scalar/compound assignment, `++`/`--`, `return`, `if`/`elif`/`else`,
-// `while`, `switch` (tagged and untagged), and `break`/`continue`; and a
-// full operator-precedence expression grammar (§6), literals (including
-// nullable-type `T?` declarations and the `none` literal), variable
-// references, and `is none`/`is not none` (§7) directly on an atom (the
-// only place the spec actually uses it — as an `if`/`switch` condition).
-// Later development steps extend this grammar further (functions,
-// structs, closures, ...) one feature at a time.
+// scalar/list-element/compound assignment, `++`/`--`, `return`,
+// `if`/`elif`/`else`, `while`, `for x in list`, `switch` (tagged and
+// untagged), and `break`/`continue`; and a full operator-precedence
+// expression grammar (§6), literals (including nullable-type `T?`
+// declarations, the `none` literal, and list literals `[1, 2, 3]`/`[]`),
+// variable references, list indexing `xs[i]`, and `is none`/`is not none`
+// (§7) directly on an atom (the only place the spec actually uses it —
+// as an `if`/`switch` condition). Later development steps extend this
+// grammar further (functions, structs, closures, ...) one feature at a
+// time.
 package parser
 
 import (
@@ -157,21 +159,45 @@ func (p *parser) parseParam() (ast.Param, error) {
 	return ast.Param{Type: typ, Name: name.Literal}, nil
 }
 
-// parseType parses a scalar type name with an optional nullable suffix
-// (cascade_spec.md §2.1, §2.3: `int`, `int?`, ...). Every non-scalar type
-// form is parsed starting in the step that introduces it.
+// parseType parses a scalar or list type with an optional trailing
+// nullable suffix (cascade_spec.md §2.1-§2.3: `int`, `int?`, `[]int`,
+// `[]int?`, ...). The `?` is checked only once, here, after parseTypeBase
+// has consumed every `[]` prefix — so it always binds to the outermost
+// type (see ast.Type's doc for why `[]int?` must mean a nullable list,
+// not a list of nullable int). Every non-scalar, non-list type form is
+// parsed starting in the step that introduces it.
 func (p *parser) parseType() (ast.Type, error) {
-	name, ok := typeKeywords[p.cur().Kind]
-	if !ok {
-		return ast.Type{}, fmt.Errorf("line %d: expected a type, got %q", p.cur().Line, p.cur().Literal)
+	t, err := p.parseTypeBase()
+	if err != nil {
+		return ast.Type{}, err
 	}
-	p.advance()
-	t := ast.Type{Name: name}
 	if p.cur().Kind == lexer.Question {
 		p.advance()
 		t.Nullable = true
 	}
 	return t, nil
+}
+
+// parseTypeBase parses a scalar type name or a `[]`-prefixed list type,
+// recursively, with no nullable suffix of its own (see parseType).
+func (p *parser) parseTypeBase() (ast.Type, error) {
+	if p.cur().Kind == lexer.LBracket {
+		p.advance()
+		if _, err := p.expect(lexer.RBracket, "']'"); err != nil {
+			return ast.Type{}, err
+		}
+		elem, err := p.parseTypeBase()
+		if err != nil {
+			return ast.Type{}, err
+		}
+		return ast.Type{Elem: &elem}, nil
+	}
+	name, ok := typeKeywords[p.cur().Kind]
+	if !ok {
+		return ast.Type{}, fmt.Errorf("line %d: expected a type, got %q", p.cur().Line, p.cur().Literal)
+	}
+	p.advance()
+	return ast.Type{Name: name}, nil
 }
 
 func (p *parser) parseBlock() ([]ast.Stmt, error) {
@@ -207,6 +233,8 @@ func (p *parser) parseStmt() (ast.Stmt, error) {
 		return p.parseWhileStmt()
 	case lexer.KwSwitch:
 		return p.parseSwitchStmt()
+	case lexer.KwFor:
+		return p.parseForInStmt()
 	case lexer.KwBreak:
 		tok := p.advance()
 		return &ast.BreakStmt{Line: tok.Line}, nil
@@ -279,6 +307,29 @@ func (p *parser) parseWhileStmt() (ast.Stmt, error) {
 		return nil, err
 	}
 	return &ast.WhileStmt{Cond: cond, Body: body, Line: kw.Line}, nil
+}
+
+// parseForInStmt parses `for x in List { ... }` (cascade_spec.md §7). The
+// two-variable map form (`for k, v in m`) is parsed starting in Step 10,
+// the step that introduces `map<K, V>`.
+func (p *parser) parseForInStmt() (ast.Stmt, error) {
+	kw := p.advance() // 'for'
+	varName, err := p.expect(lexer.Ident, "loop variable name")
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(lexer.KwIn, "'in'"); err != nil {
+		return nil, err
+	}
+	list, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	body, err := p.parseBlock()
+	if err != nil {
+		return nil, err
+	}
+	return &ast.ForInStmt{VarName: varName.Literal, List: list, Body: body, Line: kw.Line}, nil
 }
 
 // parseSwitchStmt parses both switch forms (cascade_spec.md §7): tagged
@@ -410,9 +461,9 @@ var compoundAssignOps = map[lexer.Kind]string{
 }
 
 // parseIdentStmt parses a statement starting with an identifier: a call
-// expression (`f(...)`), a scalar assignment (`name = value`), a compound
-// assignment (`name += value` etc.), or `name++`/`name--`
-// (cascade_spec.md §5).
+// expression (`f(...)`), a scalar or list-element assignment (`name =
+// value` / `name[Index] = value`), a compound assignment (`name +=
+// value` etc.), or `name++`/`name--` (cascade_spec.md §5).
 func (p *parser) parseIdentStmt() (ast.Stmt, error) {
 	name := p.advance() // Ident
 	switch {
@@ -422,6 +473,23 @@ func (p *parser) parseIdentStmt() (ast.Stmt, error) {
 			return nil, err
 		}
 		return &ast.ExprStmt{X: call, Line: call.Line}, nil
+	case p.cur().Kind == lexer.LBracket:
+		p.advance()
+		index, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(lexer.RBracket, "']'"); err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(lexer.Assign, "'='"); err != nil {
+			return nil, err
+		}
+		val, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &ast.AssignStmt{Name: name.Literal, Index: index, Value: val, Line: name.Line}, nil
 	case p.cur().Kind == lexer.Assign:
 		p.advance()
 		val, err := p.parseExpr()
@@ -586,19 +654,40 @@ func (p *parser) parseUnary() (ast.Expr, error) {
 	return p.parsePrimary()
 }
 
-// parsePrimary parses a primary atom, then wraps it in `is none`/`is not
-// none` (cascade_spec.md §7) if one directly follows — the tightest
-// binding possible, matching every spec example (always a bare
-// identifier immediately followed by `is`).
+// parsePrimary parses a primary atom, then any number of `[index]`
+// suffixes (cascade_spec.md §5's list indexing, §6 priority 1), and
+// finally wraps the result in `is none`/`is not none` (§7) if one
+// directly follows — the tightest binding possible, matching every spec
+// example (always a bare identifier immediately followed by `is`).
 func (p *parser) parsePrimary() (ast.Expr, error) {
 	x, err := p.parsePrimaryAtom()
 	if err != nil {
 		return nil, err
 	}
+	for p.cur().Kind == lexer.LBracket {
+		x, err = p.parseIndexSuffix(x)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if p.cur().Kind == lexer.KwIs {
 		return p.parseNullCheck(x)
 	}
 	return x, nil
+}
+
+// parseIndexSuffix parses the `[Index]` part of a list-index expression
+// whose target x has already been parsed.
+func (p *parser) parseIndexSuffix(x ast.Expr) (ast.Expr, error) {
+	lb := p.advance() // '['
+	index, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(lexer.RBracket, "']'"); err != nil {
+		return nil, err
+	}
+	return &ast.IndexExpr{X: x, Index: index, Line: lb.Line}, nil
 }
 
 // parseNullCheck parses the `is none`/`is not none` suffix onto an
@@ -658,6 +747,8 @@ func (p *parser) parsePrimaryAtom() (ast.Expr, error) {
 	case lexer.KwNone:
 		p.advance()
 		return &ast.NoneLit{Line: tok.Line}, nil
+	case lexer.LBracket:
+		return p.parseListLit()
 	case lexer.KwString, lexer.KwInt, lexer.KwFloat, lexer.KwBool:
 		// A type keyword can also name a builtin conversion call, e.g.
 		// string(x) (cascade_spec.md §13) — it's still a reserved
@@ -677,6 +768,30 @@ func (p *parser) parsePrimaryAtom() (ast.Expr, error) {
 	default:
 		return nil, fmt.Errorf("line %d: unexpected token %q", tok.Line, tok.Literal)
 	}
+}
+
+// parseListLit parses a list literal, e.g. `[1, 2, 3]` or `[]`
+// (cascade_spec.md §3). Its element type isn't determined here — see
+// ast.ListLit's doc.
+func (p *parser) parseListLit() (ast.Expr, error) {
+	kw := p.advance() // '['
+	lit := &ast.ListLit{Line: kw.Line}
+	for p.cur().Kind != lexer.RBracket {
+		if len(lit.Elems) > 0 {
+			if _, err := p.expect(lexer.Comma, "','"); err != nil {
+				return nil, err
+			}
+		}
+		elem, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		lit.Elems = append(lit.Elems, elem)
+	}
+	if _, err := p.expect(lexer.RBracket, "']'"); err != nil {
+		return nil, err
+	}
+	return lit, nil
 }
 
 // parseCallExprFrom parses the `(args...)` part of a call expression whose

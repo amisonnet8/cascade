@@ -1,0 +1,36 @@
+func main(): int {
+    let xs: []int = [1, 2, 3]
+    print("xs[1] = " + string(xs[1]))
+
+    xs[0] = 100
+    print("xs[0] = " + string(xs[0]))
+
+    let ys = append(xs, 4)
+    print("len(xs) = " + string(len(xs)) + ", len(ys) = " + string(len(ys)))
+
+    let sum = 0
+    for x in ys {
+        sum += x
+    }
+    print("sum = " + string(sum))
+
+    let rs = range(1, 6)
+    let product = 1
+    for r in rs {
+        product *= r
+    }
+    print("product = " + string(product))
+
+    let empty: []int
+    print("len(empty) = " + string(len(empty)))
+
+    let zs = append(empty, 42)
+    print("zs[0] = " + string(zs[0]) + ", len(zs) = " + string(len(zs)))
+
+    let names: []string = ["Alice", "Bob"]
+    for n in names {
+        print("name: " + n)
+    }
+
+    return 0
+}

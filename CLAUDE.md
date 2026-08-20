@@ -224,6 +224,16 @@ Cascadeの`func main(): int`をamivmの`!main`へ直接対応させることは�
 
 いずれも新設した`scope.shadow`(既存宣言があっても強制上書きする、`declareLocal`とは別の内部用メソッド)で実現。3パターンとも`examples/05_control_flow.cas`で実行時に値レベルで確認済み(else節の絞り込みはnoneでない値を渡す追加確認も実施)。仕様が直接例示していない組み合わせ(elif節での絞り込み一般化、switch内での絞り込みなど)は実装していない。
 
+### リスト(`[]T`)の型表現・`append`の実装方針(Step 6)
+
+**`ast.Type`に`Elem *Type`を追加し、リスト型を表現した。** 既存の`Name string`(スカラー型名)と共存させ、`Elem != nil`ならリスト型・`Name`は不使用という形にした(新しい`Kind`列挙などは導入せず、既存構造体に1フィールド追加するだけで済んだ)。`SLTYPE`+`SLMAKE`+`ASET`/`AGET`はSeedの配列実装で既に実証済みの命令(seed_implementation_notes.md §0)だが、Cascade特有の可変長・`append`・`range`の実地検証は今回が初めて。
+
+**構文上の非自明な決定: `?`は常に最も外側の型に結合する。** `[]int?`は`([]int)?`(nullableなリスト)であって`[](int?)`(nullableなintのリスト)ではない、と決定した。根拠は9.3節の`collect`が返す`[]string?`という具体例(パイプライン全体が`none`になりうる、要素がnullになりうるわけではない)。パーサは`parseTypeBase`(`[]`プレフィックスの再帰的な処理のみ、`?`は見ない)と`parseType`(`parseTypeBase`の後に一度だけ`?`をチェック)を分離することで実現した。この結果、現在の文法では「要素自体がnullableなリスト」(`[](T?)`)は表現できない——仕様例に出てこないため、今のところ問題にしていない。
+
+**`append`はGoの生の`append()`を使わず、常に`SLMAKE`で新しい配列を確保し要素をコピーする方式にした。** Goの`append`は容量に余裕があれば元の裏付け配列に書き込むことがあり、同じ裏付け配列を共有する複数のリストが独立に`append`されると、互いに観測されない形で上書きし合う可能性がある(元のリストの「見える範囲」自体は破壊されないため大抵は無害だが、常に安全とは言い切れない)。CLAUDE.mdの「命令使用ゴール」表に元々書いていた「Seedの配列と異なり可変長なので再確保が前提」という想定通りの実装にし、`append`のたびに`?len`→`SLMAKE`→コピーループ(`AGET`/`ASET`)→末尾へ新要素、という完全に独立した新しいリストを返す形にした。`examples/06_lists.cas`で`len(元のリスト)`が`append`後も変わらないことを実地確認済み。
+
+**副産物のバグ修正**: リスト型の比較ロジックを書く過程で、`checkAssignable`が値の`Nullable`を全くチェックしていなかったことに気づいた(`let a: int? = 5; let b: int = a`が絞り込み無しで通ってしまっていた)。`vt.Nullable && !target.Nullable`のときエラーにするよう修正し、回帰テストを追加した(`TestCheck_ListErrors/nullable_value_cannot_narrow_implicitly_into_a_non-nullable_target`)。あわせて型の同値判定を`typeShapeEqual`(Nullableを無視し、リストは要素型を再帰比較)に統一し、`[]int == []string`のような異なる要素型同士の比較がすり抜けていた別のバグも合わせて塞いだ。
+
 ## 意味検証の責任分担(重要)
 
 型の整合性・未定義識別子・関数シグネチャの不一致・メソッドの存在チェックなどは、**amivm側では検証せず`go/types`に全面的に委ねている。** amivmが保証するのは「構文的に妥当なGoコードを出力すること」だけ。
@@ -287,7 +297,7 @@ Seedは7〜8ステップ(git履歴上は「Step1: hello-worldパイプライン�
 | 3 ✅ | 演算子(算術・比較・論理・文字列) | `+ - * / %`、`== != < <= > >=`、`&& \|\| !`、`string`連結、優先順位表(6節)の実地検証。観測用に組み込み変換`string()`(13節)も先取り実装 | `ADD` `SUB` `MUL` `DIV` `MOD` `EQ` `NEQ` `LT` `LTE` `GT` `GTE` `AND` `OR` `NOT` `CONCAT` | — |
 | 4 ✅ | ビット演算・シフト演算 | `&` `\|` `^` `&^` `~`、`<<` `>>`(int専用、semaで型制約を検査)。優先順位表(シフトが`+`/`-`より低優先度という非直感的な並び)も実地検証 | `BAND` `BOR` `BXOR` `BCLEAR` `BNOT` `SHL` `SHR` | — |
 | 5 ✅ | 制御構文 | `if/elif/else`、`while`、`switch`(タグ付き/タグなし)、`break/continue`、`is none`/`is not none`と型絞り込み(Step2から持ち越し)。`+=`等の複合代入・`++`/`--`も前倒し実装。`for-in`は`[]T`(Step6)に依存するためStep6へ移動 | `LABEL` `GOTO` `IF` | goto/VAR巻き上げ問題(seed_implementation_notes.md §1)の再検証(下記「確定した設計判断」参照) |
-| 6 | リスト(`[]T`) | リテラル・`append`・添字読み書き・`for x in xs`・`range`/`len`組み込み | `SLTYPE` `SLMAKE` `ASET` `AGET`(`SLICE`の使い所も探る) | — |
+| 6 ✅ | リスト(`[]T`) | リテラル・`append`・添字読み書き・`for x in xs`・`range`/`len`組み込み | `SLTYPE` `SLMAKE` `ASET` `AGET`(`SLICE`の使い所も探る) | — |
 | 7 | 関数(通常関数・複数戻り値) | `func`定義、複数戻り値(8.1/8.5節)、`divmod`的サンプル | `FUNC` `RET` `CALL`の本格利用 | — |
 | 8 | 構造体・ポインタ・レシーバー関数 | `struct`定義・フィールドアクセス、`&x`/`*p`、値/ポインタレシーバーの自動変換 | `STTYPE` `FIELD` `ENDSTTYPE` `FSET` `FGET` `ADDR` `PGET` `PSET` | 課題1(レシーバー関数のコンパイル方針)の確定 |
 | 9 | クロージャー・高階関数 | クロージャーリテラル(8.3節)、`filter`/`map`/`reduce`(8.4節)、参照捕捉の実地検証 | `FNTYPE` `CLOS` `ENDCLOS` | — |

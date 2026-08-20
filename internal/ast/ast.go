@@ -2,14 +2,22 @@
 // shared vocabulary between parser, sema, and codegen.
 package ast
 
-// Type is a Cascade type reference. Only a bare scalar name (cascade_spec.md
-// §2.1: int/float/string/bool) plus the nullable suffix (§2.3) is
-// represented so far; pointer/slice/map/func/struct/error forms are added
-// as the steps that need them land (see CLAUDE.md's implementation step
-// plan).
+// Type is a Cascade type reference: a bare scalar name (cascade_spec.md
+// §2.1: int/float/string/bool, Name set and Elem nil) or a list type
+// (§2.2's `[]T`, Elem set to T and Name unused/empty), either optionally
+// nullable (§2.3). Pointer/map/func/struct/error forms are added as the
+// steps that need them land (see CLAUDE.md's implementation step plan).
+//
+// `?` always binds to the outermost type built so far — `[]int?` parses
+// as `([]int)?` (a nullable list), not `[](int?)` (a list of nullable
+// int) — matching the only concrete spec usage of a nullable list type,
+// `collect`'s `[]string?` result (§9.3); see CLAUDE.md's "確定した設計判断"
+// for why the alternative reading was rejected. A list's own element type
+// is therefore never itself nullable through this grammar.
 type Type struct {
 	Name     string
 	Nullable bool
+	Elem     *Type
 }
 
 // Param is a single function parameter.
@@ -77,11 +85,13 @@ type LetDecl struct {
 
 func (*LetDecl) stmtNode() {}
 
-// AssignStmt is a scalar assignment (cascade_spec.md §5): `name = Value`.
-// The struct-field/list-element/pointer-deref/map-element forms are added
+// AssignStmt is a scalar assignment (cascade_spec.md §5): `name = Value`,
+// or, when Index is non-nil, a single list-element assignment (`name[Index]
+// = Value`). The struct-field/pointer-deref/map-element forms are added
 // once the steps that introduce those types land.
 type AssignStmt struct {
 	Name  string
+	Index Expr // nil for `name = value`; non-nil for `name[Index] = value`
 	Value Expr
 	Line  int
 }
@@ -152,6 +162,23 @@ type ContinueStmt struct {
 }
 
 func (*ContinueStmt) stmtNode() {}
+
+// ForInStmt is `for x in List { ... }` over a list (cascade_spec.md §7).
+// The two-variable map form (`for k, v in m`) is added once maps land
+// (Step 10).
+//
+// ElemType is filled in by sema.Check with the list's element type, so
+// codegen doesn't have to re-derive it (the same ast-annotation pattern
+// LetDecl.ResolvedType uses).
+type ForInStmt struct {
+	VarName  string
+	List     Expr
+	Body     []Stmt
+	Line     int
+	ElemType Type
+}
+
+func (*ForInStmt) stmtNode() {}
 
 // SwitchCase is one `case` clause (cascade_spec.md §7). Values holds one
 // or more comma-separated candidate values for a tagged switch (compared
@@ -231,15 +258,41 @@ type NoneLit struct {
 
 func (*NoneLit) exprNode() {}
 
+// ListLit is a list literal, e.g. `[1, 2, 3]` or `[]` (cascade_spec.md
+// §3). Its element type is determined entirely by the assignment context
+// (a LetDecl's declared type, an AssignStmt's target, ...) or, for a
+// non-empty literal with no declared type, inferred from Elems[0] — not
+// by the literal itself. Like ast.NoneLit, it is therefore never resolved
+// through the general exprType path; sema special-cases it wherever a
+// value is checked against a target type (see checkAssignable/inferType).
+type ListLit struct {
+	Elems []Expr
+	Line  int
+}
+
+func (*ListLit) exprNode() {}
+
+// IndexExpr is a list element reference, e.g. `xs[0]` (cascade_spec.md
+// §5). ResultType is filled in by sema.Check with the list's element
+// type, so codegen doesn't have to re-derive it.
+type IndexExpr struct {
+	X          Expr
+	Index      Expr
+	Line       int
+	ResultType Type
+}
+
+func (*IndexExpr) exprNode() {}
+
 // CallExpr is a function call, e.g. print("hello").
 //
-// ArgType is filled in by sema.Check only for the overloaded builtin
-// string() (cascade_spec.md §13), which accepts several argument types
-// and needs different AMIVM-IR per one. It holds Args[0]'s resolved type,
-// so codegen can pick the right instruction without re-deriving a type on
-// its own (mirroring BinaryExpr/UnaryExpr's ResultType — the same pattern
-// Seed's identical CallExpr.ArgType uses). It's the zero Type for every
-// other call.
+// ArgType is filled in by sema.Check only for the builtins that need an
+// argument's resolved type to pick their AMIVM-IR (cascade_spec.md §13):
+// string() (Args[0]'s scalar type, to choose the right strconv function)
+// and append() (Args[0]'s own list type, needed for SLMAKE/ASET/AGET).
+// This mirrors BinaryExpr/UnaryExpr's ResultType — the same pattern
+// Seed's identical CallExpr.ArgType uses — so codegen never re-derives a
+// type it already has. It's the zero Type for every other call.
 type CallExpr struct {
 	Callee  string
 	Args    []Expr
@@ -315,6 +368,8 @@ func StmtLine(s Stmt) int {
 		return v.Line
 	case *SwitchStmt:
 		return v.Line
+	case *ForInStmt:
+		return v.Line
 	default:
 		return 0
 	}
@@ -334,6 +389,10 @@ func ExprLine(e Expr) int {
 	case *BoolLit:
 		return v.Line
 	case *NoneLit:
+		return v.Line
+	case *ListLit:
+		return v.Line
+	case *IndexExpr:
 		return v.Line
 	case *CallExpr:
 		return v.Line

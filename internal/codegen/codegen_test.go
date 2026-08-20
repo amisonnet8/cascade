@@ -464,3 +464,168 @@ func main(): int {
 		t.Fatalf("expected 's += \"b\"' on a string to emit CONCAT, not ADD; got:\n%s", ir)
 	}
 }
+
+func TestGenerate_SLTYPEEmittedBeforeFUNC(t *testing.T) {
+	ir := generate(t, `
+func main(): int {
+	let xs: []int = [1, 2, 3]
+	return 0
+}
+`)
+	sltypeIdx := strings.Index(ir, "SLTYPE\t^intlist\t^int\n")
+	funcIdx := strings.Index(ir, "FUNC\t!cascade_main")
+	if sltypeIdx == -1 || funcIdx == -1 || sltypeIdx > funcIdx {
+		t.Fatalf("expected SLTYPE to precede every FUNC block; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_ListLiteralUsesSLMAKEAndASET(t *testing.T) {
+	ir := generate(t, `
+func main(): int {
+	let xs: []int = [1, 2, 3]
+	return 0
+}
+`)
+	if !strings.Contains(ir, "SLMAKE\t%xs_1\t^intlist\t3\n") {
+		t.Fatalf("expected a 3-element list literal to SLMAKE with size 3; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "ASET\t%xs_1\t0\t1\n") || !strings.Contains(ir, "ASET\t%xs_1\t1\t2\n") || !strings.Contains(ir, "ASET\t%xs_1\t2\t3\n") {
+		t.Fatalf("expected each literal element to ASET at its own index; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_IndexReadAndWrite(t *testing.T) {
+	ir := generate(t, `
+func main(): int {
+	let xs = [1, 2, 3]
+	let y = xs[1]
+	xs[0] = 100
+	return 0
+}
+`)
+	if !strings.Contains(ir, "AGET\t%tmp_") || !strings.Contains(ir, "\t%xs_1\t1\n") {
+		t.Fatalf("expected xs[1] to emit AGET; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "ASET\t%xs_1\t0\t100\n") {
+		t.Fatalf("expected xs[0] = 100 to emit ASET directly (no reallocation); got:\n%s", ir)
+	}
+}
+
+func TestGenerate_AppendReallocatesAndCopies(t *testing.T) {
+	// append() must never emit a raw Go append() call — it always
+	// SLMAKEs a fresh backing array and copies the old elements in, so
+	// the original list is never mutated (see list.go's doc).
+	ir := generate(t, `
+func main(): int {
+	let xs = [1, 2, 3]
+	let ys = append(xs, 4)
+	return 0
+}
+`)
+	if strings.Contains(ir, "?append") {
+		t.Fatalf("append() must not lower to Go's raw append(); got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "CALL\t%tmp_") || !strings.Contains(ir, "?len\t%xs_1") {
+		t.Fatalf("expected append() to first read len(xs); got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "\tSLMAKE\t") {
+		t.Fatalf("expected append() to SLMAKE a fresh backing array; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "\tAGET\t") {
+		t.Fatalf("expected append() to copy old elements via AGET; got:\n%s", ir)
+	}
+	assertLabelsResolve(t, ir)
+}
+
+func TestGenerate_RangeBuildsListWithLoop(t *testing.T) {
+	ir := generate(t, `
+func main(): int {
+	let rs = range(1, 6)
+	return 0
+}
+`)
+	if !strings.Contains(ir, "\tSUB\t") {
+		t.Fatalf("expected range() to compute size = to - from via SUB; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "\tSLMAKE\t") {
+		t.Fatalf("expected range() to SLMAKE the result list; got:\n%s", ir)
+	}
+	assertLabelsResolve(t, ir)
+}
+
+func TestGenerate_LenCallsBareLen(t *testing.T) {
+	ir := generate(t, `
+func main(): int {
+	let xs = [1, 2, 3]
+	let n = len(xs)
+	return 0
+}
+`)
+	if !strings.Contains(ir, "CALL\t%tmp_3\t:\t?len\t%xs_1\n") {
+		t.Fatalf("expected len(xs) to emit a single ?len CALL; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_ForInLoop(t *testing.T) {
+	ir := generate(t, `
+func main(): int {
+	let xs = [1, 2, 3]
+	let sum = 0
+	for x in xs {
+		if x == 2 {
+			continue
+		}
+		if x == 3 {
+			break
+		}
+		sum += x
+	}
+	return 0
+}
+`)
+	if !strings.Contains(ir, "CALL\t%tmp_") || !strings.Contains(ir, "?len\t%xs_1") {
+		t.Fatalf("expected for-in to compute len(xs) once up front; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "\tAGET\t") {
+		t.Fatalf("expected for-in to AGET the current element each iteration; got:\n%s", ir)
+	}
+	assertLabelsResolve(t, ir)
+}
+
+func TestGenerate_ForInVarHoisted(t *testing.T) {
+	// The for-in loop variable is declared inside the loop body
+	// syntactically, but — like every other declaration — must still be
+	// hoisted above the loop's own IF/GOTO/LABEL instructions.
+	ir := generate(t, `
+func main(): int {
+	let xs = [1, 2, 3]
+	for x in xs {
+		print(string(x))
+	}
+	return 0
+}
+`)
+	mainBody := ir[:strings.Index(ir, "ENDFUNC")]
+	lastVar := strings.LastIndex(mainBody, "\tVAR\t")
+	firstControl := -1
+	for _, instr := range []string{"\tIF\t", "\tGOTO\t", "\tLABEL\t"} {
+		if i := strings.Index(mainBody, instr); i != -1 && (firstControl == -1 || i < firstControl) {
+			firstControl = i
+		}
+	}
+	if lastVar == -1 || firstControl == -1 || lastVar > firstControl {
+		t.Fatalf("expected every VAR (including the for-in loop variable) to precede every IF/GOTO/LABEL; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_EmptyListIsNil(t *testing.T) {
+	ir := generate(t, `
+func main(): int {
+	let xs: []int
+	return 0
+}
+`)
+	if !strings.Contains(ir, "SET\t%xs_1\tnil\n") {
+		t.Fatalf("expected an uninitialized list declaration to SET nil; got:\n%s", ir)
+	}
+}

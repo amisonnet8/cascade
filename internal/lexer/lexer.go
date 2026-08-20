@@ -2,17 +2,18 @@
 // cascade_spec.md §1: newlines are significant statement terminators, and
 // "//" starts a line comment.
 //
-// Only the punctuation/operators Steps 1-5 need are lexed so far — "(",
-// ")", "{", "}", ":", ",", "?" (nullable-type suffix, §2.3), "=" (plain
-// assignment, §5), §6's arithmetic/comparison/logical operators ("+" "-"
-// "*" "/" "%" "==" "!=" "<" "<=" ">" ">=" "&&" "||" "!"), §6's bitwise/
-// shift operators ("&" "|" "^" "&^" "~" "<<" ">>"), and §5's compound-
-// assignment/inc-dec set ("+=" "-=" "*=" "/=" "%=" "++" "--"). Unary
-// "*"/"&" (pointers, Step 8), postfix "?" (Step 11), and "|>" (Step 12)
-// are lexed starting in the steps that introduce them. The full keyword
-// set (§14) is already reserved from the start (see token.go), since
-// adding a keyword later is free but an identifier silently becoming a
-// keyword out from under existing code is not.
+// Only the punctuation/operators Steps 1-6 need are lexed so far — "(",
+// ")", "{", "}", "[", "]" (list literals/indexing/types, §2.2/§3/§5), ":",
+// ",", "?" (nullable-type suffix, §2.3), "=" (plain assignment, §5), §6's
+// arithmetic/comparison/logical operators ("+" "-" "*" "/" "%" "==" "!="
+// "<" "<=" ">" ">=" "&&" "||" "!"), §6's bitwise/shift operators ("&" "|"
+// "^" "&^" "~" "<<" ">>"), and §5's compound-assignment/inc-dec set ("+="
+// "-=" "*=" "/=" "%=" "++" "--"). Unary "*"/"&" (pointers, Step 8),
+// postfix "?" (Step 11), and "|>" (Step 12) are lexed starting in the
+// steps that introduce them. The full keyword set (§14) is already
+// reserved from the start (see token.go), since adding a keyword later is
+// free but an identifier silently becoming a keyword out from under
+// existing code is not.
 package lexer
 
 import (
@@ -222,6 +223,10 @@ func (l *Lexer) lexOperator(line int) (Token, error) {
 		return Token{Kind: LBrace, Literal: "{", Line: line}, nil
 	case '}':
 		return Token{Kind: RBrace, Literal: "}", Line: line}, nil
+	case '[':
+		return Token{Kind: LBracket, Literal: "[", Line: line}, nil
+	case ']':
+		return Token{Kind: RBracket, Literal: "]", Line: line}, nil
 	case ':':
 		return Token{Kind: Colon, Literal: ":", Line: line}, nil
 	case ',':
