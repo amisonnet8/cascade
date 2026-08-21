@@ -120,9 +120,6 @@ internal/sema/        semantic analysis (type checking, scope resolution, null n
                        pipeline type-checking — amivm delegates all of this to go/types, so
                        Cascade has to catch it itself; see CLAUDE.md)
 internal/codegen/     AST → AMIVM-IR
-cascadert/            Cascade's Go runtime library (currently just map key enumeration for
-                       `for k, v in m`, since AMIVM-IR has no instruction for it), embedded
-                       into every cascade build — see CLAUDE.md
 examples/              runnable .cas sample programs, one group per language feature
 cascade_spec.md       the Cascade language specification (the only authoritative one)
 CLAUDE.md              project conventions for AI-assisted development

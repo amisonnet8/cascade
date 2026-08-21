@@ -120,9 +120,6 @@ internal/sema/          意味検査(型チェック・スコープ解決・null
                          amivm側は全てgo/typesに委ねているためCascade自身がここを担う必要がある。
                          詳細はCLAUDE.md参照)
 internal/codegen/       AST → AMIVM-IR
-cascadert/               Cascadeランタイム(現状は`for k, v in m`用のmapキー列挙のみ。
-                         AMIVM-IRにはmapを走査する命令が無いため)。cascadeビルドのたびに
-                         埋め込まれる。詳細はCLAUDE.md参照
 examples/                実行可能な.casサンプル(言語機能ごと・実装した順にグループ化)
 cascade_spec.md         Cascade言語仕様(唯一の正確な仕様)
 CLAUDE.md                AIによる開発支援のためのプロジェクト規約

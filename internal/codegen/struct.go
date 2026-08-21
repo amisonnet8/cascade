@@ -112,26 +112,72 @@ func genFieldRead(g *funcGen, e *ast.FieldExpr) (string, error) {
 }
 
 // genAddrOf compiles unary `&x` (cascade_spec.md §6) into a fresh pointer
-// temp via ADDR. sema's isAddressable restricts X to a plain identifier —
-// amivm's ADDR only accepts a bare variable as its operand (the "variable"
-// operand category, amivm_spec.md §6 — $N/&N/%xxx/@xxx only, never a
-// field-path or index expression), so there is nothing more general to
-// support here.
+// temp via ADDR. sema's isAddressable accepts a bare variable, a
+// single-level field access on one (&p.x), or a single-level list-index
+// access on one (&xs[0]) — see its doc — matching amivm's ADDR, whose
+// optional "point" operand takes a single field name or index
+// (amivm_spec.md §4.2/§5). genAddrOfOperand does the actual emission,
+// shared with genReceiverOperand's pointer-receiver auto-address-of
+// (§8.2), since both are just "ADDR of whatever isAddressable accepted".
 func genAddrOf(g *funcGen, e *ast.UnaryExpr) (string, error) {
-	id, ok := e.X.(*ast.Ident)
-	if !ok {
-		return "", fmt.Errorf("codegen: '&' operand must be a plain variable (sema bug)")
-	}
-	ref, ok := g.scope.lookup(id.Name)
-	if !ok {
-		return "", fmt.Errorf("codegen: undefined name %q (sema bug)", id.Name)
-	}
 	irType, err := typeToIR(g.types, e.ResultType)
 	if err != nil {
 		return "", err
 	}
-	tmp := g.newTemp(irType)
-	g.emit("\tADDR\t%s\t%s\n", tmp, ref.ValOp)
+	return genAddrOfOperand(g, e.X, irType)
+}
+
+// genAddrOfOperand emits ADDR against target — a bare variable, a
+// single-level field access on one, or a single-level list-index access
+// on one (see isAddressable's doc, which sema already restricted target
+// to one of these shapes) — into a fresh temp of resultIRType (the
+// pointer type ADDR produces).
+//
+// This deliberately never calls genValue(g, target) first: that would
+// evaluate a field/index access into a *copy* (via FGET/AGET), and
+// ADDRing the copy would alias the copy, not the original storage —
+// exactly the failure mode that made ADDR (unlike PGET/PSET/FSET) not
+// workaroundable with a copy round-trip in the first place (see
+// CLAUDE.md's "確定した設計判断", Step 8's ADDR operand-category finding).
+// Instead this resolves target's own base variable and, for FieldExpr/
+// IndexExpr, folds the field name or index directly into ADDR's point
+// operand.
+func genAddrOfOperand(g *funcGen, target ast.Expr, resultIRType string) (string, error) {
+	tmp := g.newTemp(resultIRType)
+	switch v := target.(type) {
+	case *ast.Ident:
+		ref, ok := g.scope.lookup(v.Name)
+		if !ok {
+			return "", fmt.Errorf("codegen: undefined name %q (sema bug)", v.Name)
+		}
+		g.emit("\tADDR\t%s\t%s\n", tmp, ref.ValOp)
+	case *ast.FieldExpr:
+		base, ok := v.X.(*ast.Ident)
+		if !ok {
+			return "", fmt.Errorf("codegen: '&' field operand must be a plain variable (sema bug)")
+		}
+		ref, ok := g.scope.lookup(base.Name)
+		if !ok {
+			return "", fmt.Errorf("codegen: undefined name %q (sema bug)", base.Name)
+		}
+		g.emit("\tADDR\t%s\t%s\t>%s\n", tmp, ref.ValOp, v.Field)
+	case *ast.IndexExpr:
+		base, ok := v.X.(*ast.Ident)
+		if !ok {
+			return "", fmt.Errorf("codegen: '&' index operand must be a plain variable (sema bug)")
+		}
+		ref, ok := g.scope.lookup(base.Name)
+		if !ok {
+			return "", fmt.Errorf("codegen: undefined name %q (sema bug)", base.Name)
+		}
+		idxOp, err := genValue(g, v.Index)
+		if err != nil {
+			return "", err
+		}
+		g.emit("\tADDR\t%s\t%s\t%s\n", tmp, ref.ValOp, idxOp)
+	default:
+		return "", fmt.Errorf("codegen: '&' operand must be a plain variable, field access, or list index (sema bug)")
+	}
 	return tmp, nil
 }
 
@@ -176,14 +222,17 @@ func genDerefAssignStmt(g *funcGen, stmt *ast.DerefAssignStmt) error {
 // ast.CallExpr's RecvNeedsAddr/RecvNeedsDeref doc). At most one of the
 // two is ever set.
 func genReceiverOperand(g *funcGen, call *ast.CallExpr) (string, error) {
+	if call.RecvNeedsAddr {
+		// Must go through genAddrOfOperand directly on call.Receiver, not
+		// genValue+ADDR — see genAddrOfOperand's doc on why ADDRing a
+		// genValue'd copy of a field/index receiver (e.g. `pt.field.
+		// scale()`, `xs[0].scale()`) would alias the copy instead of the
+		// original.
+		return genAddrOfOperand(g, call.Receiver, "^*"+call.RecvStruct)
+	}
 	recvOp, err := genValue(g, call.Receiver)
 	if err != nil {
 		return "", err
-	}
-	if call.RecvNeedsAddr {
-		tmp := g.newTemp("^*" + call.RecvStruct)
-		g.emit("\tADDR\t%s\t%s\n", tmp, recvOp)
-		return tmp, nil
 	}
 	if call.RecvNeedsDeref {
 		tmp := g.newTemp("^" + call.RecvStruct)

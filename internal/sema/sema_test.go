@@ -939,6 +939,62 @@ func main(): int {
 	}
 }
 
+// TestCheck_ValidAddressOfFieldAndIndex regression-tests isAddressable's
+// widening (amivm's ADDR instruction gained an optional "point" operand —
+// see isAddressable's doc): &p.x (a single-level field access on a bare
+// variable) and &xs[0] (a single-level list-index access on a bare
+// variable) are both now valid unary `&` operands, as is auto-address-of
+// for a pointer-receiver method called through either shape.
+func TestCheck_ValidAddressOfFieldAndIndex(t *testing.T) {
+	src := `
+struct Point {
+	x: int
+	y: int
+}
+
+func (p: *Point) scale(factor: int) {
+	p.x = p.x * factor
+	p.y = p.y * factor
+}
+
+func main(): int {
+	let pt: Point = Point{x: 1, y: 2}
+	let px: *int = &pt.x
+	print(string(*px))
+
+	let xs: []int = [10, 20, 30]
+	let pe: *int = &xs[1]
+	print(string(*pe))
+
+	pt.scale(3)
+	return 0
+}
+`
+	if err := check(t, src); err != nil {
+		t.Fatalf("Check() = %v, want nil", err)
+	}
+}
+
+func TestCheck_AddressOfMapIndexIsRejected(t *testing.T) {
+	// Unlike a list index, a map index can never be addressed — amivm's
+	// ADDR point-as-index form is slice/array-only (a map element is
+	// never addressable in Go either) — see isAddressable's doc.
+	src := `
+func main(): int {
+	let m: map<string, int> = {"a": 1}
+	let p: *int = &m["a"]
+	return 0
+}
+`
+	err := check(t, src)
+	if err == nil {
+		t.Fatalf("Check() = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "cannot take the address of this expression") {
+		t.Fatalf("Check() = %q, want error containing %q", err.Error(), "cannot take the address of this expression")
+	}
+}
+
 func TestCheck_StructPointerErrors(t *testing.T) {
 	tests := []struct {
 		name    string

@@ -56,7 +56,7 @@ amivm <IRファイルパス> [-o|--output <出力ファイルパス>] [-v|--verb
 
 - `-o`/`--output`省略時の出力先は、IRファイルパスの拡張子を`.go`に置き換えたパス
 - `-v`/`--verbose`を付けると元のIR・型チェックの過程・最終的な生成コード・完了メッセージを標準出力に表示する
-- `-i`/`--import <名前>=<importパス>`は繰り返し指定できる。**Cascadeが独自のランタイムライブラリ(`cascadert`等、未使用なら消える)を呼びたい場合はこれを使う**
+- `-i`/`--import <名前>=<importパス>`は繰り返し指定できる。**Cascadeが独自のランタイムライブラリ(未使用なら消える)を呼びたい場合はこれを使う**(下記「独自のGoランタイムを呼ぶ」参照。現状Cascadeはこの機構を使っていない)
 - ファイル読み込み失敗・IRパースエラー・型チェック失敗などのエラーは常に出力する
 - `go build`による実行ファイル生成は行わない(別工程。Cascade側のビルドパイプラインで実行する)
 
@@ -104,7 +104,7 @@ amivm <IRファイルパス> [-o|--output <出力ファイルパス>] [-v|--verb
 | select | `SEL` `CASESEND` `CASERECV` `DEFAULT` `ENDSEL` |
 | スライス | `SLTYPE` `SLMAKE` `SLICE` |
 | 構造体 | `STTYPE` `FIELD` `ENDSTTYPE` `FSET` `FGET` |
-| map | `MPTYPE` `MPMAKE` `MSET` `MGET` |
+| map | `MPTYPE` `MPMAKE` `MSET` `MGET` `MPKEYS` |
 | クロージャー・関数型 | `FNTYPE` `CLOS` `ENDCLOS` |
 
 各命令の生成Goコード・オペランドカテゴリ(`whole`/`integer`/`value`/`single`/`multi`等)・Kind分類は`amivm/docs/amivm_spec.md`の4〜6節を参照。**キャスト・組み込み関数(`close`/`len`/`cap`等)は専用命令を持たず`CALL`に統合されている**(Goの型変換`T(v)`は構文上`ast.CallExpr`と同一のため)。
@@ -124,11 +124,11 @@ amivm <IRファイルパス> [-o|--output <出力ファイルパス>] [-v|--verb
 | `CONCAT` | `string + string` | 確定 |
 | `LABEL` `GOTO` `IF` | `if`/`elif`/`else`/`while`/`for`/`switch`/`break`/`continue`(制御構文全般) | 確定 |
 | `FUNC` `RET` `ENDFUNC` `CALL` | 通常関数・レシーバー付き関数・複数戻り値(8節) | 確定 |
-| `ADDR` `PGET` `PSET` | `&x`(アドレス取得)・`*p`(デリファレンス)・`*ptr = v`(2.2/4.4/6節) | 確定 |
+| `ADDR` `PGET` `PSET` | `&x`(アドレス取得。単純な変数だけでなく、amivmのADDRの`point`オペランド追加後は`&p.x`/`&xs[0]`のような単一階層のフィールド/添字アクセスも含む)・`*p`(デリファレンス)・`*ptr = v`(2.2/4.4/6節) | 確定 |
 | `SLTYPE` `SLMAKE` `ASET` `AGET` | `[]T`(可変長リスト、4.3節)。`append`は再SLMAKE+コピーで実現する見込み(Seedの配列と異なり可変長なので再確保が前提) | 確定 |
 | `SLICE` | Step 9で実装。ユーザー向け構文としては今も存在しないが、`filter`組み込み関数の内部実装(結果件数が事前にわからないため入力と同じ長さで`SLMAKE`し、マッチ分だけ前方に詰めてから実際の件数へ`SLICE`で切り詰める)で自然な使い道が見つかった | 確定 |
 | `STTYPE` `FIELD` `ENDSTTYPE` `FSET` `FGET` | `struct`定義・フィールドアクセス(4.1/5節) | 確定 |
-| `MPTYPE` `MPMAKE` `MSET` `MGET` | `map<K, V>`(4.5節)。`m[k]`が返す`V?`は予想通り`MGET`のcomma-ok形をそのまま値+nullフラグへ流し込めた(seed_implementation_notes.md §3の予想が的中)。Step 10で実装・実地検証済み | 確定 |
+| `MPTYPE` `MPMAKE` `MSET` `MGET` `MPKEYS` | `map<K, V>`(4.5節)。`m[k]`が返す`V?`は予想通り`MGET`のcomma-ok形をそのまま値+nullフラグへ流し込めた(seed_implementation_notes.md §3の予想が的中)。Step 10で実装・実地検証済み。`for k, v in m`のキー列挙はamivmに`MPKEYS`が追加されるまで`cascadert.Keys`という自前ランタイム経由で回避していたが、`MPKEYS`追加後は`cascadert`パッケージごと削除しネイティブ命令に置き換えた(下記「確定した設計判断」参照) | 確定 |
 | `FNTYPE` `CLOS` `ENDCLOS` | `func(...): R`型・クロージャーリテラル(8.3節)。Step 9で実装・実地検証済み | 確定 |
 | `CHTYPE` `CHMAKE` `CHSEND` `CHRECV` | `chan<T>`・`send()`・`for v in someChannel`(9節) | 確定 |
 | `SPAWN` | `source`/`stage`/`sink`を`|>`で連結した際の各段の並行実行(9.2節) | 確定 |
@@ -344,6 +344,22 @@ Cascadeの`func main(): int`をamivmの`!main`へ直接対応させることは�
 
 `README.md`/`README_ja.md`はSeedの同名ファイルの構成(ステータス・パイプライン図・要件・インストール・使い方・例・言語仕様・リポジトリ構成)をそのまま踏襲し、Cascade固有の内容(3本柱・実装済み機能一覧・パイプライン記法を使った例)に差し替えて作成した。掲載したコード例(`Hello, Cascade!`・4段抜きの並行パイプライン)はどちらも実際に`cascade run`へ通して動作確認済み。
 
+### AMIVM命令改修(ADDR拡張・callname拡張・MPKEYS追加)を受けたCascade側の追従(Step 15完了後)
+
+15ステップの実装計画が完了した後、Step 8/9/10で発見した3つのamivm側の制約(下記「命令使用ゴール」節参照)について、amivm本体への改修をユーザーが別セッションで依頼・実装し、`make install`で反映した。Cascade側はこれを受けて、**「前の命令だったので回避していた」実装を、新しい命令をそのまま使う形に置き換える**という後方追従の改修を行った。新しいCascade機能や文法は一切追加していない——既存の`&`/`*p`/クロージャー呼び出し/`for k, v in m`が生成するIRの中身が変わっただけで、これらの構文自体はStep 5〜10で既に確定済みのまま。
+
+**1. `ADDR`の`point`オペランド追加により、`isAddressable`(`internal/sema/sema.go`)を単純な識別子だけでなく、識別子直下の単一階層のフィールドアクセス(`&p.x`)・単一階層のリスト添字アクセス(`&xs[0]`)まで受け入れるよう拡張した。** amivmの`ADDR`は`ADDR single variable (point)`という形になり、`point`省略時は従来通り`single = &variable`、`point`が`>xxx_123`(フィールド名)なら`single = &variable.point`、それ以外(整数リテラル・変数など)なら`single = &variable[point]`を生成する(`amivm/docs/amivm_spec.md`4.2/5節)。ただし`point`はあくまで単一のフィールド名/添字であって経路(パス)ではないため、`&a.b.c`のような多段フィールドパスは今回も非対応のまま(`isAddressable`の`FieldExpr`/`IndexExpr`ケースは、いずれも`X`が裸の`*ast.Ident`であることを要求する)。また`&variable[point]`はスライス/配列専用でmapには使えない(mapの要素はGo自身においてもアドレス不可)ため、`isAddressable`の`IndexExpr`ケースは`ResultType.Nullable`(map読み取りかリスト読み取りかを判別する、Step 10由来の既存パターン)を見て、mapの添字は明示的に拒否する。
+
+**この拡張を安全に行うため、`exprType`の`UnaryExpr`("&")ケースで、`isAddressable`の呼び出し順序を入れ替えた。** 従来は`isAddressable(v.X)`を`c.exprType(sc, v.X)`より先に呼んでいたが(識別子オンリーの旧実装ではv.Xの型情報が不要だったため問題にならなかった)、`IndexExpr`ケースの判定に`v.X`自身の(map/リストを判別する)`ResultType`が必要になったため、`exprType`を先に呼んでからでないと正しく判定できない。この入れ替えにより、型チェック(フィールドの存在確認・添字の妥当性確認)が先に走り、その後でアドレス取得可能性を判定する、という自然な順序になった。
+
+**codegen側では、`&`の対象を`genValue`で一度値として評価してからADDRする、という従来のアプローチを使えないことに注意が必要だった。** `genValue(g, e)`で`p.x`や`xs[0]`を評価すると、`FGET`/`AGET`で**コピー**を新しい一時変数に読み出してしまい、そのコピーをADDRしても元のストレージへのエイリアスにはならない(まさにamivm_addr_revision_planメモリが警告していた「ADDRはコピー往復による回避ができない」という制約そのもの)。そのため、新設した`genAddrOfOperand`(`internal/codegen/struct.go`)は`target`(`&`の対象のAST式)を`genValue`に渡さず、`*ast.Ident`/`*ast.FieldExpr`/`*ast.IndexExpr`で型スイッチし、ベースとなる変数のトークンをスコープから直接引いた上で、`ADDR tmp base`・`ADDR tmp base >field`・`ADDR tmp base indexOp`のいずれかを直接発行する。**この過程で、既存の`genReceiverOperand`(値レシーバー/ポインタレシーバー自動変換、Step 8由来)に潜在バグを発見・修正した**——旧`isAddressable`が識別子オンリーだったため`RecvNeedsAddr`(値レシーバーの構造体をポインタレシーバーメソッドへ渡す際の暗黙ADDR)は今まで常に裸の識別子にしか発生せず問題が顕在化しなかったが、`isAddressable`をフィールド/添字まで拡張した今、`genReceiverOperand`が(拡張前と同じロジックのまま)`genValue(g, call.Receiver)`でレシーバー式を評価してからADDRしていたら、`b.pt.getX()`のようなフィールド経由のポインタレシーバー呼び出しで、コピーをADDRする同じ欠陥が発生するところだった。修正として`genReceiverOperand`も`genAddrOfOperand`を直接使うようにした。**この一連の経緯は「新しい構文・機能を実装したら、既存の周辺コードとの組み合わせも含めて実地検証する」という、本プロジェクトで繰り返し確認されてきた教訓を裏付けるものだった**——`isAddressable`単体のテストだけでは発見できず、既存の値/ポインタレシーバー自動変換との組み合わせで初めて表面化する種類のバグだった。
+
+**2. `callname`オペランドカテゴリへの`$N`/`&N`追加により、`closureCallTarget`(`internal/codegen/closure.go`)のコピー回避ロジックを単純化した。** 従来は`%xxx`/`@xxx`以外の全てのトークン(`$N`/`&N`を含む)を一時変数へ`SET`でコピーしてから呼び出していたが、`callname`が`$N`/`&N`を直接受け付けるようになったため、コピーが必要なのは`@xxx`(グローバルなクロージャー変数。今も`callname`カテゴリに含まれない)だけになった——`applyTwice(f: func(int): int, x: int): int { return f(f(x)) }`のようなプログラムで、パラメータ`f`(`$1`)を経由したクロージャー呼び出しが、コピーを介さず`CALL %tmp : $1 ...`という形へ直接コンパイルされるようになった(実地検証: `amivm`→`go build`→実行、および回帰テスト`TestGenerate_ClosureCallThroughParameterUsesDollarTokenDirectly`)。
+
+**3. `MPKEYS`命令の追加により、`for k, v in m`の実装(`internal/codegen/map.go`の`genForInMapStmt`)から`cascadert.Keys`ヘルパー呼び出しを削除し、`MPKEYS`を直接発行するよう置き換えた。** `MPKEYS single1 single2`は`single1 = slices.Collect(maps.Keys(single2))`を生成する(amivm標準ライブラリの`slices`/`maps`パッケージを利用、`amivm_spec.md`4.16節)。これによりCascadeが自前のGoランタイム(`cascadert`パッケージ)を必要とする箇所が完全になくなったため、**`cascadert/`ディレクトリ・`cmd/cascade/build.go`の`writeCascadert`・amivm呼び出しの`-i cascadert=cascadebuild/cascadert`引数を全て削除した**(下記「独自のGoランタイムを呼ぶ」節参照)。この方式(独自Goランタイムパッケージの`go:embed`配布)自体はSeedの`seedrt`から踏襲した仕組みとして今後も使える設計のまま残っており、将来別のビルトインが必要になれば復活させられる。
+
+**4. `value1`/`value2`オペランドカテゴリへの`!xxx_123`/`?xxx_123`/`?xxx_123.xxx_123`追加(トップレベル関数・Go関数参照を値として渡せるようにする拡張)は、amivm側では実装されたが、Cascade側の追従は意図的にスコープ外とした。** これは「クロージャーとして定義しなかった生の関数を値として扱えない」という別の制約(Step 9の「確定した設計判断」参照)を解消するもので、`filter(numbers, isEven)`のようにトップレベル関数を直接値として渡せるようにする、独立した意味論設計項目(呼び出し可能解決の優先順位への組み込み、`ast.Ident`が指すのが変数かトップレベル関数かの曖昧性解消など)を要する。今回の追従は「前の命令では回避していたものを新しい命令に置き換える」という3項目(ADDR/callname/MPKEYS)に絞り、この項目は別途ユーザーと相談の上で着手する。
+
 ## 意味検証の責任分担(重要)
 
 型の整合性・未定義識別子・関数シグネチャの不一致・メソッドの存在チェックなどは、**amivm側では検証せず`go/types`に全面的に委ねている。** amivmが保証するのは「構文的に妥当なGoコードを出力すること」だけ。
@@ -354,7 +370,9 @@ Cascadeの`func main(): int`をamivmの`!main`へ直接対応させることは�
 
 ## 独自のGoランタイムを呼ぶ
 
-`amivm`は`?pkg.Func`+`CALL`の仕組みで任意のGo関数を呼べる。Cascadeのビルトイン関数(`sqrt`/`args`等)のうち、単純な演算命令に対応しないものは、Cascade自身が用意するGoランタイムパッケージ`cascadert`(Seedの`seedrt`に相当)の関数として実装し、生成したIRから`CALL`で呼び出す。Step 10(map)で`for k, v in m`の実装のために初めて必要になり、Seedの`seedrt`と全く同じ方式で導入済み: `cascadert/embed.go`が自身の`.go`ファイルを`go:embed`で埋め込み、`cmd/cascade/build.go`の`writeCascadert`(`seed/cmd/seed/build.go`の`writeSeedrt`を忠実に踏襲)が`cascade build`実行時にスクラッチビルド用ディレクトリ配下の`cascadert/`へコピーし、`amivm`の`-i cascadert=cascadebuild/cascadert`で解決する(`-i`は未使用でも無害なので毎回無条件に渡してよい)。現在の`cascadert`の中身は`Keys[K comparable, V any](m map[K]V) []K`(Go 1.18+のジェネリクスを使い、`MPTYPE`が生成するどんな名前付きmap型に対しても1つの実装で動く。named map型からの型推論が実際に効くことは実装前に独立した最小Goプログラムで検証済み)のみ。新しいビルトインが必要になるたびにこのパッケージへ関数を追加していく。
+`amivm`は`?pkg.Func`+`CALL`の仕組みで任意のGo関数を呼べる。Cascadeのビルトイン関数のうち、単純な演算命令に対応しないものが将来必要になれば、Cascade自身が用意するGoランタイムパッケージ(Seedの`seedrt`に相当)の関数として実装し、生成したIRから`CALL`で呼び出す、という方式を使える(`cascadert/embed.go`が自身の`.go`ファイルを`go:embed`で埋め込み、`cmd/cascade/build.go`がビルド時にスクラッチディレクトリへコピーし`amivm`の`-i`で解決する、というSeedの`seedrt`/`writeSeedrt`と同じ配布方式)。
+
+**この方式は一度(Step 10、`for k, v in m`用の`cascadert.Keys`ヘルパー)導入したが、AMIVM本体に`MPKEYS`命令が追加されたことでネイティブ命令に置き換わり、`cascadert`パッケージ自体は完全に削除した**(下記「確定した設計判断」参照)。現時点でCascadeが自前のGoランタイムを必要とするビルトインは無い——新しいビルトインが、既存のAMIVM命令の組み合わせでは実装できない何かを必要とする時点で、改めてこの方式を復活させる。
 
 ## 過去に踏まれた地雷(Seedからの申し送り。Cascadeでも起こりうる)
 
@@ -396,10 +414,6 @@ Cascadeの`func main(): int`をamivmの`!main`へ直接対応させることは�
                                  (下記「確定した設計判断」参照)
   internal/sema/                意味検査(型チェック・スコープ解決・null絞り込み・パイプライン型接続検査)
   internal/codegen/             AST → AMIVM-IR生成
-  cascadert/                    Cascadeランタイム(Step 10で導入済み。現状は map<K, V> の
-                                 for-in走査に使うKeysのみ。sqrt/args等、単純な演算命令に
-                                 対応しないビルトインを今後ここに追加していく想定)。
-                                 生成されたGoコードからimportされるため internal/ 配下には置けない
   examples/                     サンプルCascadeプログラム(`.cas`。実装した構文ごとに追加)
 ```
 

@@ -672,15 +672,37 @@ func (c *checker) structTypeName(t ast.Type) (name string, isPtr bool, ok bool) 
 
 // isAddressable reports whether e is a valid operand for unary `&`
 // (cascade_spec.md §6) or a value-receiver method call's implicit
-// address-of (§8.2) — a plain variable only. Go itself allows the
-// broader set of lvalues (a struct field, a list element, ...), but
-// amivm's ADDR instruction accepts only a bare variable as its operand
-// (the "variable" category, amivm_spec.md §6: $N/&N/%xxx/@xxx — never a
-// field-path or index expression), so codegen has no way to honor
-// anything wider even though Go's own semantics would allow it.
+// address-of (§8.2). amivm's ADDR instruction (amivm_spec.md §4.2/§5)
+// takes a plain variable optionally combined with a single field name or
+// index (the "point" operand), so a bare variable (&x), a single-level
+// field access on a bare variable (&p.x), or a single-level list-index
+// access on a bare variable (&xs[0]) are all addressable — but a
+// multi-level path (&a.b.c) is not (ADDR's point is a single field/index,
+// not a path — there is no way to express taking the address of a field
+// of a field in one instruction), and neither is an index into a map
+// (&m[k]: amivm_spec.md's note under ADDR spells out that the
+// point-as-index form is slice/array-only and produces a go/types error
+// against a map — consistent with Go itself, where map elements are
+// never addressable).
+//
+// For the IndexExpr case, e's own ResultType must already be populated —
+// callers must run exprType on e (or on an expression containing e) before
+// calling isAddressable — so the list/map discriminator (ResultType.
+// Nullable; see exprType's IndexExpr case) is available to tell a list
+// index (addressable) from a map index (not) apart.
 func isAddressable(e ast.Expr) bool {
-	_, ok := e.(*ast.Ident)
-	return ok
+	switch v := e.(type) {
+	case *ast.Ident:
+		return true
+	case *ast.FieldExpr:
+		_, ok := v.X.(*ast.Ident)
+		return ok
+	case *ast.IndexExpr:
+		_, ok := v.X.(*ast.Ident)
+		return ok && !v.ResultType.Nullable
+	default:
+		return false
+	}
 }
 
 // checkStmt dispatches to one statement's own check function. want is the
@@ -1814,12 +1836,15 @@ func (c *checker) exprType(sc *scope, e ast.Expr) (ast.Type, error) {
 		// unaryResultType's generic scalar-operator shape — see
 		// isAddressable's doc and ast.Type's pointer-nullability doc.
 		if v.Op == "&" {
-			if !isAddressable(v.X) {
-				return ast.Type{}, fmt.Errorf("line %d: cannot take the address of this expression", v.Line)
-			}
+			// exprType must run first (not isAddressable) so v.X's own
+			// ResultType is populated in time — isAddressable's IndexExpr
+			// case needs it to tell a list index from a map index apart.
 			xt, err := c.exprType(sc, v.X)
 			if err != nil {
 				return ast.Type{}, err
+			}
+			if !isAddressable(v.X) {
+				return ast.Type{}, fmt.Errorf("line %d: cannot take the address of this expression", v.Line)
 			}
 			rt := ast.Type{Ptr: &xt, Nullable: true}
 			v.ResultType = rt

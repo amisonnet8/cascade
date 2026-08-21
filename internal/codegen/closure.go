@@ -101,18 +101,19 @@ func genClosureLit(g *funcGen, lit *ast.ClosureLit) (string, error) {
 }
 
 // closureCallTarget returns an operand valid in amivm's callname category
-// (`!xxx`/`!main`/`?xxx`/`?xxx.xxx`/`%xxx` — see amivm_spec.md §5) for
-// calling the function value held in valOp. A `%xxx` (or `@xxx`) token is
-// already valid as-is; anything else — most notably a plain function
-// parameter (`$N`) or closure parameter (`&N`) holding a closure value,
-// e.g. `func applyTwice(f: func(int): int, x: int): int { return
-// f(f(x)) }` — is NOT accepted there (a real amivm constraint discovered
-// empirically running examples/09_closures.cas through amivm — see
-// CLAUDE.md's "確定した設計判断" — despite amivm/test_ir/15_closure.ir's
-// own example only ever calling a `%xxx`), so it's copied into a fresh
-// local temp first.
+// (`!xxx`/`!main`/`?xxx`/`?xxx.xxx`/`%xxx`/`$N`/`&N` — see amivm_spec.md
+// §5) for calling the function value held in valOp. `%xxx`/`@xxx`/`$N`/
+// `&N` tokens are all valid as-is — the `$N`/`&N` cases (a plain function
+// parameter or closure parameter directly holding a closure value, e.g.
+// `func applyTwice(f: func(int): int, x: int): int { return f(f(x)) }`)
+// were rejected by an older amivm callname category that accepted only
+// `!xxx`/`!main`/`?xxx`/`?xxx.xxx`/`%xxx` (discovered empirically running
+// examples/09_closures.cas through amivm — see CLAUDE.md's "確定した設計
+// 判断"); amivm's callname category now accepts them directly, so only
+// `@xxx` (a global closure variable — still absent from callname) needs
+// the copy-to-temp fallback.
 func closureCallTarget(g *funcGen, valOp, irType string) string {
-	if strings.HasPrefix(valOp, "%") || strings.HasPrefix(valOp, "@") {
+	if strings.HasPrefix(valOp, "%") || strings.HasPrefix(valOp, "$") || strings.HasPrefix(valOp, "&") {
 		return valOp
 	}
 	tmp := g.newTemp(irType)

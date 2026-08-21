@@ -36,12 +36,12 @@ func genMapLiteralInit(g *funcGen, ref varRef, lit *ast.MapLit) error {
 }
 
 // genForInMapStmt compiles `for k, v in M { ... }` (cascade_spec.md §7).
-// AMIVM-IR has no instruction to enumerate a map's entries (MPTYPE/
-// MPMAKE/MSET/MGET only declare, construct, and do single-key access —
-// see CLAUDE.md's "確定した設計判断"), so this calls the cascadert
-// runtime's generic Keys() helper once to get the map's keys as an
-// ordinary Cascade list, then loops over that list exactly like
-// genForInStmt, MGETting each key's value inside the loop body.
+// MPKEYS gets the map's keys as an ordinary Cascade list in one
+// instruction (amivm_spec.md §4.16 — added after Cascade's Step 10
+// originally worked around its absence with the cascadert runtime's
+// Keys() helper; see CLAUDE.md's "確定した設計判断"), then this loops
+// over that list exactly like genForInStmt, MGETting each key's value
+// inside the loop body.
 func genForInMapStmt(g *funcGen, stmt *ast.ForInStmt) error {
 	mapOp, err := genValue(g, stmt.List)
 	if err != nil {
@@ -61,7 +61,7 @@ func genForInMapStmt(g *funcGen, stmt *ast.ForInStmt) error {
 	}
 
 	keysOp := g.newTemp(keysListIRType)
-	g.emit("\tCALL\t%s\t:\t?cascadert.Keys\t%s\n", keysOp, mapOp)
+	g.emit("\tMPKEYS\t%s\t%s\n", keysOp, mapOp)
 
 	lenOp := g.newTemp("^int")
 	g.emit("\tCALL\t%s\t:\t?len\t%s\n", lenOp, keysOp)

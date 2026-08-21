@@ -854,6 +854,73 @@ func main(): int {
 	}
 }
 
+func TestGenerate_AddrOfFieldAndIndexUsePointOperand(t *testing.T) {
+	// Regression test: amivm's ADDR gained an optional "point" operand
+	// (a field name or index — amivm_spec.md §4.2/§5) after Cascade's
+	// isAddressable originally restricted `&` to a bare variable only
+	// (see isAddressable's doc). genAddrOfOperand must resolve the base
+	// variable directly and fold the field/index into ADDR's point —
+	// never genValue the field/index into a copy first (that would ADDR
+	// the copy, not the original storage; see genAddrOfOperand's doc).
+	ir := generate(t, `
+struct Point {
+	x: int
+	y: int
+}
+func main(): int {
+	let pt: Point = Point{x: 1, y: 2}
+	let px: *int = &pt.x
+
+	let xs: []int = [10, 20, 30]
+	let idx: int = 1
+	let pe: *int = &xs[idx]
+	return 0
+}
+`)
+	if !strings.Contains(ir, "ADDR\t%tmp_4\t%pt_1\t>x\n") {
+		t.Fatalf("expected &pt.x to compile to ADDR with a >x field point operand; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "ADDR\t%tmp_8\t%xs_5\t%idx_6\n") {
+		t.Fatalf("expected &xs[idx] to compile to ADDR with idx as its index point operand; got:\n%s", ir)
+	}
+	if strings.Contains(ir, "FGET") || strings.Contains(ir, "AGET") {
+		t.Fatalf("must not read the field/index into a copy before ADDRing it; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_MethodCallAutoAddrOnFieldAndIndex(t *testing.T) {
+	// Companion to TestGenerate_AddrOfFieldAndIndexUsePointOperand: the
+	// same widened addressability applies to a pointer-receiver method's
+	// implicit auto-address-of (cascade_spec.md §8.2, CallExpr.
+	// RecvNeedsAddr) — genReceiverOperand must route through
+	// genAddrOfOperand directly on the receiver expression, not genValue
+	// a copy and ADDR that. Used in value position (a `let`'s
+	// initializer) rather than as its own bare statement, since
+	// parseFieldOrMethodStmt's statement-position shortcut only supports
+	// a single dotted level (b.pt.bump() as its own statement is an
+	// unrelated, pre-existing parser limitation — see its doc) while
+	// general expression parsing (parseSelectorSuffix) has no such limit.
+	ir := generate(t, `
+struct Point {
+	x: int
+}
+func (p: *Point) getX(): int {
+	return p.x
+}
+struct Box {
+	pt: Point
+}
+func main(): int {
+	let b: Box = Box{pt: Point{x: 1}}
+	let v: int = b.pt.getX()
+	return 0
+}
+`)
+	if !strings.Contains(ir, "ADDR\t%tmp_5\t%b_1\t>pt\n") {
+		t.Fatalf("expected b.pt.getX()'s auto-address-of to compile to ADDR with a >pt field point operand (directly off %%b_1, not a copy of b.pt); got:\n%s", ir)
+	}
+}
+
 func TestGenerate_PointerNullCheckUsesEQNilNotIssetFlag(t *testing.T) {
 	// A pointer has no isset flag of its own (its nullability is native Go
 	// nil — see ast.Type's doc) — `is none`/`is not none` on one must
@@ -990,12 +1057,12 @@ func main(): int {
 	}
 }
 
-func TestGenerate_ClosureCallThroughParameterUsesTempNotDollarToken(t *testing.T) {
-	// Regression test: amivm's CALL callname category only accepts
-	// %xxx/@xxx/!xxx/?xxx, never $N or &N (a real constraint found by
-	// actually running this program through amivm — see
-	// closureCallTarget's doc) — calling a closure held in a plain
-	// function parameter must copy it into a local temp first.
+func TestGenerate_ClosureCallThroughParameterUsesDollarTokenDirectly(t *testing.T) {
+	// Regression test: amivm's CALL callname category accepts
+	// %xxx/@xxx/!xxx/?xxx/$N/&N (the $N/&N addition came after Cascade's
+	// Step 9 originally worked around their absence by copying into a
+	// local temp first — see closureCallTarget's doc), so calling a
+	// closure held in a plain function parameter no longer needs a copy.
 	ir := generate(t, `
 func applyTwice(f: func(int): int, x: int): int {
 	return f(f(x))
@@ -1004,11 +1071,11 @@ func main(): int {
 	return 0
 }
 `)
-	if strings.Contains(ir, "CALL\t%tmp_2\t:\t$1\t") {
-		t.Fatalf("must not call a closure through a bare $N parameter token; got:\n%s", ir)
+	if strings.Contains(ir, "SET\t%tmp_1\t$1\n") {
+		t.Fatalf("closure parameter should be called through $1 directly, without a copy-to-temp; got:\n%s", ir)
 	}
-	if !strings.Contains(ir, "SET\t%tmp_1\t$1\n") {
-		t.Fatalf("expected the closure parameter to be copied into a local temp before being called; got:\n%s", ir)
+	if !strings.Contains(ir, "CALL\t%tmp_1\t:\t$1\t") {
+		t.Fatalf("expected the closure call to use the $1 parameter token directly as callname; got:\n%s", ir)
 	}
 }
 
@@ -1138,7 +1205,7 @@ func main(): int {
 	}
 }
 
-func TestGenerate_TwoVariableForInUsesCascadertKeys(t *testing.T) {
+func TestGenerate_TwoVariableForInUsesMPKEYS(t *testing.T) {
 	ir := generate(t, `
 func main(): int {
 	let counts: map<string, int> = {"a": 1, "b": 2}
@@ -1150,8 +1217,8 @@ func main(): int {
 	return 0
 }
 `)
-	if !strings.Contains(ir, "CALL\t%tmp_3\t:\t?cascadert.Keys\t%counts_1\n") {
-		t.Fatalf("expected the two-variable for-in to call cascadert.Keys once; got:\n%s", ir)
+	if !strings.Contains(ir, "MPKEYS\t%tmp_3\t%counts_1\n") {
+		t.Fatalf("expected the two-variable for-in to call MPKEYS once; got:\n%s", ir)
 	}
 	if !strings.Contains(ir, "\tMGET\t%v_") {
 		t.Fatalf("expected each iteration to MGET the value for its key; got:\n%s", ir)
