@@ -123,6 +123,7 @@ internal/codegen/       AST → AMIVM-IR
 examples/                実行可能な.casサンプル(言語機能ごと・実装した順にグループ化)
 cascade_spec.md         Cascade言語仕様(唯一の正確な仕様)
 CLAUDE.md                AIによる開発支援のためのプロジェクト規約
+LICENSE                  MITライセンス
 ```
 
 ## ライセンス

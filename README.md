@@ -123,6 +123,7 @@ internal/codegen/     AST → AMIVM-IR
 examples/              runnable .cas sample programs, one group per language feature
 cascade_spec.md       the Cascade language specification (the only authoritative one)
 CLAUDE.md              project conventions for AI-assisted development
+LICENSE                MIT license
 ```
 
 ## License
