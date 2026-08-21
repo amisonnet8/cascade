@@ -640,6 +640,9 @@ func genInit(g *funcGen, ref varRef, init ast.Expr) error {
 	if lit, isMap := init.(*ast.MapLit); isMap {
 		return genMapLiteralInit(g, ref, lit)
 	}
+	if lit, isClosure := init.(*ast.ClosureLit); isClosure {
+		return genClosureLitInto(g, ref.ValOp, lit)
+	}
 	if ref.SetOp != "" {
 		val, isset, err := genNullableOperands(g, init, ref.Type)
 		if err != nil {

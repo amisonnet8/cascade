@@ -10,10 +10,34 @@ import (
 )
 
 // genClosureLit compiles a closure literal (cascade_spec.md §8.3) into a
-// fresh temp, via a nested CLOS...ENDCLOS block emitted inline within the
-// enclosing function's own body (amivm requires CLOS's target to already
-// be VAR-declared — see amivm_spec.md's CLOS — which newTemp's own
-// declareVar call satisfies).
+// fresh temp — the general case, used when a closure literal appears as
+// a subexpression with no single target variable to write into directly
+// (e.g. a call argument). See genClosureLitInto for the target-aware
+// form genInit uses instead for `let f = func(...) {...}` (or a plain
+// reassignment `f = func(...) {...}`), which writes straight into the
+// destination variable — now that amivm's CLOS target category accepts
+// a pre-declared $N/%xxx/@xxx directly ("shallow", amivm_spec.md §4.17/
+// §5) rather than only a fresh local, this skips the redundant temp+SET
+// this function still needs for the general case.
+func genClosureLit(g *funcGen, lit *ast.ClosureLit) (string, error) {
+	irType, err := typeToIR(g.types, lit.ResolvedType)
+	if err != nil {
+		return "", err
+	}
+	tmp := g.newTemp(irType)
+	if err := genClosureLitInto(g, tmp, lit); err != nil {
+		return "", err
+	}
+	return tmp, nil
+}
+
+// genClosureLitInto compiles a closure literal directly into target — a
+// token already valid in amivm's CLOS "shallow" category ($N/%xxx/@xxx;
+// a %xxx or @xxx target must already be VAR/GVAR-declared, which is
+// always true by the time this runs: a %xxx local is hoisted before its
+// initializer compiles, and @xxx globals are GVAR-declared at the top
+// level before cascade_init ever runs) — via a nested CLOS...ENDCLOS
+// block emitted inline within the enclosing function's own body.
 //
 // The closure body compiles through its own, completely independent
 // funcGen — fresh decls/seq/labelSeq/breakStack/continueStack, since a
@@ -32,14 +56,12 @@ import (
 // §2.1's "CLOSはFUNC本体内にのみ出現し、ネスト不可") — sema.Check already
 // rejects a closure literal appearing inside another closure's body
 // before codegen ever runs (see checker.closureDepth), so this function
-// never has to guard against it itself.
-func genClosureLit(g *funcGen, lit *ast.ClosureLit) (string, error) {
-	irType, err := typeToIR(g.types, lit.ResolvedType)
-	if err != nil {
-		return "", err
-	}
-	tmp := g.newTemp(irType)
-
+// never has to guard against it itself. This is also exactly why CLOS's
+// own target can never legitimately be a `&N` token (only reachable from
+// inside a CLOS body, where a CLOS instruction itself can never appear)
+// — amivm's "shallow" category correctly excludes it, unlike the
+// (deliberately broader) "single" category other constructors use.
+func genClosureLitInto(g *funcGen, target string, lit *ast.ClosureLit) error {
 	inner := &funcGen{scope: newScope(g.scope), types: g.types, structs: g.structs, sigs: g.sigs, methods: g.methods}
 
 	var paramIRTypes []string
@@ -47,7 +69,7 @@ func genClosureLit(g *funcGen, lit *ast.ClosureLit) (string, error) {
 	for _, p := range lit.Params {
 		pIRType, err := typeToIR(g.types, p.Type)
 		if err != nil {
-			return "", err
+			return err
 		}
 		argIdx++
 		ref := varRef{Type: p.Type, ValOp: fmt.Sprintf("&%d", argIdx)}
@@ -64,7 +86,7 @@ func genClosureLit(g *funcGen, lit *ast.ClosureLit) (string, error) {
 	for _, r := range lit.Results {
 		rIRType, err := typeToIR(g.types, r)
 		if err != nil {
-			return "", err
+			return err
 		}
 		resultIRTypes = append(resultIRTypes, rIRType)
 		if needsIssetSlot(r) {
@@ -75,12 +97,12 @@ func genClosureLit(g *funcGen, lit *ast.ClosureLit) (string, error) {
 
 	for _, stmt := range lit.Body {
 		if err := genStmt(inner, stmt); err != nil {
-			return "", err
+			return err
 		}
 	}
 
 	var head strings.Builder
-	fmt.Fprintf(&head, "\tCLOS\t%s", tmp)
+	fmt.Fprintf(&head, "\tCLOS\t%s", target)
 	for _, t := range paramIRTypes {
 		head.WriteString("\t")
 		head.WriteString(t)
@@ -97,23 +119,28 @@ func genClosureLit(g *funcGen, lit *ast.ClosureLit) (string, error) {
 	}
 	g.b.WriteString(inner.b.String())
 	g.emit("ENDCLOS\n")
-	return tmp, nil
+	return nil
 }
 
 // closureCallTarget returns an operand valid in amivm's callname category
-// (`!xxx`/`!main`/`?xxx`/`?xxx.xxx`/`%xxx`/`$N`/`&N` — see amivm_spec.md
-// §5) for calling the function value held in valOp. `%xxx`/`@xxx`/`$N`/
-// `&N` tokens are all valid as-is — the `$N`/`&N` cases (a plain function
-// parameter or closure parameter directly holding a closure value, e.g.
-// `func applyTwice(f: func(int): int, x: int): int { return f(f(x)) }`)
-// were rejected by an older amivm callname category that accepted only
-// `!xxx`/`!main`/`?xxx`/`?xxx.xxx`/`%xxx` (discovered empirically running
-// examples/09_closures.cas through amivm — see CLAUDE.md's "確定した設計
-// 判断"); amivm's callname category now accepts them directly, so only
-// `@xxx` (a global closure variable — still absent from callname) needs
-// the copy-to-temp fallback.
+// (`!xxx`/`!main`/`?xxx`/`?xxx.xxx`/`%xxx`/`@xxx`/`$N`/`&N` — see
+// amivm_spec.md §5) for calling the function value held in valOp.
+// `%xxx`/`@xxx`/`$N`/`&N` tokens — every shape genValue can ever hand
+// back for a closure-typed expression — are all valid as-is now, so the
+// copy-to-temp fallback below is unreachable in practice; it stays only
+// as a defensive catch-all (e.g. a bare `nil` literal, which is not a
+// valid callname token on its own).
+//
+// This used to be a real, exercised fallback: an older amivm callname
+// category accepted only `!xxx`/`!main`/`?xxx`/`?xxx.xxx`/`%xxx`, forcing
+// a copy for `$N`/`&N` (a plain function/closure parameter directly
+// holding a closure value, e.g. `func applyTwice(f: func(int): int, x:
+// int): int { return f(f(x)) }` — discovered empirically running
+// examples/09_closures.cas through amivm) and, later, for `@xxx` (a
+// global closure variable) once `$N`/`&N` were added but `@xxx` still
+// wasn't — see CLAUDE.md's "確定した設計判断" for both rounds.
 func closureCallTarget(g *funcGen, valOp, irType string) string {
-	if strings.HasPrefix(valOp, "%") || strings.HasPrefix(valOp, "$") || strings.HasPrefix(valOp, "&") {
+	if strings.HasPrefix(valOp, "%") || strings.HasPrefix(valOp, "@") || strings.HasPrefix(valOp, "$") || strings.HasPrefix(valOp, "&") {
 		return valOp
 	}
 	tmp := g.newTemp(irType)

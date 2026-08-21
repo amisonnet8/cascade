@@ -1057,6 +1057,73 @@ func main(): int {
 	}
 }
 
+func TestGenerate_ClosureLitAssignedToLocalSkipsTempCopy(t *testing.T) {
+	// Regression test: amivm's CLOS target category was widened from
+	// "local" (%xxx only) to "shallow" ($N/%xxx/@xxx — amivm_spec.md
+	// §4.17/§5), so `let f = func(...) {...}` (or a plain reassignment)
+	// can CLOS straight into the destination variable instead of a fresh
+	// temp followed by a redundant SET — see genClosureLitInto's doc.
+	ir := generate(t, `
+func main(): int {
+	let f: func(int): int = func(x: int): int {
+		return x + 1
+	}
+	print(string(f(4)))
+	return 0
+}
+`)
+	if !strings.Contains(ir, "CLOS\t%f_1\t^int\t:\t^int\n") {
+		t.Fatalf("expected the closure literal to CLOS directly into %%f_1; got:\n%s", ir)
+	}
+	if strings.Contains(ir, "SET\t%f_1\t%tmp") {
+		t.Fatalf("must not copy the closure through a temp before assigning it to f; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_ClosureLitAssignedToGlobalSkipsTempCopy(t *testing.T) {
+	// Companion to the local-variable case above: a top-level `let`
+	// closure initializer (compiled inside cascade_init — cascade_spec.md
+	// §11.3) CLOSes directly into its @xxx global too, since "shallow"
+	// includes @xxx alongside $N/%xxx.
+	ir := generate(t, `
+let doubler: func(int): int = func(x: int): int {
+	return x * 2
+}
+func main(): int {
+	print(string(doubler(21)))
+	return 0
+}
+`)
+	if !strings.Contains(ir, "CLOS\t@doubler\t^int\t:\t^int\n") {
+		t.Fatalf("expected the closure literal to CLOS directly into @doubler; got:\n%s", ir)
+	}
+	if strings.Contains(ir, "SET\t@doubler\t%tmp") {
+		t.Fatalf("must not copy the closure through a temp before assigning it to the global; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_ClosureCallThroughGlobalUsesAtTokenDirectly(t *testing.T) {
+	// Regression test: amivm's callname category was widened to accept
+	// @xxx directly (amivm_spec.md §5), so calling a closure held in a
+	// global variable no longer needs a copy-to-temp first — see
+	// closureCallTarget's doc.
+	ir := generate(t, `
+let doubler: func(int): int = func(x: int): int {
+	return x * 2
+}
+func main(): int {
+	print(string(doubler(21)))
+	return 0
+}
+`)
+	if !strings.Contains(ir, "CALL\t%tmp_1\t:\t@doubler\t21\n") {
+		t.Fatalf("expected the call to use @doubler directly as its callname; got:\n%s", ir)
+	}
+	if strings.Contains(ir, "SET\t%tmp_1\t@doubler\n") {
+		t.Fatalf("must not copy the global closure into a temp before calling through it; got:\n%s", ir)
+	}
+}
+
 func TestGenerate_ClosureCallThroughParameterUsesDollarTokenDirectly(t *testing.T) {
 	// Regression test: amivm's CALL callname category accepts
 	// %xxx/@xxx/!xxx/?xxx/$N/&N (the $N/&N addition came after Cascade's
