@@ -1022,8 +1022,8 @@ func main(): int {
 	if !strings.Contains(ir, "CLOS\t%tmp_1\t^int\t:\t^int\n") {
 		t.Fatalf("expected the closure literal to compile to a CLOS block; got:\n%s", ir)
 	}
-	if !strings.Contains(ir, "ADD\t%tmp_1\t$1\t&1\n") {
-		t.Fatalf("expected the closure body to reference its own param via &1 and the captured outer param via $1; got:\n%s", ir)
+	if !strings.Contains(ir, "ADD\t%tmp_1\t$1\t&1-1\n") {
+		t.Fatalf("expected the closure body to reference its own param via &1-1 (depth 1, param 1) and the captured outer param via $1; got:\n%s", ir)
 	}
 	if !strings.Contains(ir, "ENDCLOS\n") {
 		t.Fatalf("expected the CLOS block to be closed with ENDCLOS; got:\n%s", ir)
@@ -1054,6 +1054,42 @@ func main(): int {
 	}
 	if !strings.Contains(ir, "ADD\t%count_1\t%count_1\t1\n") {
 		t.Fatalf("expected the closure body to mutate the captured %%count_1 directly, not a copy; got:\n%s", ir)
+	}
+}
+
+func TestGenerate_NestedClosureLitUsesQualifiedParamTokens(t *testing.T) {
+	// Regression test: amivm's CLOS gained nesting support (a closure
+	// literal may now itself contain another — see genClosureLitInto's
+	// doc), with each nesting depth's own parameters addressed via a
+	// fully-qualified &depth-N token rather than the old flat &N. This
+	// checks the classic curry(a)(b) = a + b shape: the outer CLOS
+	// (depth 1) must declare its own parameter as &1-1, and the inner
+	// CLOS (depth 2, nested inside the outer's own body) must reference
+	// both its own parameter (&2-1) and the captured outer one (&1-1) —
+	// never a bare &1/&2, which would be ambiguous once nesting exists.
+	ir := generate(t, `
+func curry(): func(int): func(int): int {
+	return func(a: int): func(int): int {
+		return func(b: int): int {
+			return a + b
+		}
+	}
+}
+func main(): int {
+	return 0
+}
+`)
+	if !strings.Contains(ir, "CLOS\t%tmp_1\t^int\t:\t^FuncType1\n") {
+		t.Fatalf("expected the outer (depth-1) closure's own CLOS header; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "CLOS\t%tmp_1\t^int\t:\t^int\n") {
+		t.Fatalf("expected the inner (depth-2) closure's own CLOS header; got:\n%s", ir)
+	}
+	if !strings.Contains(ir, "ADD\t%tmp_1\t&1-1\t&2-1\n") {
+		t.Fatalf("expected the innermost body to add the captured outer param (&1-1) and its own param (&2-1); got:\n%s", ir)
+	}
+	if strings.Contains(ir, "&1\t") || strings.Contains(ir, "\t&1\n") || strings.Contains(ir, "&2\t") || strings.Contains(ir, "\t&2\n") {
+		t.Fatalf("must never emit a bare (unqualified) &N closure-parameter token now that CLOS can nest; got:\n%s", ir)
 	}
 }
 

@@ -95,21 +95,17 @@ type checker struct {
 	methods map[string]map[string]methodSig // struct name -> method name -> sig
 	stages  map[string]stageSig             // source/stage/sink name -> channel shape
 
-	// closureDepth counts enclosing closure-literal bodies currently being
-	// checked (0 outside any closure). amivm's CLOS cannot itself contain
-	// another CLOS (amivm_spec.md §2.1's "CLOSはFUNC本体内にのみ出現し、ネ
-	// スト不可") — see checkClosureLit, which rejects a ClosureLit found
-	// while this is already > 0, so codegen never has to guard against it.
-	closureDepth int
-
 	// currentFuncResults is the declared result types of whichever
 	// function or closure body is currently being checked — needed by
 	// checkErrorPropExpr (§8.6's postfix `?`) to validate that its own
 	// enclosing function/closure also ends in `error?`, since exprType
 	// isn't threaded a "want" parameter the way checkStmt is. Saved and
-	// restored around checkClosureLit's body check (mirroring
-	// closureDepth) so a closure's own result types don't leak back out
-	// to whatever encloses it.
+	// restored around checkClosureLit's body check so a closure's own
+	// result types don't leak back out to whatever encloses it — the same
+	// save/restore shape works unchanged for a closure literal nested
+	// inside another one (cascade_spec.md §8.3), since each nested
+	// checkClosureLit call saves/restores its own caller's value via Go's
+	// own call stack, with no explicit depth counter needed.
 	currentFuncResults []ast.Type
 
 	// inStageBody is true while checking a source/stage/sink's own body
@@ -472,8 +468,8 @@ func (c *checker) validateChanParamType(t ast.Type, line int) (ast.Type, error) 
 // parameters (cascade_spec.md §9.1) — mirrors checkFuncBody, except a
 // source/stage/sink never returns a value (want is nil, so a bare
 // `return` is the only form checkReturnStmt will accept) and has no
-// receiver. c.inStageBody is set for the duration (mirroring
-// closureDepth's save/restore pattern), since abort() (§9.4) is only
+// receiver. c.inStageBody is set for the duration (cleared via defer),
+// since abort() (§9.4) is only
 // meaningful — and only compilable, codegen needs an abort channel that
 // only a source/stage/sink actually has — from inside one of these
 // bodies.
@@ -1554,14 +1550,21 @@ func (c *checker) checkStructLit(sc *scope, lit *ast.StructLit) (ast.Type, error
 // separate capture-analysis pass here — see CLAUDE.md's "確定した設計判
 // 断"), and loopDepth/breakDepth reset to 0 (a closure body is its own
 // function-like boundary: `break`/`continue` inside it can never reach a
-// loop outside it, mirroring Go's own func-literal semantics). Rejects a
-// closure literal found while already checking another closure's body —
-// see checker.closureDepth's doc for why.
+// loop outside it, mirroring Go's own func-literal semantics).
+//
+// A closure literal may itself contain another closure literal (a curried
+// `func(a: int): func(int): int { return func(b: int): int { return a +
+// b } }`) — amivm's CLOS instruction originally couldn't nest, so this
+// was rejected here up through Cascade's first implementation pass, but
+// amivm later added CLOS nesting support (a numbered closure-parameter
+// scheme, `&N`/`&L-N` — see codegen's genClosureLitInto), so there is
+// nothing left for sema to reject: sc already chains scopes arbitrarily
+// deep regardless of nesting, checkStmtsIn's loopDepth/breakDepth=0 reset
+// and the currentFuncResults save/restore below both already recurse
+// correctly through Go's own call stack with no explicit depth tracking
+// needed, and codegen (a fully independent package — see "意味検証の責任
+// 分担") handles amivm's own numbering scheme entirely on its own.
 func (c *checker) checkClosureLit(sc *scope, lit *ast.ClosureLit) (ast.Type, error) {
-	if c.closureDepth > 0 {
-		return ast.Type{}, fmt.Errorf("line %d: a closure literal cannot itself contain another closure literal (amivm's CLOS cannot nest)", lit.Line)
-	}
-
 	paramTypes := make([]ast.Type, len(lit.Params))
 	inner := newScope(sc)
 	for i, p := range lit.Params {
@@ -1579,12 +1582,10 @@ func (c *checker) checkClosureLit(sc *scope, lit *ast.ClosureLit) (ast.Type, err
 		}
 	}
 
-	c.closureDepth++
 	savedResults := c.currentFuncResults
 	c.currentFuncResults = lit.Results
 	err := c.checkStmtsIn(inner, lit.Body, lit.Results, 0, 0)
 	c.currentFuncResults = savedResults
-	c.closureDepth--
 	if err != nil {
 		return ast.Type{}, err
 	}

@@ -212,6 +212,7 @@ type funcGen struct {
 	methods       map[string]map[string]funcSig // struct name -> method name -> sig, for struct.go's method-call codegen
 	stages        map[string]stageInfo          // source/stage/sink name -> channel shape, for pipeline.go's genPipelineStmt (§9.2)
 	results       []ast.Type                    // this FUNC/CLOS's own declared result types, for genReturnStmt's nullable-result expansion and error.go's genErrorProp (§8.6's postfix `?`)
+	closureDepth  int                           // 0 in a plain FUNC body; a CLOS body's own nesting depth L otherwise (FUNC-direct is 1, amivm_spec.md §4.17/§10) — see genClosureLitInto's doc for why every closure-parameter token is always emitted fully qualified (&L-N) rather than the bare &N shorthand
 	abortChanOp   string                        // this source/stage/sink's own hidden abort-broadcast channel operand (§9.4); empty outside a stage body (see genStageDecl/genForInChannelStmt/genSendCall)
 	guardChanOp   string                        // this source/stage/sink's own hidden close-once guard channel operand (§9.4, only used by genAbortCall); empty outside a stage body
 	seq           int

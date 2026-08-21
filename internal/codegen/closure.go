@@ -32,12 +32,13 @@ func genClosureLit(g *funcGen, lit *ast.ClosureLit) (string, error) {
 }
 
 // genClosureLitInto compiles a closure literal directly into target — a
-// token already valid in amivm's CLOS "shallow" category ($N/%xxx/@xxx;
-// a %xxx or @xxx target must already be VAR/GVAR-declared, which is
-// always true by the time this runs: a %xxx local is hoisted before its
-// initializer compiles, and @xxx globals are GVAR-declared at the top
-// level before cascade_init ever runs) — via a nested CLOS...ENDCLOS
-// block emitted inline within the enclosing function's own body.
+// token already valid in amivm's CLOS "single1" category ($N/&N/&L-N/
+// %xxx/@xxx; a %xxx or @xxx target must already be VAR/GVAR-declared,
+// which is always true by the time this runs: a %xxx local is hoisted
+// before its initializer compiles, and @xxx globals are GVAR-declared at
+// the top level before cascade_init ever runs) — via a nested
+// CLOS...ENDCLOS block emitted inline within the enclosing function's
+// own body.
 //
 // The closure body compiles through its own, completely independent
 // funcGen — fresh decls/seq/labelSeq/breakStack/continueStack, since a
@@ -45,24 +46,33 @@ func genClosureLit(g *funcGen, lit *ast.ClosureLit) (string, error) {
 // its own goto/VAR-hoisting problem (seed_implementation_notes.md §1) —
 // except its *scope* is a child of the enclosing scope at the point the
 // literal appears, exactly mirroring real Go closure capture: a captured
-// identifier resolves to the *same* underlying %xxx/$N token used
-// outside, with no copying or special capture instruction needed (see
+// identifier resolves to the *same* underlying token used outside, with
+// no copying or special capture instruction needed (see
 // amivm/test_ir/15_closure.ir, where `%count`/`%base` are referenced
-// directly, unchanged, inside a CLOS body). A closure parameter is a
-// consecutive `&N` slot exactly like a FUNC parameter's `$N` (including
-// the same two-slot nullable expansion — see needsIssetSlot).
+// directly, unchanged, inside a CLOS body).
 //
-// amivm forbids CLOS from nesting inside another CLOS (amivm_spec.md
-// §2.1's "CLOSはFUNC本体内にのみ出現し、ネスト不可") — sema.Check already
-// rejects a closure literal appearing inside another closure's body
-// before codegen ever runs (see checker.closureDepth), so this function
-// never has to guard against it itself. This is also exactly why CLOS's
-// own target can never legitimately be a `&N` token (only reachable from
-// inside a CLOS body, where a CLOS instruction itself can never appear)
-// — amivm's "shallow" category correctly excludes it, unlike the
-// (deliberately broader) "single" category other constructors use.
+// A closure parameter is a `&depth-N` slot exactly like a FUNC
+// parameter's `$N` (including the same two-slot nullable expansion — see
+// needsIssetSlot), where depth is this closure's own nesting depth
+// (inner.closureDepth = g.closureDepth+1, FUNC-direct is 1 —
+// amivm_spec.md §4.17/§10). amivm also accepts the bare `&N` shorthand
+// (meaning "the closure I'm currently compiling"), but this always emits
+// the fully-qualified `&depth-N` form instead, for every parameter at
+// every depth, even a depth-1 closure that could use the short form —
+// because a closure literal may now itself contain another (cascade_spec
+// .md §8.3, amivm's CLOS nesting support), and a varRef's ValOp is a
+// single fixed string decided once at declaration time and reused
+// verbatim by every future scope lookup, however many closure bodies
+// deep that lookup happens to come from (the whole mechanism this
+// function's capture story above relies on). A bare `&N` stored at
+// declaration time would resolve correctly only for a reference from
+// that *same* closure body — a deeper nested closure capturing it would
+// misread it as its own Nth parameter instead. The fully-qualified form
+// has no such blind spot: it is unambiguous regardless of which closure
+// body — this one or any depth beneath it — ends up reading it back out.
 func genClosureLitInto(g *funcGen, target string, lit *ast.ClosureLit) error {
-	inner := &funcGen{scope: newScope(g.scope), types: g.types, structs: g.structs, sigs: g.sigs, methods: g.methods}
+	depth := g.closureDepth + 1
+	inner := &funcGen{scope: newScope(g.scope), types: g.types, structs: g.structs, sigs: g.sigs, methods: g.methods, closureDepth: depth}
 
 	var paramIRTypes []string
 	argIdx := 0
@@ -72,11 +82,11 @@ func genClosureLitInto(g *funcGen, target string, lit *ast.ClosureLit) error {
 			return err
 		}
 		argIdx++
-		ref := varRef{Type: p.Type, ValOp: fmt.Sprintf("&%d", argIdx)}
+		ref := varRef{Type: p.Type, ValOp: fmt.Sprintf("&%d-%d", depth, argIdx)}
 		paramIRTypes = append(paramIRTypes, pIRType)
 		if needsIssetSlot(p.Type) {
 			argIdx++
-			ref.SetOp = fmt.Sprintf("&%d", argIdx)
+			ref.SetOp = fmt.Sprintf("&%d-%d", depth, argIdx)
 			paramIRTypes = append(paramIRTypes, "^bool")
 		}
 		inner.scope.declare(p.Name, ref)

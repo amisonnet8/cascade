@@ -16,6 +16,18 @@ func applyTwice(f: func(int): int, x: int): int {
     return f(f(x))
 }
 
+// カリー化: クロージャーリテラルの中にさらにクロージャーリテラルを書ける
+// (amivmのCLOSがネスト可能になったことで対応。&L-Nという階層付きトーク
+// ンにより、内側のクロージャーから外側のクロージャーの引数(この場合は
+// 外側のa)を正しく捕捉できる)
+func curry(): func(int): func(int): int {
+    return func(a: int): func(int): int {
+        return func(b: int): int {
+            return a + b
+        }
+    }
+}
+
 func main(): int {
     let add5 = makeAdder(5)
     print("add5(10)=" + string(add5(10)))
@@ -51,6 +63,10 @@ func main(): int {
         return acc + n
     })
     print("total=" + string(total))
+
+    let add = curry()
+    let addFive = add(5)
+    print("curry()(5)(10)=" + string(addFive(10)))
 
     return 0
 }

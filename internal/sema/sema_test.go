@@ -1403,27 +1403,41 @@ func main(): int {
 	}
 }
 
+// TestCheck_ValidNestedClosureLit regression-tests that a closure literal
+// may itself contain another (currying) — amivm's CLOS instruction
+// originally couldn't nest, so Cascade rejected this outright; amivm
+// later added CLOS nesting support (see checkClosureLit's doc), and this
+// confirms sema no longer rejects it, that a nested closure can capture
+// both its own parameter and an enclosing closure's, and that plain
+// (non-nested) closures are unaffected.
+func TestCheck_ValidNestedClosureLit(t *testing.T) {
+	src := `
+func curry(): func(int): func(int): int {
+	return func(a: int): func(int): int {
+		return func(b: int): int {
+			return a + b
+		}
+	}
+}
+
+func main(): int {
+	let add = curry()
+	let add5 = add(5)
+	print(string(add5(10)))
+	return 0
+}
+`
+	if err := check(t, src); err != nil {
+		t.Fatalf("Check() = %v, want nil", err)
+	}
+}
+
 func TestCheck_ClosureErrors(t *testing.T) {
 	tests := []struct {
 		name    string
 		src     string
 		wantErr string
 	}{
-		{
-			name: "closure literal cannot itself contain another closure literal",
-			src: `
-func main(): int {
-	let f = func(): int {
-		let g = func(): int {
-			return 1
-		}
-		return g()
-	}
-	return 0
-}
-`,
-			wantErr: "cannot itself contain another closure literal",
-		},
 		{
 			name: "closure parameter type mismatch",
 			src: `
