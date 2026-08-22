@@ -13,5 +13,10 @@ func main(): int {
     let ready: bool = true
     let empty: int?
 
+    // 文字列リテラルのエスケープシーケンス(3.1節、AMIVM/Go準拠)
+    print("she said \"hi\" to me")
+    print("line1\nline2")
+    print("emoji: \U0001F600")
+
     return 0
 }
