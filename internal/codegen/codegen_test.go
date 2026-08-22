@@ -253,10 +253,17 @@ func TestGenerate_StringConversion(t *testing.T) {
 }
 
 // labelDefRe/labelRefRe/assertLabelsResolve check IR well-formedness at
-// the label level: every "#Lx" a GOTO/IF/CASE... jumps to must actually
-// be defined by a LABEL somewhere in the same IR. This is the kind of
-// mistake seed_implementation_notes.md §1 warns is easy to make and easy
-// to miss just by reading generated IR text.
+// the label level, in both directions: every "#Lx" a GOTO/IF/CASE...
+// jumps to must actually be defined by a LABEL somewhere in the same IR,
+// and (just as importantly, since amivm's IF/LOOP migration) every
+// defined LABEL must actually be referenced by at least one GOTO —
+// go/types rejects an unreferenced Go label the same way it rejects an
+// unused variable, exactly the class of bug this caught in
+// genSwitchStmt's own end-of-switch label before its unconditional
+// fallthrough GOTO was added (a switch whose body never calls `break`
+// left that label defined but never jumped to). This is the kind of
+// mistake seed_implementation_notes.md §1/§2.2 warns is easy to make and
+// easy to miss just by reading generated IR text.
 var (
 	labelDefRe = regexp.MustCompile(`(?m)^\tLABEL\t#(\w+)`)
 	labelRefRe = regexp.MustCompile(`#(\w+)`)
@@ -268,9 +275,21 @@ func assertLabelsResolve(t *testing.T, ir string) {
 	for _, m := range labelDefRe.FindAllStringSubmatch(ir, -1) {
 		defined[m[1]] = true
 	}
-	for _, m := range labelRefRe.FindAllStringSubmatch(ir, -1) {
+	// Non-defining references only: strip every LABEL-definition line
+	// first, so a label's own `LABEL #Lx` line doesn't count as a
+	// reference to itself (every defined label would otherwise trivially
+	// look "referenced", defeating the point of the check below).
+	nonLabelLines := labelDefRe.ReplaceAllString(ir, "")
+	referenced := map[string]bool{}
+	for _, m := range labelRefRe.FindAllStringSubmatch(nonLabelLines, -1) {
+		referenced[m[1]] = true
 		if !defined[m[1]] {
 			t.Fatalf("label #%s is referenced but never defined by a LABEL; IR:\n%s", m[1], ir)
+		}
+	}
+	for label := range defined {
+		if !referenced[label] {
+			t.Fatalf("label #%s is defined by a LABEL but never referenced by anything (go/types would reject this as an unused label); IR:\n%s", label, ir)
 		}
 	}
 }
@@ -352,6 +371,13 @@ func main(): int {
 // target, never a continue target, so `continue` inside a switch must
 // still resolve to the while's start label, not fail to compile.
 func TestGenerate_ContinueInSwitchTargetsEnclosingLoop(t *testing.T) {
+	// switch never pushes its own continueTarget (cascade_spec.md §7:
+	// "switch自体はループではない"), so `continue` inside a switch body
+	// finds the enclosing while's continueTarget on the stack — which for
+	// a while loop is native (see genWhileStmt), meaning this compiles to
+	// a plain CONTINUE that Go's own scoping rules carry straight past
+	// the switch's nested IF/ELSE blocks to the LOOP, with no LABEL/GOTO
+	// needed at all.
 	ir := generate(t, `
 func main(): int {
 	let i = 0
@@ -366,14 +392,8 @@ func main(): int {
 }
 `)
 	assertLabelsResolve(t, ir)
-	// The while loop's start label is the very first LABEL emitted.
-	m := labelDefRe.FindStringSubmatch(ir)
-	if m == nil {
-		t.Fatalf("expected at least one LABEL in IR:\n%s", ir)
-	}
-	startLabel := m[1]
-	if !strings.Contains(ir, "GOTO\t#"+startLabel+"\n") {
-		t.Fatalf("expected continue (inside the switch) to GOTO the while's start label #%s; got:\n%s", startLabel, ir)
+	if !strings.Contains(ir, "\tIF\t%tmp_4\n\tCONTINUE\n\tENDIF\n") {
+		t.Fatalf("expected continue (inside the switch) to compile to a native CONTINUE directly inside the switch's own IF, with no GOTO of its own; got:\n%s", ir)
 	}
 }
 
@@ -1424,7 +1444,7 @@ func main(): int {
 	if !strings.Contains(ir, "CALL\t%tmp_2\t%tmp_3\t%tmp_4\t:\t!divide\t$1\t$2\n") {
 		t.Fatalf("expected 'divide(a, b)?' to request all three of divide's result operands; got:\n%s", ir)
 	}
-	if !strings.Contains(ir, "IF\t%tmp_4\t#L1\n") {
+	if !strings.Contains(ir, "IF\t%tmp_4\n") {
 		t.Fatalf("expected the propagation check to branch on divide's own isset flag; got:\n%s", ir)
 	}
 	if !strings.Contains(ir, "RET\t0\t%tmp_3\ttrue\n") {
@@ -1516,7 +1536,7 @@ func main(): int {
 	// real send) and a CASERECV on the hidden abort channel — a plain
 	// CHSEND would block forever if downstream ever aborts and nobody's
 	// left to receive (see pipeline.go's genSendCall).
-	if !strings.Contains(ir, "CASESEND\t$1\t42\t#") {
+	if !strings.Contains(ir, "SEL\n\tCASESEND\t$1\t42\n") {
 		t.Fatalf("expected send(output, 42) inside 'numbers' to compile to a CASESEND $1 42 inside a SEL; got:\n%s", ir)
 	}
 }
@@ -1576,11 +1596,11 @@ func main(): int {
 	// Inside a stage body, the receive is wrapped in a SEL alongside a
 	// CASERECV on the hidden abort channel (see pipeline.go's
 	// genForInChannelStmt) rather than a plain CHRECV.
-	if !strings.Contains(printAllIR, "CASERECV\t%n_1\t%tmp_2\t$1\t#") {
+	if !strings.Contains(printAllIR, "SEL\n\tCASERECV\t%n_1\t%tmp_2\t$1\n") {
 		t.Fatalf("expected 'for n in input' to compile to a comma-ok CASERECV inside a SEL; got:\n%s", printAllIR)
 	}
-	if !strings.Contains(printAllIR, "IF\t%tmp_2\t#") {
-		t.Fatalf("expected the CASERECV's ok flag to drive the loop's IF; got:\n%s", printAllIR)
+	if !strings.Contains(printAllIR, "NOT\t%tmp_3\t%tmp_2\n\tIF\t%tmp_3\n\tBREAK\n\tENDIF\n") {
+		t.Fatalf("expected the CASERECV's ok flag (negated) to drive the loop's BREAK; got:\n%s", printAllIR)
 	}
 	if strings.Contains(printAllIR, "AGET") {
 		t.Fatalf("a channel for-in must not use AGET (that's the list form); got:\n%s", printAllIR)
@@ -1651,7 +1671,7 @@ func main(): int {
 	// what signals an aborted pipeline as `none` (cascade_spec.md §9.3/
 	// §9.4); ok=true carries the real collected list.
 	collectorIR := ir[strings.Index(ir, "FUNC\t!__collect_1"):]
-	if !strings.Contains(collectorIR, "SEL\n\tCASERECV\t%v\t%ok\t$1\t#") {
+	if !strings.Contains(collectorIR, "SEL\n\tCASERECV\t%v\t%ok\t$1\n") {
 		t.Fatalf("expected the collector to SEL-receive its input channel with comma-ok; got:\n%s", collectorIR)
 	}
 	if !strings.Contains(collectorIR, "CALL\t%result\t:\t?append\t%result\t%v\n") {
@@ -1692,7 +1712,7 @@ func main(): int {
 	// shared abort-broadcast channel — see genAbortCall's doc for why a
 	// plain send can't safely broadcast to multiple concurrently-selecting
 	// stages, only a close can.
-	if !strings.Contains(numbersIR, "SEL\n\tCASESEND\t") || !strings.Contains(numbersIR, "\tDEFAULT\t#") {
+	if !strings.Contains(numbersIR, "SEL\n\tCASESEND\t") || !strings.Contains(numbersIR, "\tDEFAULT\n") {
 		t.Fatalf("expected abort() to use a non-blocking SEL+DEFAULT guard before closing; got:\n%s", numbersIR)
 	}
 	if !strings.Contains(numbersIR, "CALL\t:\t?close\t") {
@@ -1738,7 +1758,7 @@ func main(): int {
 	if !strings.Contains(mergeIR, "SET\t%chA\tnil\n") || !strings.Contains(mergeIR, "SET\t%chB\tnil\n") {
 		t.Fatalf("expected the fan-in to nil out a closed input's own channel variable; got:\n%s", mergeIR)
 	}
-	if !strings.Contains(mergeIR, "SEL\n\tCASERECV\t%v\t%ok\t%chA\t#") {
+	if !strings.Contains(mergeIR, "SEL\n\tCASERECV\t%v\t%ok\t%chA\n") || !strings.Contains(mergeIR, "\tCASERECV\t%v\t%ok\t%chB\n") {
 		t.Fatalf("expected the fan-in to SEL-receive from both inputs; got:\n%s", mergeIR)
 	}
 	assertLabelsResolve(t, ir)

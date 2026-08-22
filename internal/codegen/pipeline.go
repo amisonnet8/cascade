@@ -158,18 +158,11 @@ func genSendCall(g *funcGen, call *ast.CallExpr) error {
 		g.emit("\tCHSEND\t%s\t%s\n", ch, v)
 		return nil
 	}
-	sentLabel := g.newLabel()
-	abortedLabel := g.newLabel()
-	afterLabel := g.newLabel()
 	g.emit("\tSEL\n")
-	g.emit("\tCASESEND\t%s\t%s\t#%s\n", ch, v, sentLabel)
-	g.emit("\tCASERECV\t_\t%s\t#%s\n", g.abortChanOp, abortedLabel)
-	g.emit("\tENDSEL\n")
-	g.emit("\tLABEL\t#%s\n", sentLabel)
-	g.emit("\tGOTO\t#%s\n", afterLabel)
-	g.emit("\tLABEL\t#%s\n", abortedLabel)
+	g.emit("\tCASESEND\t%s\t%s\n", ch, v)
+	g.emit("\tCASERECV\t_\t%s\n", g.abortChanOp)
 	g.emit("\tRET\n")
-	g.emit("\tLABEL\t#%s\n", afterLabel)
+	g.emit("\tENDSEL\n")
 	return nil
 }
 
@@ -200,33 +193,29 @@ func genAbortCall(g *funcGen, call *ast.CallExpr) error {
 	g.emit("\tCONCAT\t%s\t%s\t%s\n", prefixed, strconv.Quote("abort: "), msgOp)
 	g.emit("\tCALL\t:\t?fmt.Println\t%s\n", prefixed)
 
-	wonLabel := g.newLabel()
-	lostLabel := g.newLabel()
-	afterLabel := g.newLabel()
 	g.emit("\tSEL\n")
-	g.emit("\tCASESEND\t%s\ttrue\t#%s\n", g.guardChanOp, wonLabel)
-	g.emit("\tDEFAULT\t#%s\n", lostLabel)
-	g.emit("\tENDSEL\n")
-	g.emit("\tLABEL\t#%s\n", wonLabel)
+	g.emit("\tCASESEND\t%s\ttrue\n", g.guardChanOp)
 	g.emit("\tCALL\t:\t?close\t%s\n", g.abortChanOp)
-	g.emit("\tGOTO\t#%s\n", afterLabel)
-	g.emit("\tLABEL\t#%s\n", lostLabel)
-	g.emit("\tLABEL\t#%s\n", afterLabel)
+	g.emit("\tDEFAULT\n")
+	g.emit("\tENDSEL\n")
 	g.emit("\tRET\n")
 	return nil
 }
 
 // genForInChannelStmt compiles `for v in ch { ... }` over a channel
-// (cascade_spec.md §7, §9.1). Outside a stage body (g.abortChanOp == "")
-// this is the plain Step 12 form: CHRECV's comma-ok result doubles as
-// both the loop condition (false once ch is closed and drained) and each
-// iteration's value fetch. Inside a stage body, it becomes a SEL between
-// that same CHRECV and a CASERECV on the abort-broadcast channel — if
-// abort() fires (anywhere in the pipeline) before ch's next value
-// arrives, this stage returns immediately instead of continuing to wait.
-// Either way, there is no separate index variable or increment step at
-// all — `continue` simply re-issues the next receive, the same shape
-// genWhileStmt's own continue target already uses.
+// (cascade_spec.md §7, §9.1) as a LOOP. Outside a stage body
+// (g.abortChanOp == "") this is the plain Step 12 form: CHRECV's
+// comma-ok result doubles as both the loop condition (false once ch is
+// closed and drained) and each iteration's value fetch. Inside a stage
+// body, the receive becomes a SEL between that same CHRECV and a
+// CASERECV on the abort-broadcast channel — if abort() fires (anywhere
+// in the pipeline) before ch's next value arrives, this stage returns
+// immediately instead of continuing to wait; the abort case's own RET
+// sits inside its CASERECV body, so it only fires when abort actually
+// wins the race, and both SEL branches otherwise fall through to the
+// same ok-check below. Either way, there is no separate index variable
+// or increment step at all — `continue` is a native CONTINUE, same as
+// genWhileStmt.
 func genForInChannelStmt(g *funcGen, stmt *ast.ForInStmt) error {
 	chOp, err := genValue(g, stmt.List)
 	if err != nil {
@@ -244,34 +233,20 @@ func genForInChannelStmt(g *funcGen, stmt *ast.ForInStmt) error {
 	g.scope.declare(stmt.VarName, loopRef)
 	okOp := g.newTemp("^bool")
 
-	startLabel := g.newLabel()
-	bodyLabel := g.newLabel()
-	endLabel := g.newLabel()
-
+	g.emit("\tLOOP\n")
 	if g.abortChanOp == "" {
-		g.emit("\tLABEL\t#%s\n", startLabel)
 		g.emit("\tCHRECV\t%s\t%s\t%s\n", loopRef.ValOp, okOp, chOp)
-		g.emit("\tIF\t%s\t#%s\n", okOp, bodyLabel)
-		g.emit("\tGOTO\t#%s\n", endLabel)
-		g.emit("\tLABEL\t#%s\n", bodyLabel)
 	} else {
-		gotLabel := g.newLabel()
-		abortedLabel := g.newLabel()
-		g.emit("\tLABEL\t#%s\n", startLabel)
 		g.emit("\tSEL\n")
-		g.emit("\tCASERECV\t%s\t%s\t%s\t#%s\n", loopRef.ValOp, okOp, chOp, gotLabel)
-		g.emit("\tCASERECV\t_\t%s\t#%s\n", g.abortChanOp, abortedLabel)
-		g.emit("\tENDSEL\n")
-		g.emit("\tLABEL\t#%s\n", gotLabel)
-		g.emit("\tIF\t%s\t#%s\n", okOp, bodyLabel)
-		g.emit("\tGOTO\t#%s\n", endLabel)
-		g.emit("\tLABEL\t#%s\n", abortedLabel)
+		g.emit("\tCASERECV\t%s\t%s\t%s\n", loopRef.ValOp, okOp, chOp)
+		g.emit("\tCASERECV\t_\t%s\n", g.abortChanOp)
 		g.emit("\tRET\n")
-		g.emit("\tLABEL\t#%s\n", bodyLabel)
+		g.emit("\tENDSEL\n")
 	}
+	g.emitBreakUnless(okOp)
 
-	g.pushBreak(endLabel)
-	g.pushContinue(startLabel)
+	g.pushBreak(breakTarget{})
+	g.pushContinue(continueTarget{})
 	var bodyErr error
 	for _, s := range stmt.Body {
 		if bodyErr = genStmt(g, s); bodyErr != nil {
@@ -285,8 +260,7 @@ func genForInChannelStmt(g *funcGen, stmt *ast.ForInStmt) error {
 		return bodyErr
 	}
 
-	g.emit("\tGOTO\t#%s\n", startLabel)
-	g.emit("\tLABEL\t#%s\n", endLabel)
+	g.emit("\tENDLOOP\n")
 	return nil
 }
 
@@ -398,20 +372,19 @@ func genCollectorFunc(types *typeRegistry, elemType, listType ast.Type) (funcNam
 	b.WriteString("\tVAR\t%ok\t^bool\n")
 	fmt.Fprintf(&b, "\tSLMAKE\t%%result\t%s\t0\n", listIRType)
 	b.WriteString("\tDEFER\t?close\t$2\n")
-	b.WriteString("\tLABEL\t#L1\n")
+	b.WriteString("\tLOOP\n")
 	b.WriteString("\tSEL\n")
-	b.WriteString("\tCASERECV\t%v\t%ok\t$1\t#L2\n")
-	b.WriteString("\tCASERECV\t_\t$3\t#L4\n")
-	b.WriteString("\tENDSEL\n")
-	b.WriteString("\tLABEL\t#L2\n")
-	b.WriteString("\tIF\t%ok\t#L3\n")
+	b.WriteString("\tCASERECV\t%v\t%ok\t$1\n")
+	b.WriteString("\tIF\t%ok\n")
+	b.WriteString("\tCALL\t%result\t:\t?append\t%result\t%v\n")
+	b.WriteString("\tELSE\n")
 	b.WriteString("\tCHSEND\t$2\t%result\n")
 	b.WriteString("\tRET\n")
-	b.WriteString("\tLABEL\t#L3\n")
-	b.WriteString("\tCALL\t%result\t:\t?append\t%result\t%v\n")
-	b.WriteString("\tGOTO\t#L1\n")
-	b.WriteString("\tLABEL\t#L4\n")
+	b.WriteString("\tENDIF\n")
+	b.WriteString("\tCASERECV\t_\t$3\n")
 	b.WriteString("\tRET\n")
+	b.WriteString("\tENDSEL\n")
+	b.WriteString("\tENDLOOP\n")
 	b.WriteString("ENDFUNC\n")
 	return name, b.String(), nil
 }
@@ -500,28 +473,28 @@ func genMergeFunc(types *typeRegistry, chanIRType, elemIRType string) (funcName,
 	b.WriteString("\tSET\t%chA\t$1\n")
 	b.WriteString("\tSET\t%chB\t$2\n")
 	b.WriteString("\tDEFER\t?close\t$3\n")
-	b.WriteString("\tLABEL\t#L1\n")
+	b.WriteString("\tLOOP\n")
 	b.WriteString("\tEQ\t%doneA\t%chA\tnil\n")
 	b.WriteString("\tEQ\t%doneB\t%chB\tnil\n")
 	b.WriteString("\tAND\t%bothDone\t%doneA\t%doneB\n")
-	b.WriteString("\tIF\t%bothDone\t#L2\n")
-	b.WriteString("\tSEL\n")
-	b.WriteString("\tCASERECV\t%v\t%ok\t%chA\t#L3\n")
-	b.WriteString("\tCASERECV\t%v\t%ok\t%chB\t#L4\n")
-	b.WriteString("\tENDSEL\n")
-	b.WriteString("\tLABEL\t#L3\n")
-	b.WriteString("\tIF\t%ok\t#L5\n")
-	b.WriteString("\tSET\t%chA\tnil\n")
-	b.WriteString("\tGOTO\t#L1\n")
-	b.WriteString("\tLABEL\t#L4\n")
-	b.WriteString("\tIF\t%ok\t#L5\n")
-	b.WriteString("\tSET\t%chB\tnil\n")
-	b.WriteString("\tGOTO\t#L1\n")
-	b.WriteString("\tLABEL\t#L5\n")
-	b.WriteString("\tCHSEND\t$3\t%v\n")
-	b.WriteString("\tGOTO\t#L1\n")
-	b.WriteString("\tLABEL\t#L2\n")
+	b.WriteString("\tIF\t%bothDone\n")
 	b.WriteString("\tRET\n")
+	b.WriteString("\tENDIF\n")
+	b.WriteString("\tSEL\n")
+	b.WriteString("\tCASERECV\t%v\t%ok\t%chA\n")
+	b.WriteString("\tIF\t%ok\n")
+	b.WriteString("\tCHSEND\t$3\t%v\n")
+	b.WriteString("\tELSE\n")
+	b.WriteString("\tSET\t%chA\tnil\n")
+	b.WriteString("\tENDIF\n")
+	b.WriteString("\tCASERECV\t%v\t%ok\t%chB\n")
+	b.WriteString("\tIF\t%ok\n")
+	b.WriteString("\tCHSEND\t$3\t%v\n")
+	b.WriteString("\tELSE\n")
+	b.WriteString("\tSET\t%chB\tnil\n")
+	b.WriteString("\tENDIF\n")
+	b.WriteString("\tENDSEL\n")
+	b.WriteString("\tENDLOOP\n")
 	b.WriteString("ENDFUNC\n")
 	return name, b.String(), nil
 }

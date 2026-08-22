@@ -122,6 +122,8 @@ internal/sema/          意味検査(型チェック・スコープ解決・null
 internal/codegen/       AST → AMIVM-IR
 examples/                実行可能な.casサンプル(言語機能ごと・実装した順にグループ化)
 cascade_spec.md         Cascade言語仕様(唯一の正確な仕様)
+cascade_implementation_notes.md  AMIVM-IRを生成するフロントエンドを書く上での知見
+                         (Cascade固有ではなく一般的な話に絞ってある)
 CLAUDE.md                AIによる開発支援のためのプロジェクト規約
 LICENSE                  MITライセンス
 ```

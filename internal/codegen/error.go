@@ -78,11 +78,7 @@ func genErrorProp(g *funcGen, e *ast.ErrorPropExpr) (string, error) {
 	}
 	errRef := refs[len(refs)-1]
 
-	isErrLabel := g.newLabel()
-	okLabel := g.newLabel()
-	g.emit("\tIF\t%s\t#%s\n", errRef.SetOp, isErrLabel)
-	g.emit("\tGOTO\t#%s\n", okLabel)
-	g.emit("\tLABEL\t#%s\n", isErrLabel)
+	g.emit("\tIF\t%s\n", errRef.SetOp)
 
 	var retVals []string
 	for _, rt := range g.results[:len(g.results)-1] {
@@ -97,7 +93,6 @@ func genErrorProp(g *funcGen, e *ast.ErrorPropExpr) (string, error) {
 	}
 	retVals = append(retVals, errRef.ValOp, "true")
 	g.emit("\tRET\t%s\n", strings.Join(retVals, "\t"))
-
-	g.emit("\tLABEL\t#%s\n", okLabel)
+	g.emit("\tENDIF\n")
 	return refs[0].ValOp, nil
 }

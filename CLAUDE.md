@@ -34,7 +34,7 @@ Cascade開発でAMIVMの全命令を使うことが目標として掲げられ�
 |---|---|
 | `cascade_spec.md` | **Cascade言語仕様。唯一の正確な仕様。** 字句規則・型・演算子・制御構文・構造体・クロージャー・パイプライン・モジュールなどを定義。実装と齟齬が出たら、まず`cascade_spec.md`の記述を疑い、仕様として確定してからコードを直すこと |
 | `amivm/docs/amivm_spec.md` | AMIVM-IRの唯一の正確な仕様(下記「AMIVM-IRの書き方」節に要点を転記)。amivm本体のバージョンを上げた際は齟齬がないか確認すること |
-| `seed_implementation_notes.md` | **[[Seed]]の実装で踏んだ地雷・確立したパターンのまとめ。Cascade実装前に必読。** 特にgoto/VAR巻き上げ問題(§1)は最重要。Seedが未実証だった命令(ポインタ・構造体・map・クロージャー・チャネル・select・ビット演算)をCascadeでは実際に使うことになるため、§5の「未実証命令への手がかり」は実地検証必須の仮説として扱うこと |
+| `cascade_implementation_notes.md` | **Cascade自身の実装で踏んだ地雷・確立したパターンのまとめ。AMIVM-IRを生成するフロントエンドを書くときの一般的な知見に絞ってある。** 新しいAMIVM命令カテゴリを実装する前・amivm本体の破壊的変更に追従する前に一読すること。各言語の実装知見はその言語自身のリポジトリで管理する方針のため、[[Seed]]側の知見(goto/VAR巻き上げ問題など)はこのファイルには含まれない——必要なら`github.com/amisonnet8/seed`リポジトリ自身の実装知見を参照すること |
 | `seed/` | Seedの実装済みリポジトリ(参考実装)。ディレクトリ構成・レイヤー分割(`lexer`/`parser`/`ast`/`sema`/`codegen`)・CLIの作り(`flag.NewFlagSet`によるサブコマンド)・テスト戦略の実例として参照してよい。**Cascadeリポジトリの一部ではない** |
 | `amivm/` | 参照用にローカルへ置かれているamivmリポジトリのクローン。**Cascadeリポジトリの一部ではない。** amivmはCascadeから見て「外部CLIツール」であり、`go install`で`PATH`に配置して呼び出す(下記参照) |
 | 本ファイル(`CLAUDE.md`) | Cascadeプロジェクトの規約・AIによる開発支援のための注意点 |
@@ -66,7 +66,7 @@ amivm <IRファイルパス> [-o|--output <出力ファイルパス>] [-v|--verb
 
 ### 制約・前提条件
 
-- `FUNC`はトップレベルのみに置ける(関数のネスト不可)。`STTYPE`・`SEL`もネスト不可。**`CLOS`だけは例外で、`CLOS`本体の中にさらに`CLOS`をネストできる**(クロージャーを返すクロージャー=カリー化を表現するため。ネストの深さ`L`は`FUNC`直下を1として数える)
+- `FUNC`はトップレベルのみに置ける(関数のネスト不可)。`STTYPE`もネスト不可。**`IF`・`LOOP`・`CLOS`・`SEL`はいずれもネストできる**(互いの本体の中に`IF`/`LOOP`/`CLOS`/`SEL`を任意の組み合わせ・任意の深さで書ける。`CLOS`のネスト深さ`L`は`FUNC`直下を1として数え、クロージャー引数`&L-N`の階層番号に対応する)
 - 配列は1次元固定長のみ。多次元配列はAMIVM-IR自体では表現しない(Cascadeの`[]T`はそもそも1次元のみなので該当しない)
 - チャネル・スライス・map・構造体・クロージャーは、対応する`TYPE`系命令(`SLTYPE`/`MPTYPE`/`STTYPE`/`FNTYPE`/`CHTYPE`)で型を定義してから使う
 - トークンの区切り文字は**タブ**。行頭のインデント用タブは無視。`//`で始まる行はコメントとして無視
@@ -97,17 +97,20 @@ amivm <IRファイルパス> [-o|--output <出力ファイルパス>] [-v|--verb
 | 論理演算 | `AND` `OR` `NOT` |
 | 比較 | `EQ` `NEQ` `LT` `LTE` `GT` `GTE` |
 | 文字列連結 | `CONCAT single slice1 slice2 ...` |
-| ラベル・分岐 | `LABEL label` / `GOTO label` / `IF boolean1 label` |
+| ラベル・GOTO | `LABEL label` / `GOTO label` |
+| 条件分岐 | `IF boolean1` / `ELIF boolean1` / `ELSE` / `ENDIF`(ブロック形。Goの`if`/`else if`/`else`に対応) |
+| ループ | `LOOP` / `BREAK` / `CONTINUE` / `ENDLOOP`(Goの無限`for {}`。条件付きループは`LOOP`の中で`IF`+`BREAK`を組み合わせて表現する) |
+| 型アサーション | `ASSERT multi1 (multi2) variable type1`(Goの`v.(T)`。`any`型相当をCascadeが持たないため対象外——下記「命令使用ゴール」参照) |
 | 関数定義 | `FUNC defname type1 ... : type3 ...` / `RET` / `ENDFUNC` |
 | 関数呼び出し | `CALL multi1 ... : callname value1 ...` / `DEFER` / `SPAWN` |
 | チャネル | `CHTYPE` `CHMAKE` `CHSEND` `CHRECV` |
-| select | `SEL` `CASESEND` `CASERECV` `DEFAULT` `ENDSEL` |
+| select | `SEL` `CASESEND` `CASERECV` `DEFAULT` `ENDSEL`(`CASESEND`/`CASERECV`/`DEFAULT`はブロック形。`label`は取らず、次のケースか`ENDSEL`までが本体) |
 | スライス | `SLTYPE` `SLMAKE` `SLICE` |
 | 構造体 | `STTYPE` `FIELD` `ENDSTTYPE` `FSET` `FGET` |
 | map | `MPTYPE` `MPMAKE` `MSET` `MGET` `MPKEYS` |
 | クロージャー・関数型 | `FNTYPE` `CLOS` `ENDCLOS` |
 
-各命令の生成Goコード・オペランドカテゴリ(`whole`/`integer`/`value`/`single`/`multi`等)・Kind分類は`amivm/docs/amivm_spec.md`の4〜6節を参照。**キャスト・組み込み関数(`close`/`len`/`cap`等)は専用命令を持たず`CALL`に統合されている**(Goの型変換`T(v)`は構文上`ast.CallExpr`と同一のため)。
+各命令の生成Goコード・オペランドカテゴリ(`whole`/`integer`/`value`/`single`/`multi`等)・Kind分類は`amivm/docs/amivm_spec.md`の4〜6節を参照。**キャスト・組み込み関数(`close`/`len`/`cap`等)は専用命令を持たず`CALL`に統合されている**(Goの型変換`T(v)`は構文上`ast.CallExpr`と同一のため)。型アサーション(`v.(T)`)だけは構文が異なる別ASTノード(Goの`ast.TypeAssertExpr`)になるため`CALL`に含めず`ASSERT`という専用命令になっている。
 
 ## 命令使用ゴール(Cascade機能とAMIVM命令の対応表)
 
@@ -122,7 +125,9 @@ amivm <IRファイルパス> [-o|--output <出力ファイルパス>] [-v|--verb
 | `AND` `OR` `NOT` | `&&` `\|\|` `!` | 確定 |
 | `EQ` `NEQ` `LT` `LTE` `GT` `GTE` | 比較演算子。`is none`/`is not none`もnull許容型の内部フラグ比較として実装できる見込み | 確定 |
 | `CONCAT` | `string + string` | 確定 |
-| `LABEL` `GOTO` `IF` | `if`/`elif`/`else`/`while`/`for`/`switch`/`break`/`continue`(制御構文全般) | 確定 |
+| `IF` `ELIF` `ELSE` `ENDIF` | `if`/`elif`/`else`(7節)、`switch`の内部的な分岐実装(タグ付き/タグなし問わず、対応するネイティブ命令がamivmに無いため`switch`はIF/ELSEのネストへ desugar する。7節)。`ELIF`トークン自体は使わず`ELSE`の中に次の`IF`をネストして自前で組み立てる(条件式が複数命令を要する場合に対応するため。下記「確定した設計判断」参照) | 確定 |
+| `LOOP` `BREAK` `CONTINUE` `ENDLOOP` | `while`(7節)、`for`(list/map/channel、いずれも7節)。`break`/`continue`はループでは基本ネイティブの`BREAK`/`CONTINUE`だが、`switch`の`break`と添字カウント式`for`(list/map)の`continue`だけ`LABEL`/`GOTO`を使う(下記「確定した設計判断」参照) | 確定 |
+| `LABEL` `GOTO` | `switch`の`break`(ネイティブの`BREAK`で抜けられる構造がswitchには無いため)、list/map for-inの`continue`(添字カウンタの更新が本体の後にあるため、ループ先頭に戻るネイティブ`CONTINUE`だけでは足りない) | 確定 |
 | `FUNC` `RET` `ENDFUNC` `CALL` | 通常関数・レシーバー付き関数・複数戻り値(8節) | 確定 |
 | `ADDR` `PGET` `PSET` | `&x`(アドレス取得。単純な変数だけでなく、amivmのADDRの`point`オペランド追加後は`&p.x`/`&xs[0]`のような単一階層のフィールド/添字アクセスも含む)・`*p`(デリファレンス)・`*ptr = v`(2.2/4.4/6節) | 確定 |
 | `SLTYPE` `SLMAKE` `ASET` `AGET` | `[]T`(可変長リスト、4.3節)。`append`は再SLMAKE+コピーで実現する見込み(Seedの配列と異なり可変長なので再確保が前提) | 確定 |
@@ -134,6 +139,7 @@ amivm <IRファイルパス> [-o|--output <出力ファイルパス>] [-v|--verb
 | `SPAWN` | `source`/`stage`/`sink`を`|>`で連結した際の各段の並行実行(9.2節) | 確定 |
 | `SEL` `CASESEND` `CASERECV` `DEFAULT` | `merge()`のファンイン実装(9.5節。2チャネルのどちらか先に来た方を受け取るselect相当)に加え、`abort()`(9.4節)の中断通知・各ステージの`for-in`/`send()`の中断監視でも使用。Step 13で実装・実地検証済み(下記「確定した設計判断」参照) | 確定 |
 | `DEFER` | ユーザー向け構文としては存在しない。`source`/`stage`のFUNC本体先頭で`DEFER ?close $N`(出力チャネル)を無条件に発行し、関数(=ステージ)がどの経路で終了しても出力チャネルを自動closeして下流の`for-in`を終了させる、というコード生成側の内部利用。Step 12で実装・実地検証済み(下記「確定した設計判断」参照) | 確定 |
+| `ASSERT` | 対応するCascade機能なし。Goの型アサーション`v.(T)`(`any`型の値から具体的な型を取り出す命令)に対応するが、Cascadeの型システムには`any`相当の型が無く、`ASSERT`を必要とする局面がそもそも発生しない。「無理に全命令を使う必要はない」という本プロジェクトの努力目標(冒頭「全命令使用という目標について」参照)に照らして、これは意図的に対象外とする | 対象外 |
 
 ## 確定した設計判断
 
@@ -362,7 +368,7 @@ Cascadeの`func main(): int`をamivmの`!main`へ直接対応させることは�
 
 ### AMIVM命令改修・第2弾(callnameへの`@xxx_123`追加、CLOSの左辺`local`→`shallow`)への追従
 
-前節の改修(ADDR拡張・callname拡張・MPKEYS追加)を踏まえて`cascade_implementation_notes.md`(`seed_implementation_notes.md`の続編にあたる知見メモ。`amivm/`配下に置く——Cascadeリポジトリの一部ではないため`.gitignore`の`/amivm/`ごと対象外)を書き起こしたところ、ユーザー自身がその内容を元に2つの追加改修をamivm本体へ加えた。Cascade側もこれに追従した。
+前節の改修(ADDR拡張・callname拡張・MPKEYS追加)を踏まえて`cascade_implementation_notes.md`(Seedの知見の続編にあたる知見メモ)を書き起こしたところ、ユーザー自身がその内容を元に2つの追加改修をamivm本体へ加えた。Cascade側もこれに追従した。**当初はこのファイルを`amivm/`配下(Cascadeリポジトリの一部ではない参照用クローン)に置いていたが、amivm側の更新のたびに`git clone`し直されることで2度ファイルごと消失する事態が発生し、「各言語の実装知見はその言語自身のリポジトリで管理する」方針へ転換、以降はCascadeリポジトリ直下(`cascade_implementation_notes.md`)で管理している(下記「リポジトリ構成」参照)。**
 
 **1. `callname`オペランドカテゴリへの`@xxx_123`(グローバル変数)追加により、`closureCallTarget`(`internal/codegen/closure.go`)のコピー回避ロジックが完全に閉じた。** 前節の改修で`$N`/`&N`は直接呼び出し対象にできるようになっていたが、`@xxx`(トップレベル`let`/`const`で宣言されたクロージャー型のグローバル変数)を直接呼ぶケースだけがコピーを要求されたまま残っていた(`let doubler: func(int): int = ...; doubler(21)`のようなコードが`SET %tmp @doubler` → `CALL %tmp 21`という形になっていた)。`@xxx`追加により`genValue`がクロージャー型の式に対して返しうる全てのトークン形(`%xxx`/`@xxx`/`$N`/`&N`)が`callname`カテゴリに揃ったため、`closureCallTarget`のコピー分岐は事実上到達不能になった(`none`リテラルのような`callname`に現れえない形への防御としてのみ残している)。
 
@@ -400,6 +406,30 @@ amivm本体で文字列・ルーンリテラルのトークナイザにあった
 
 `internal/lexer`パッケージにこれまでユニットテストが存在しなかった(sema/codegenレイヤーのテストのみだった)ため、今回`lexer_test.go`を新設し、正常系(全エスケープ種別+非エスケープの生Unicode文字列との混在)・異常系(未知のエスケープ・桁不足・不正な桁・8進数の範囲超過)を直接`Tokenize`関数へ通す形でカバーした。`amivm`→`go build`→実行でも、`\"`(今回のamivm修正の直接のトリガーとなったケース)を含む複数のエスケープを実際に`print`し、生成されたIRの文字列トークンが`strconv.Quote`によって正しく再エスケープされていることを確認済み。
 
+### `IF`/`LOOP`のブロック化・`SEL`ケースのブロック化・`ASSERT`追加への追従(AMIVM命令改修・第4弾)
+
+amivm本体で制御フローの表現方法が全面的に刷新された。単一行`IF boolean1 label`(条件付き`goto`)が廃止され、ブロック形の`IF`/`ELIF`/`ELSE`/`ENDIF`(Goの`if`/`else if`/`else`)と、新設の`LOOP`/`BREAK`/`CONTINUE`/`ENDLOOP`(Goの無限`for {}`)に置き換わった。これに伴い`IF`/`LOOP`/`CLOS`/`SEL`が全てネスト可能に統一され(`CLOS`は元々ネスト可能だった)、`SEL`の`CASESEND`/`CASERECV`/`DEFAULT`も`label`を取らずブロック本体を持つ形に変わった。加えて`any`型からの型アサーション用に`ASSERT`が新設された。**後方互換は無い改修**(旧`IF boolean1 label`は仕様から完全に削除)だったため、Cascadeの制御構文コード生成(`internal/codegen`)を全面的に書き換える必要があった。
+
+**この規模の破壊的変更を安全に乗り切れたのは、Seed(`github.com/amisonnet8/seed`)が同じ改修に一足先に追随し、`seed_implementation_notes.md`に踏んだ地雷と確立したパターンを記録していたためだった。** Cascadeの`while`・`for`(list/map)の書き換えはSeedの`genWhileStmt`/`genForInStmt`(`seed/internal/codegen/stmt.go`)をほぼそのまま移植する形で済んだ——「事前に知見のある移行」と「ゼロから設計判断する移行」の労力差を体感する良い例だった。ただしCascadeには`switch`(Seedに無い構文)・チャネル`for-in`(SEL絡み)・`SEL`を使う`merge`/`abort`/`collect`など、Seedに前例の無い箇所も多く、それらは独自に設計した(下記)。
+
+**`genIfStmt`(if/elif/else)は、`ELIF`トークンを直接使わず`ELSE`の中に次の`IF`をネストする形で自前に構築する。** `ELIF boolean1`のオペランドは、そのIR行に到達した時点で既に値になっている変数/リテラルでなければならず、`a + b < c`のような複数命令を要する条件式を「1つ前の節の`}`」と「`} else if`」の間に挟む構文上の余地が無い。`ELSE`の中に次の`IF`をネストする形にすれば、各節の条件計算命令をそれを守る`ELSE`の中に自然に置け、しかも「前の条件が真なら後の条件は一切計算しない」という短絡評価も無料で手に入る(amivm自身が`ELIF`を解析する際も内部的にこの構造へ変換しているため、生成されるGo ASTは`ELIF`を使った場合と完全に同一になる)。`switch`のcase値についても同じ理由・同じ形で「1つの値をIFでチェック→ELSEの中に次の値、または次のcase、またはdefaultをネスト」という完全再帰の構造にした(`genSwitchCase`)——これは1つのcaseに複数値がある場合(`case 1, 2, 3:`)の値ごとの短絡評価も、旧実装(フラットなIF-GOTO連鎖で、値が1つ一致した時点で残りを評価せずジャンプしていた)と全く同じ挙動を保つための選択で、単純にOR演算子で複数値の条件を合成する案(実装は簡単だが、case値が副作用を持つ式の場合に評価回数が変わってしまう)は採らなかった。
+
+**`switch`はamivmにネイティブ命令が無いため、今回もIF/ELSEのネストへdesugarするCascade独自の実装のまま変わらない。** これが決定的に重要な帰結を生んだ: **`break`(switchを抜ける)と`continue`(switchを素通りして囲むループへ抜ける)を、Go自身の`break`/`continue`キーワードの挙動だけでは正しく実装できない。** Goの`break`は最も内側の`for`/`switch`/`select`を抜けるが、Cascadeの`switch`はGoの本物の`switch`ではなくただのネストした`if`なので、Go側には「switchを抜ける」という受け皿が存在しない——`switch`のcase本体で素の`BREAK`を使うと、（switchを内包する）外側の`LOOP`をGoの通常のスコープルールに従って抜けてしまい、意図と異なる。一方Goの`continue`は最も内側の`for`にしか効かず、間に挟まる`if`/`switch`/`select`は素通りする、という性質を逆手に取れば、`continue`は`LOOP`の中にネストした`IF`をいくつ挟んでいても、Cascadeが期待する「switchを素通りして囲むループへ」という挙動をGo自身が保証してくれる。**この非対称性(breakは特別扱いが要るがcontinueは要らない)がCascadeの`switch`設計の核心であり、Step 5で最初に発見しStep 5の「確定した設計判断」に記録済みだったものが、今回の移行でも変わらず有効だった。**
+
+**`breakStack`/`continueStack`の要素を、単なるラベル名の`string`から、`breakTarget{Label string}`/`continueTarget{Label string}`という小さな構造体に変更した。** `Label`が空文字列なら「ネイティブの`BREAK`/`CONTINUE`を発行する」、非空なら「そのラベルへ`GOTO`する」という2つのモードを切り替える。ループ(while・list/map for-in・channel for-in)の`break`は常にネイティブ(`Label`空)——`LOOP`が本物のGoの`for`を生成するため、最も内側の`LOOP`を抜けるというGoの`break`の意味論がそのままCascadeの要求と一致する。`continue`は「ループ本体の先頭で毎回条件を再チェックする」形(while・channel for-in)ならネイティブで足りるが、「本体の**後**にインデックス更新がある」形(list/map for-in)だけは、ネイティブ`CONTINUE`だと`LOOP`の先頭(長さの再チェック)へ戻ってインデックス更新を飛ばしてしまうため、更新の直前に置いた専用ラベルへの`GOTO`が必要(Seedの`loopInfo`と全く同じ設計)。`switch`の`break`は常にラベルベース(`Label`非空、if-chainの外に置いたラベルへ`GOTO`)——switch自体がネイティブに抜けられる構造を持たないため。`switch`は`continueStack`には一切触れない(元々の設計のまま)。
+
+**LABEL/GOTOで踏んだバグ第2弾: switch自身の終端ラベルが、そのswitch本体が一度も`break`しない場合に「定義されているが誰からも参照されない」状態になり、`go/types`の「未使用ラベル」エラーになる。** これはSeedの`seed_implementation_notes.md`§2.2が記録していた「for-inのcontinueラベルが、本体に`continue`が無いと未参照になる」バグと全く同じ形のバグだが、**switchの`break`という別の場所で独立に踏んだ**(移行時に横展開できていなかった箇所)。対策も同じ: switch本体(if-chain)の通常のフォールスルー末尾に、無条件の`GOTO`をラベルの直前へ置き、`break`が一度も呼ばれないswitchでもラベルが必ず参照される状態にした(`genSwitchStmt`)。**この教訓を活かし、今回のテストインフラ改善として`assertLabelsResolve`(`codegen_test.go`)を「参照→定義」だけでなく「定義→参照」の両方向でチェックするよう拡張した**——ラベルが定義されているのに一度も参照されない、というこの種のバグをテストレベルで機械的に検出できるようにした。
+
+**チャネル絡みの`SEL`(`genForInChannelStmt`のチャネル受信・`genSendCall`の送信・`genAbortCall`のガード・`genCollectorFunc`/`genMergeFunc`の合成関数)は、いずれも`CASESEND`/`CASERECV`/`DEFAULT`のブロック本体化によって大幅に簡潔になった。** 旧実装は「各ケースが成功したらどのラベルへ`GOTO`するか」を`SEL`の外側で個別に管理する必要があったが、新実装では各ケースの処理をそのケース自身の本体に直接書けるため、`genMergeFunc`(2チャネルのファンイン)は最終的に**`LABEL`/`GOTO`を1つも使わない**形にまで単純化できた(`LOOP`の中で「両方閉じたか判定→`IF`で`RET`」「`SEL`の各ケース内で`IF ok`により転送/`SET nil`」という素直な構造だけで完結する)。`genCollectorFunc`も同様に、`SEL`の各`CASERECV`本体へ直接ロジックを書き込む形に整理した。
+
+**この規模の変更にもかかわらず、Cascadeの言語仕様(`cascade_spec.md`)・AST(`internal/ast`)・意味検査(`internal/sema`)は一切変更していない。** amivmのIF/LOOP/SELがどう表現されるかはCascadeにとって完全にcodegen内部の実装詳細であり、`if`/`while`/`for`/`switch`/`break`/`continue`というCascade言語自体の構文・意味論は寸分変わっていない——「意味検証の責任分担」の原則(sema/codegenの独立性、AMIVM-IRの表現詳細をsemaが知る必要がない)がここでも効いた。
+
+**VAR巻き上げの仕組み(関数先頭への全`VAR`宣言の集約)は変更せず維持した。** ブロック形`IF`/`LOOP`が本物のGoブロックスコープを生成するようになったことで、理論上は「gotoが変数宣言を飛び越える」問題(seed_implementation_notes.md §1)の大部分は解消されている——しかし今回もswitchの`break`・list/map for-inの`continue`という2箇所でLABEL/GOTOを使い続けており(上記参照)、これらのジャンプが将来何らかの理由でVAR宣言を飛び越える可能性を完全に排除できない。VAR巻き上げを維持しておけば、どんなLABEL/GOTOが生成されようと「まだ宣言されていない変数を飛び越える」状況が構造的に発生しなくなるため、追加の安全確認コストなしにこのリスクを消せる。Cascadeの変数命名スキーム(シャドーイング対応の一意な名前採番、`scope.go`)も元々この巻き上げに依存しているため、変更する積極的な理由も無かった(Seedが全く同じ判断をしていたことも確認済み)。
+
+**`ASSERT`(型アサーション)はCascade側で一切使わない設計のまま据え置いた。** `any`相当の型がCascadeの型システムに存在しない(スカラー4種・構造体・ポインタ・リスト・map・チャネル・関数型・`error`のみ)ため、`v.(T)`という操作自体が意味を持つ場面が無い。「無理に全命令を使う必要はない」という本プロジェクトの努力目標に照らし、今回追加された`ASSERT`は意図的に「命令使用ゴール」表で対象外として記録した。
+
+**検証は既存の単体テスト修正に加えて、新旧amivmバイナリの並行運用(`/go/bin/amivm`=新・`/go/bin/oldamivm`=旧)を活かし、新バイナリで`amivm`→`go build`→実行の全パイプラインを回した。** 既存13サンプル+`examples/14_packages`が全て無変更で通ることに加え、elif連鎖の短絡評価・switch内breakがループを巻き込まないこと・switch内continueが囲むループへ正しく抜けること・多値case・深いネスト(while内if内whileにswitch)・list/map/channel双方のfor-inにおけるbreak/continue・パイプラインのステージ内for-inでのbreak/continueの組み合わせ、を専用の使い捨てサンプルプログラムで個別に実行し、全て手計算どおりの結果になることを確認した。
+
 ## 意味検証の責任分担(重要)
 
 型の整合性・未定義識別子・関数シグネチャの不一致・メソッドの存在チェックなどは、**amivm側では検証せず`go/types`に全面的に委ねている。** amivmが保証するのは「構文的に妥当なGoコードを出力すること」だけ。
@@ -416,9 +446,9 @@ amivm本体で文字列・ルーンリテラルのトークナイザにあった
 
 ## 過去に踏まれた地雷(Seedからの申し送り。Cascadeでも起こりうる)
 
-詳細は`seed_implementation_notes.md`を参照。特に重要なものを抜粋。
+詳細はSeed自身のリポジトリ(`github.com/amisonnet8/seed`)の実装知見を参照(各言語の実装知見はその言語自身のリポジトリで管理する方針のため、このリポジトリには同梱していない——下記「リポジトリ構成」参照)。特に重要なものを抜粋。
 
-1. **goto/VAR巻き上げ問題(最重要)**: `IF`/`GOTO`が生成するGoコードは1関数内のフラットな命令列であり、`goto`は「まだスコープに入っていない変数宣言」を飛び越えられない(Goのルール)。対象言語の関数・クロージャー・**ステージ関数**ごとに、使う`VAR`を全て先頭に巻き上げ、初期化は元の位置に`SET`だけ残すこと。`CLOS`本体も独立した1関数スコープなので同様の巻き上げが必要
+1. **goto/VAR巻き上げ問題(最重要)**: `LABEL`/`GOTO`が生成するGoコードは(ブロック構造を経由しない場合)1関数内のフラットな命令列であり、`goto`は「まだスコープに入っていない変数宣言」を飛び越えられない(Goのルール)。ブロック形の`IF`/`LOOP`(下記「AMIVM命令改修・第4弾」参照)が本物のGoブロックスコープを生成するようになったことで、素直な`if`/`while`/`for`相当の構文を書くだけならこの問題自体は発生しなくなったが、構造化制御フローだけでは表現できないジャンプ(switchの`break`、添字カウント式for-inの`continue`)には今も`LABEL`/`GOTO`が必要であり、そこでこの問題が再発しうる。対象言語の関数・クロージャー・**ステージ関数**ごとに、使う`VAR`を全て先頭に巻き上げ、初期化は元の位置に`SET`だけ残す、という対策は今も維持しておくこと(理論上は不要な範囲が広がったが、シャドーイング用の命名スキームがこの巻き上げに依存しているため変更する理由も無い)。`CLOS`本体も独立した1関数スコープなので同様の巻き上げが必要
 2. **スコープはGo側で完全にフラット**: シャドーイングを許す言語仕様(10節)に対して、codegenは内部で一意な変数名を採番すること
 3. **`CALL`はキャストにも使われる**: `string(intVal)`のような数値→文字列変換はGoの素の型変換だと`"A"`のようなルーン変換になる罠がある(`strconv`を使うこと)
 4. **`CALL`の結果省略は本当に省略する**: 空文字列オペランドではなく`CALL : callname ...`のように空にする
@@ -428,12 +458,13 @@ amivm本体で文字列・ルーンリテラルのトークナイザにあった
 
 ## リポジトリ構成(予定・未実装)
 
-**`/workspaces/cascade`(このディレクトリ自体)がCascadeのホーム。** Seed(`seed/`)は自分自身が独立リポジトリのルートで、`amivm/`をその内部に参照用クローンとして置く構成だったが、Cascadeでは`cascade_spec.md`・`seed_implementation_notes.md`・`seed/`・`amivm/`が既にこの階層に揃っているため、Cascade本体の実装(`go.mod`以下)もこの直下に追加していく。実装が進むにつれ実態に合わせて更新すること。
+**`/workspaces/cascade`(このディレクトリ自体)がCascadeのホーム。** Seed(`seed/`)・amivm(`amivm/`)はそれぞれ自分自身が独立リポジトリのルートで、Cascadeから見た参照用クローンとしてこの階層に置かれている。Cascade自身の実装知見(`cascade_implementation_notes.md`)はCascade自身のリポジトリで管理し、Seedの実装知見はSeed自身のリポジトリ(`github.com/amisonnet8/seed`)で管理する——「各言語の実装知見はその言語自身のリポジトリで管理する」方針(前節参照)。
 
 ```
 /workspaces/cascade/            Cascadeのホーム(このリポジトリのルート)
   cascade_spec.md               Cascade言語仕様(唯一の正)
-  seed_implementation_notes.md  Seed実装時の知見
+  cascade_implementation_notes.md  Cascade自身の実装知見(AMIVM-IRを生成するフロントエンドを
+                                 書く上での一般的な知見)
   CLAUDE.md                     本ファイル
   seed/                         Seedの参考実装(参照用。Cascade本体の一部ではない)
   amivm/                        amivmのローカルクローン(参照用。Cascade本体の一部ではない)

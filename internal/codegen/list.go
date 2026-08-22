@@ -403,10 +403,10 @@ func genLenCall(g *funcGen, call *ast.CallExpr) (string, error) {
 }
 
 // genRangeCall compiles range(from, to) (cascade_spec.md §13) into a
-// freshly SLMAKE'd []int, filled in by a runtime counting loop (the same
-// LABEL/IF/GOTO shape genWhileStmt/genForInStmt use, emitted directly
-// since this loop has no user-visible break/continue target and declares
-// no Cascade-level variables).
+// freshly SLMAKE'd []int, filled in by a runtime counting LOOP (this
+// loop has no user-visible break/continue target and declares no
+// Cascade-level variables, so it's emitted directly rather than through
+// genWhileStmt/genForInStmt).
 func genRangeCall(g *funcGen, call *ast.CallExpr) (string, error) {
 	from, err := genValue(g, call.Args[0])
 	if err != nil {
@@ -430,21 +430,15 @@ func genRangeCall(g *funcGen, call *ast.CallExpr) (string, error) {
 
 	idxOp := g.newTemp("^int")
 	g.emit("\tSET\t%s\t0\n", idxOp)
-	startLabel := g.newLabel()
-	bodyLabel := g.newLabel()
-	endLabel := g.newLabel()
-	g.emit("\tLABEL\t#%s\n", startLabel)
+	g.emit("\tLOOP\n")
 	cmp := g.newTemp("^bool")
 	g.emit("\tLT\t%s\t%s\t%s\n", cmp, idxOp, sizeOp)
-	g.emit("\tIF\t%s\t#%s\n", cmp, bodyLabel)
-	g.emit("\tGOTO\t#%s\n", endLabel)
-	g.emit("\tLABEL\t#%s\n", bodyLabel)
+	g.emitBreakUnless(cmp)
 	valOp := g.newTemp("^int")
 	g.emit("\tADD\t%s\t%s\t%s\n", valOp, from, idxOp)
 	g.emit("\tASET\t%s\t%s\t%s\n", result, idxOp, valOp)
 	g.emit("\tADD\t%s\t%s\t1\n", idxOp, idxOp)
-	g.emit("\tGOTO\t#%s\n", startLabel)
-	g.emit("\tLABEL\t#%s\n", endLabel)
+	g.emit("\tENDLOOP\n")
 	return result, nil
 }
 
@@ -486,43 +480,42 @@ func genAppendCall(g *funcGen, call *ast.CallExpr) (string, error) {
 
 	idxOp := g.newTemp("^int")
 	g.emit("\tSET\t%s\t0\n", idxOp)
-	startLabel := g.newLabel()
-	bodyLabel := g.newLabel()
-	endLabel := g.newLabel()
-	g.emit("\tLABEL\t#%s\n", startLabel)
+	g.emit("\tLOOP\n")
 	cmp := g.newTemp("^bool")
 	g.emit("\tLT\t%s\t%s\t%s\n", cmp, idxOp, lenOp)
-	g.emit("\tIF\t%s\t#%s\n", cmp, bodyLabel)
-	g.emit("\tGOTO\t#%s\n", endLabel)
-	g.emit("\tLABEL\t#%s\n", bodyLabel)
+	g.emitBreakUnless(cmp)
 	elemOp := g.newTemp(elemIRType)
 	g.emit("\tAGET\t%s\t%s\t%s\n", elemOp, listOp, idxOp)
 	g.emit("\tASET\t%s\t%s\t%s\n", result, idxOp, elemOp)
 	g.emit("\tADD\t%s\t%s\t1\n", idxOp, idxOp)
-	g.emit("\tGOTO\t#%s\n", startLabel)
-	g.emit("\tLABEL\t#%s\n", endLabel)
+	g.emit("\tENDLOOP\n")
 
 	g.emit("\tASET\t%s\t%s\t%s\n", result, lenOp, valueOp)
 	return result, nil
 }
 
 // genForInStmt compiles `for x in List { ... }` (cascade_spec.md §7) as
-// an index-counted loop over len(List) — mirrors Seed's identical
-// genForInStmt (seed/internal/codegen/stmt.go). The two-variable map
-// form (`for k, v in m`) is a different shape entirely — see
-// genForInMapStmt.
+// an index-counted LOOP over len(List). The two-variable map form (`for
+// k, v in m`) is a different shape entirely — see genForInMapStmt.
 //
 //	CALL lenOp : ?len list; SET idxOp 0
-//	LABEL start; LT cmp idxOp lenOp; IF cmp body; GOTO end
-//	LABEL body; AGET x list idxOp; ...; LABEL continue
-//	ADD idxOp idxOp 1; GOTO start
-//	LABEL end
+//	LOOP
+//		LT cmp idxOp lenOp; NOT notCmp cmp; IF notCmp BREAK ENDIF
+//		AGET x list idxOp; ...
+//		GOTO #continue; LABEL #continue; ADD idxOp idxOp 1
+//	ENDLOOP
 //
-// Unlike genWhileStmt, `continue` cannot target start directly: start
-// only re-checks the condition, and skipping straight to it would skip
-// the idxOp++ step, looping forever on the same element. So continue
-// targets a dedicated label positioned right before that increment,
-// which the body's normal (non-break/continue) fallthrough also reaches.
+// Unlike genWhileStmt, `continue` cannot be a native CONTINUE: that would
+// jump back to the top of the LOOP (the length re-check) and skip the
+// idxOp++ step below it, looping forever on the same element. So
+// genContinueStmt instead GOTOs a dedicated label placed right before
+// that increment (LABEL/GOTO are kept alongside the block instructions
+// specifically for jumps structured control flow can't express — see
+// continueTarget's doc), which the body's normal (non-break/continue)
+// fallthrough also reaches: without that unconditional GOTO, a body with
+// no `continue` in it would leave the label referenced by nothing at
+// all, and go/types rejects an unused label the same way it rejects an
+// unused variable.
 func genForInStmt(g *funcGen, stmt *ast.ForInStmt) error {
 	if stmt.ValueVarName != "" {
 		return genForInMapStmt(g, stmt)
@@ -544,17 +537,12 @@ func genForInStmt(g *funcGen, stmt *ast.ForInStmt) error {
 	idxOp := g.newTemp("^int")
 	g.emit("\tSET\t%s\t0\n", idxOp)
 
-	startLabel := g.newLabel()
-	bodyLabel := g.newLabel()
 	continueLabel := g.newLabel()
-	endLabel := g.newLabel()
 
-	g.emit("\tLABEL\t#%s\n", startLabel)
+	g.emit("\tLOOP\n")
 	cmp := g.newTemp("^bool")
 	g.emit("\tLT\t%s\t%s\t%s\n", cmp, idxOp, lenOp)
-	g.emit("\tIF\t%s\t#%s\n", cmp, bodyLabel)
-	g.emit("\tGOTO\t#%s\n", endLabel)
-	g.emit("\tLABEL\t#%s\n", bodyLabel)
+	g.emitBreakUnless(cmp)
 
 	outer := g.scope
 	g.scope = newScope(outer)
@@ -563,8 +551,8 @@ func genForInStmt(g *funcGen, stmt *ast.ForInStmt) error {
 	g.scope.declare(stmt.VarName, loopRef)
 	g.emit("\tAGET\t%s\t%s\t%s\n", loopRef.ValOp, listOp, idxOp)
 
-	g.pushBreak(endLabel)
-	g.pushContinue(continueLabel)
+	g.pushBreak(breakTarget{})
+	g.pushContinue(continueTarget{Label: continueLabel})
 	var bodyErr error
 	for _, s := range stmt.Body {
 		if bodyErr = genStmt(g, s); bodyErr != nil {
@@ -581,7 +569,6 @@ func genForInStmt(g *funcGen, stmt *ast.ForInStmt) error {
 	g.emit("\tGOTO\t#%s\n", continueLabel)
 	g.emit("\tLABEL\t#%s\n", continueLabel)
 	g.emit("\tADD\t%s\t%s\t1\n", idxOp, idxOp)
-	g.emit("\tGOTO\t#%s\n", startLabel)
-	g.emit("\tLABEL\t#%s\n", endLabel)
+	g.emit("\tENDLOOP\n")
 	return nil
 }

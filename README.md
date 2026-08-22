@@ -122,6 +122,8 @@ internal/sema/        semantic analysis (type checking, scope resolution, null n
 internal/codegen/     AST → AMIVM-IR
 examples/              runnable .cas sample programs, one group per language feature
 cascade_spec.md       the Cascade language specification (the only authoritative one)
+cascade_implementation_notes.md  lessons learned writing an AMIVM-IR-generating front end —
+                       general pitfalls/patterns, not Cascade-specific
 CLAUDE.md              project conventions for AI-assisted development
 LICENSE                MIT license
 ```

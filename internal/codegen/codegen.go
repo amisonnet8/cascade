@@ -12,20 +12,28 @@
 //
 // Every declared variable's `VAR` is hoisted to the top of its function,
 // with only the `SET` that actually assigns a value left at its original
-// position. AMIVM-IR's control flow is GOTO-based, not nested Go blocks
-// (see genIfStmt/genWhileStmt/genSwitchStmt), so without this a forward
-// jump — an `elif` chain skipping a later clause's body, a `break`
-// jumping past the rest of a loop — trips Go's "goto jumps over variable
-// declaration" rule the moment the skipped code declares anything
-// (seed_implementation_notes.md §1). genBlock gives every if/while/
-// switch-case body its own funcGen scope, even though every declaration
-// still ends up as one flat hoisted VAR in the enclosing function — that
-// scope is purely for name resolution (shadowing, cascade_spec.md §10),
-// not for Go block structure, which doesn't exist here. See scope.go's
-// varRef for how a nullable `T?` variable's companion "is this set?"
-// flag is represented, and funcGen's breakStack/continueStack for why
-// `break` (loop or switch) and `continue` (loop only, skipping over any
-// enclosing switch) need separate target stacks.
+// position. if/elif/else and while/for-in compile to amivm's block IF/
+// LOOP instructions (genIfStmt/genWhileStmt/genForInStmt), which produce
+// real nested Go blocks — so this hoisting is no longer required to avoid
+// Go's "goto jumps over variable declaration" rule the way it once was
+// (seed_implementation_notes.md §1). It's kept anyway for two reasons:
+// switch (genSwitchStmt) has no native breakable Go construct to lower
+// onto, so its own `break` still needs LABEL/GOTO around it (as does a
+// list/map for-in's `continue`, whose index increment sits after the
+// loop body — see continueTarget's doc), and those jumps could in
+// principle still trip the same rule; and the shadowing-safe naming
+// scheme (scope.go) already depends on hoisting being unconditional. See
+// CLAUDE.md's "確定した設計判断" (AMIVM命令改修・第4弾) for the full
+// migration history. genBlock gives every if/while/switch-case body its
+// own funcGen scope regardless, even though every declaration still ends
+// up as one flat hoisted VAR in the enclosing function — that scope is
+// purely for name resolution (shadowing, cascade_spec.md §10), not for
+// Go block structure. See scope.go's varRef for how a nullable `T?`
+// variable's companion "is this set?" flag is represented, and
+// breakTarget/continueTarget's docs for why `break` (loop or switch) and
+// `continue` (loop only, skipping over any enclosing switch) need
+// separate target stacks, and why each stack entry now records whether
+// its target compiles to a native BREAK/CONTINUE or a LABEL/GOTO.
 //
 // Only enough is implemented so far to compile Steps 1-8: `main` plus any
 // number of other functions (§8.1, including multi-value returns via
@@ -217,8 +225,39 @@ type funcGen struct {
 	guardChanOp   string                        // this source/stage/sink's own hidden close-once guard channel operand (§9.4, only used by genAbortCall); empty outside a stage body
 	seq           int
 	labelSeq      int
-	breakStack    []string // break targets: pushed by both while and switch
-	continueStack []string // continue targets: pushed by while only (switch isn't a loop)
+	breakStack    []breakTarget    // break targets: pushed by while, for-in (any form), and switch
+	continueStack []continueTarget // continue targets: pushed by while and for-in only (switch isn't a loop — cascade_spec.md §7)
+}
+
+// breakTarget records how `break` must be compiled for one enclosing
+// break-able construct. A loop (while, or any of the three for-in forms)
+// compiles to a real amivm LOOP — a native Go for-loop underneath — so
+// `break` inside it is just a native BREAK targeting that nearest
+// enclosing LOOP directly (Label empty). `switch` (cascade_spec.md §7's
+// "switch自体はループではない") has no native breakable Go construct of
+// its own: there is no SWITCH instruction in amivm, so Cascade lowers a
+// switch into nested IF/ELSE blocks (see genSwitchStmt), which isn't a
+// break target in Go the way a real `switch`/`select`/`for` is. So a
+// switch's own break instead jumps past the whole if-chain via LABEL/
+// GOTO (kept alongside the block instructions specifically for jumps
+// structured control flow can't express — amivm_instruction_spec.md's
+// migration notes) — Label holds that jump target.
+type breakTarget struct {
+	Label string
+}
+
+// continueTarget records how `continue` must be compiled for one
+// enclosing loop. Label empty means a native CONTINUE suffices: the
+// per-iteration condition re-check sits at the very top of the LOOP body
+// (while, channel for-in — see genWhileStmt/genForInChannelStmt), so
+// jumping back there is already correct. A list/map for-in loop's index
+// increment sits *after* the body instead (see genForInStmt/
+// genForInMapStmt), so its own continue must GOTO a label placed right
+// before that increment — a native CONTINUE would jump back to the
+// LOOP's own top (the length re-check) and skip the increment, looping
+// forever on the same element.
+type continueTarget struct {
+	Label string
 }
 
 func (g *funcGen) emit(format string, args ...any) {
@@ -238,23 +277,34 @@ func (g *funcGen) newLabel() string {
 	return fmt.Sprintf("L%d", g.labelSeq)
 }
 
-func (g *funcGen) pushBreak(label string)    { g.breakStack = append(g.breakStack, label) }
-func (g *funcGen) popBreak()                 { g.breakStack = g.breakStack[:len(g.breakStack)-1] }
-func (g *funcGen) pushContinue(label string) { g.continueStack = append(g.continueStack, label) }
-func (g *funcGen) popContinue()              { g.continueStack = g.continueStack[:len(g.continueStack)-1] }
+func (g *funcGen) pushBreak(t breakTarget)       { g.breakStack = append(g.breakStack, t) }
+func (g *funcGen) popBreak()                     { g.breakStack = g.breakStack[:len(g.breakStack)-1] }
+func (g *funcGen) pushContinue(t continueTarget) { g.continueStack = append(g.continueStack, t) }
+func (g *funcGen) popContinue()                  { g.continueStack = g.continueStack[:len(g.continueStack)-1] }
 
-func (g *funcGen) currentBreak() (string, bool) {
+func (g *funcGen) currentBreak() (breakTarget, bool) {
 	if len(g.breakStack) == 0 {
-		return "", false
+		return breakTarget{}, false
 	}
 	return g.breakStack[len(g.breakStack)-1], true
 }
 
-func (g *funcGen) currentContinue() (string, bool) {
+func (g *funcGen) currentContinue() (continueTarget, bool) {
 	if len(g.continueStack) == 0 {
-		return "", false
+		return continueTarget{}, false
 	}
 	return g.continueStack[len(g.continueStack)-1], true
+}
+
+// emitBreakUnless emits the "stop the loop" half of a while/for-in loop's
+// per-iteration condition check: cond must already be computed, and this
+// negates it and BREAKs the nearest enclosing LOOP when it's false.
+func (g *funcGen) emitBreakUnless(cond string) {
+	notCond := g.newTemp("^bool")
+	g.emit("\tNOT\t%s\t%s\n", notCond, cond)
+	g.emit("\tIF\t%s\n", notCond)
+	g.emit("\tBREAK\n")
+	g.emit("\tENDIF\n")
 }
 
 // newTemp declares a fresh hoisted variable of the given AMIVM-IR type to
@@ -329,88 +379,75 @@ func genStmt(g *funcGen, stmt ast.Stmt) error {
 	}
 }
 
-// genIfStmt compiles an if/elif/else chain to a sequence of conditional
-// jumps followed by the bodies themselves (mirrors Seed's identical
-// genIfStmt — see seed/internal/codegen/stmt.go). Each clause's condition
-// is evaluated immediately before its own IF, so a taken jump skips every
-// later condition's instructions entirely — giving the usual short-circuit
-// "elif conditions run only if earlier ones were false" behavior for free.
-//
-//	<cond1 instrs>; IF cond1 body1
-//	<cond2 instrs>; IF cond2 body2
-//	...
-//	GOTO else-or-end
-//	LABEL body1; ...; GOTO end
-//	LABEL body2; ...; GOTO end
-//	LABEL else; ...; GOTO end   (only if there's an `else`)
-//	LABEL end
+// genIfStmt compiles an if/elif/else chain to nested IF/ELSE/ENDIF blocks
+// (amivm_spec.md §4.10): clauses[0]'s condition is computed and checked
+// first; every later clause (and the final else, if any) is nested
+// inside its ELSE body. This mirrors exactly how amivm itself desugars a
+// flat IF/ELIF/ELSE/ENDIF into nested `ast.IfStmt.Else` chains internally,
+// but building the nesting ourselves (rather than emitting the ELIF
+// token directly) means each later clause's condition instructions can
+// be emitted right where they belong — inside the ELSE that guards them
+// — so a clause's condition is only ever computed once every earlier one
+// has been checked false, giving the usual short-circuit "elif
+// conditions run only if earlier ones were false" behavior for free. An
+// `ELIF` token can't offer this on its own: its condition operand must
+// already be a value by the time that line is reached, with nowhere to
+// place a multi-instruction condition computation in between the
+// preceding clause's `}` and its own `else if` (amivm_instruction_spec.md's
+// migration notes; mirrors seed/internal/codegen/stmt.go's identical
+// genIfClauses).
 func genIfStmt(g *funcGen, stmt *ast.IfStmt) error {
-	endLabel := g.newLabel()
-	bodyLabels := make([]string, len(stmt.Clauses))
+	return genIfClauses(g, stmt.Clauses, stmt.Else)
+}
 
-	for i, clause := range stmt.Clauses {
-		cond, err := genValue(g, clause.Cond)
-		if err != nil {
+func genIfClauses(g *funcGen, clauses []ast.IfClause, elseBody []ast.Stmt) error {
+	if len(clauses) == 0 {
+		return genBlock(g, elseBody)
+	}
+	cond, err := genValue(g, clauses[0].Cond)
+	if err != nil {
+		return err
+	}
+	g.emit("\tIF\t%s\n", cond)
+	if err := genBlock(g, clauses[0].Body); err != nil {
+		return err
+	}
+	rest := clauses[1:]
+	if len(rest) > 0 || elseBody != nil {
+		g.emit("\tELSE\n")
+		if err := genIfClauses(g, rest, elseBody); err != nil {
 			return err
 		}
-		bodyLabels[i] = g.newLabel()
-		g.emit("\tIF\t%s\t#%s\n", cond, bodyLabels[i])
 	}
-
-	var elseLabel string
-	if stmt.Else != nil {
-		elseLabel = g.newLabel()
-		g.emit("\tGOTO\t#%s\n", elseLabel)
-	} else {
-		g.emit("\tGOTO\t#%s\n", endLabel)
-	}
-
-	for i, clause := range stmt.Clauses {
-		g.emit("\tLABEL\t#%s\n", bodyLabels[i])
-		if err := genBlock(g, clause.Body); err != nil {
-			return err
-		}
-		g.emit("\tGOTO\t#%s\n", endLabel)
-	}
-
-	if stmt.Else != nil {
-		g.emit("\tLABEL\t#%s\n", elseLabel)
-		if err := genBlock(g, stmt.Else); err != nil {
-			return err
-		}
-		g.emit("\tGOTO\t#%s\n", endLabel)
-	}
-
-	g.emit("\tLABEL\t#%s\n", endLabel)
+	g.emit("\tENDIF\n")
 	return nil
 }
 
-// genWhileStmt compiles a while loop as: check the condition, jump into
-// the body if true or out past the loop if false, and jump back to the
-// check after the body runs (mirrors Seed's identical genWhileStmt).
+// genWhileStmt compiles a while loop as a real LOOP block (amivm_spec.md
+// §4.11): the condition is (re-)computed at the very top of the body on
+// every pass, and emitBreakUnless BREAKs out the moment it's false.
 //
-//	LABEL start; <cond instrs>; IF cond body; GOTO end
-//	LABEL body; ...; GOTO start
-//	LABEL end
+//	LOOP
+//		<cond instrs>; NOT notCond cond; IF notCond BREAK ENDIF
+//		<body>
+//	ENDLOOP
 //
-// `continue` targets start (re-check the condition) and `break` targets
-// end.
+// `continue` inside the body is therefore already correct as a native
+// CONTINUE — it jumps back to the top of the LOOP, exactly where the
+// condition re-check lives — and `break` as a native BREAK; see
+// genBreakStmt/genContinueStmt. The pushed continueTarget is left with
+// an empty Label to select that native-CONTINUE path (contrast
+// genForInStmt, which can't use it — see continueTarget's doc).
 func genWhileStmt(g *funcGen, stmt *ast.WhileStmt) error {
-	startLabel := g.newLabel()
-	bodyLabel := g.newLabel()
-	endLabel := g.newLabel()
-
-	g.emit("\tLABEL\t#%s\n", startLabel)
+	g.emit("\tLOOP\n")
 	cond, err := genValue(g, stmt.Cond)
 	if err != nil {
 		return err
 	}
-	g.emit("\tIF\t%s\t#%s\n", cond, bodyLabel)
-	g.emit("\tGOTO\t#%s\n", endLabel)
-	g.emit("\tLABEL\t#%s\n", bodyLabel)
+	g.emitBreakUnless(cond)
 
-	g.pushBreak(endLabel)
-	g.pushContinue(startLabel)
+	g.pushBreak(breakTarget{})
+	g.pushContinue(continueTarget{})
 	err = genBlock(g, stmt.Body)
 	g.popContinue()
 	g.popBreak()
@@ -418,21 +455,35 @@ func genWhileStmt(g *funcGen, stmt *ast.WhileStmt) error {
 		return err
 	}
 
-	g.emit("\tGOTO\t#%s\n", startLabel)
-	g.emit("\tLABEL\t#%s\n", endLabel)
+	g.emit("\tENDLOOP\n")
 	return nil
 }
 
 // genSwitchStmt compiles a tagged or untagged switch (cascade_spec.md
-// §7) as a sequence of conditional jumps, one IF per case value, followed
-// by the case bodies themselves — the same "evaluate condition, jump to
-// body, fall through to the next condition" shape as genIfStmt. The tag
-// (if any) is evaluated exactly once, up front, and its resulting operand
-// reused for every case's EQ comparison. break targets end; switch is not
-// a loop, so it never touches the continue stack (see funcGen's doc).
+// §7) to nested IF/ELSE blocks, the same shape genIfStmt uses — there is
+// no native SWITCH instruction in amivm, so this is Cascade's own
+// lowering, not a real Go switch. The tag (if any) is evaluated exactly
+// once, up front, and its resulting operand reused for every case's EQ
+// comparison. Each case's own (possibly multiple, comma-separated)
+// values are checked one at a time via genSwitchCase, nested the same
+// short-circuiting way genIfClauses nests elif conditions: a value's
+// instructions are only computed once every earlier value (in this case
+// or an earlier one) has been checked false, exactly mirroring the
+// pre-migration flat IF-chain's own evaluation order — necessary since a
+// case value could in principle be an arbitrary side-effecting
+// expression, not just a constant. break targets the label placed after
+// the whole if-chain (there is no native breakable Go construct backing
+// it — see breakTarget's doc); switch is not a loop, so it never touches
+// the continue stack. The if-chain's own normal (non-break) fallthrough
+// GOTOs that same label unconditionally, exactly mirroring genForInStmt's
+// identical trick: without it, a switch whose body never actually calls
+// `break` would leave the label referenced by nothing at all, and
+// go/types rejects an unused label the same way it rejects an unused
+// variable.
 func genSwitchStmt(g *funcGen, stmt *ast.SwitchStmt) error {
 	var tagOp string
-	if stmt.Tag != nil {
+	hasTag := stmt.Tag != nil
+	if hasTag {
 		v, err := genValue(g, stmt.Tag)
 		if err != nil {
 			return err
@@ -441,71 +492,89 @@ func genSwitchStmt(g *funcGen, stmt *ast.SwitchStmt) error {
 	}
 
 	endLabel := g.newLabel()
-	caseLabels := make([]string, len(stmt.Cases))
-
-	for i, c := range stmt.Cases {
-		caseLabels[i] = g.newLabel()
-		for _, val := range c.Values {
-			v, err := genValue(g, val)
-			if err != nil {
-				return err
-			}
-			if stmt.Tag != nil {
-				cmp := g.newTemp("^bool")
-				g.emit("\tEQ\t%s\t%s\t%s\n", cmp, tagOp, v)
-				g.emit("\tIF\t%s\t#%s\n", cmp, caseLabels[i])
-			} else {
-				g.emit("\tIF\t%s\t#%s\n", v, caseLabels[i])
-			}
-		}
-	}
-
-	var defaultLabel string
-	if stmt.Default != nil {
-		defaultLabel = g.newLabel()
-		g.emit("\tGOTO\t#%s\n", defaultLabel)
-	} else {
-		g.emit("\tGOTO\t#%s\n", endLabel)
-	}
-
-	g.pushBreak(endLabel)
-	for i, c := range stmt.Cases {
-		g.emit("\tLABEL\t#%s\n", caseLabels[i])
-		if err := genBlock(g, c.Body); err != nil {
-			g.popBreak()
-			return err
-		}
-		g.emit("\tGOTO\t#%s\n", endLabel)
-	}
-	if stmt.Default != nil {
-		g.emit("\tLABEL\t#%s\n", defaultLabel)
-		if err := genBlock(g, stmt.Default); err != nil {
-			g.popBreak()
-			return err
-		}
-		g.emit("\tGOTO\t#%s\n", endLabel)
-	}
+	g.pushBreak(breakTarget{Label: endLabel})
+	err := genSwitchClauses(g, tagOp, hasTag, stmt.Cases, stmt.Default)
 	g.popBreak()
+	if err != nil {
+		return err
+	}
 
+	g.emit("\tGOTO\t#%s\n", endLabel)
 	g.emit("\tLABEL\t#%s\n", endLabel)
 	return nil
 }
 
+// genSwitchClauses dispatches to the first case in cases (via
+// genSwitchCase), or defaultBody if there are none left — see
+// genSwitchStmt's doc.
+func genSwitchClauses(g *funcGen, tagOp string, hasTag bool, cases []ast.SwitchCase, defaultBody []ast.Stmt) error {
+	if len(cases) == 0 {
+		return genBlock(g, defaultBody)
+	}
+	return genSwitchCase(g, tagOp, hasTag, cases[0].Values, cases[0].Body, cases[1:], defaultBody)
+}
+
+// genSwitchCase checks one case's value list one at a time, short-
+// circuiting exactly like the pre-migration flat IF-chain did: values[0]
+// is computed and checked first, with every later value in this case
+// (then every later case, then defaultBody) nested inside its ELSE —
+// see genSwitchStmt's doc.
+func genSwitchCase(g *funcGen, tagOp string, hasTag bool, values []ast.Expr, body []ast.Stmt, restCases []ast.SwitchCase, defaultBody []ast.Stmt) error {
+	v, err := genValue(g, values[0])
+	if err != nil {
+		return err
+	}
+	cond := v
+	if hasTag {
+		cmp := g.newTemp("^bool")
+		g.emit("\tEQ\t%s\t%s\t%s\n", cmp, tagOp, v)
+		cond = cmp
+	}
+	g.emit("\tIF\t%s\n", cond)
+	if err := genBlock(g, body); err != nil {
+		return err
+	}
+
+	restValues := values[1:]
+	hasMore := len(restValues) > 0 || len(restCases) > 0 || defaultBody != nil
+	if hasMore {
+		g.emit("\tELSE\n")
+		if len(restValues) > 0 {
+			err = genSwitchCase(g, tagOp, hasTag, restValues, body, restCases, defaultBody)
+		} else {
+			err = genSwitchClauses(g, tagOp, hasTag, restCases, defaultBody)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	g.emit("\tENDIF\n")
+	return nil
+}
+
 func genBreakStmt(g *funcGen, stmt *ast.BreakStmt) error {
-	label, ok := g.currentBreak()
+	t, ok := g.currentBreak()
 	if !ok {
 		return fmt.Errorf("codegen: break outside of a loop or switch (sema bug)")
 	}
-	g.emit("\tGOTO\t#%s\n", label)
+	if t.Label != "" {
+		g.emit("\tGOTO\t#%s\n", t.Label)
+		return nil
+	}
+	g.emit("\tBREAK\n")
 	return nil
 }
 
 func genContinueStmt(g *funcGen, stmt *ast.ContinueStmt) error {
-	label, ok := g.currentContinue()
+	t, ok := g.currentContinue()
 	if !ok {
 		return fmt.Errorf("codegen: continue outside of a loop (sema bug)")
 	}
-	g.emit("\tGOTO\t#%s\n", label)
+	if t.Label != "" {
+		g.emit("\tGOTO\t#%s\n", t.Label)
+		return nil
+	}
+	g.emit("\tCONTINUE\n")
 	return nil
 }
 

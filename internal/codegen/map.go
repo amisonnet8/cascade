@@ -68,17 +68,12 @@ func genForInMapStmt(g *funcGen, stmt *ast.ForInStmt) error {
 	idxOp := g.newTemp("^int")
 	g.emit("\tSET\t%s\t0\n", idxOp)
 
-	startLabel := g.newLabel()
-	bodyLabel := g.newLabel()
 	continueLabel := g.newLabel()
-	endLabel := g.newLabel()
 
-	g.emit("\tLABEL\t#%s\n", startLabel)
+	g.emit("\tLOOP\n")
 	cmp := g.newTemp("^bool")
 	g.emit("\tLT\t%s\t%s\t%s\n", cmp, idxOp, lenOp)
-	g.emit("\tIF\t%s\t#%s\n", cmp, bodyLabel)
-	g.emit("\tGOTO\t#%s\n", endLabel)
-	g.emit("\tLABEL\t#%s\n", bodyLabel)
+	g.emitBreakUnless(cmp)
 
 	outer := g.scope
 	g.scope = newScope(outer)
@@ -92,8 +87,8 @@ func genForInMapStmt(g *funcGen, stmt *ast.ForInStmt) error {
 	g.scope.declare(stmt.ValueVarName, valueRef)
 	g.emit("\tMGET\t%s\t%s\t%s\n", valueRef.ValOp, mapOp, keyRef.ValOp)
 
-	g.pushBreak(endLabel)
-	g.pushContinue(continueLabel)
+	g.pushBreak(breakTarget{})
+	g.pushContinue(continueTarget{Label: continueLabel})
 	var bodyErr error
 	for _, s := range stmt.Body {
 		if bodyErr = genStmt(g, s); bodyErr != nil {
@@ -110,8 +105,7 @@ func genForInMapStmt(g *funcGen, stmt *ast.ForInStmt) error {
 	g.emit("\tGOTO\t#%s\n", continueLabel)
 	g.emit("\tLABEL\t#%s\n", continueLabel)
 	g.emit("\tADD\t%s\t%s\t1\n", idxOp, idxOp)
-	g.emit("\tGOTO\t#%s\n", startLabel)
-	g.emit("\tLABEL\t#%s\n", endLabel)
+	g.emit("\tENDLOOP\n")
 	return nil
 }
 
