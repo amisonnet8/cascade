@@ -4,7 +4,7 @@ BINARY := cascade
 PKG    := ./cmd/cascade
 GO     := go
 
-.PHONY: all build install test fmt vet tidy clean help
+.PHONY: all build install test test-examples fmt vet tidy clean help
 
 all: build ## デフォルトターゲット(ビルドのみ)
 
@@ -16,6 +16,13 @@ install: ## cascadeバイナリをGOBIN($GOPATH/bin)へインストールする
 
 test: ## go testで全パッケージのユニットテストを実行する
 	$(GO) test ./...
+
+test-examples: build ## examples/配下の全サンプル(.casファイル・パッケージディレクトリ双方)をamivm→go buildまで通し実行する(amivmがPATHにある前提)
+	@set -e; \
+	for src in examples/*; do \
+		echo "== $$src =="; \
+		./$(BINARY) run "$$src"; \
+	done
 
 fmt: ## *.goをgoimportsで整形する
 	goimports -w .

@@ -1,5 +1,7 @@
 # Cascade
 
+[![test](https://github.com/amisonnet8/cascade/actions/workflows/test.yml/badge.svg)](https://github.com/amisonnet8/cascade/actions/workflows/test.yml)
+
 A programming language, implemented in Go, that compiles to Go source via AMIVM-IR. It's the second front end built on AMIVM (after [Seed](seed/)), and goes considerably further: pointers, structs, closures, maps, channels/goroutines, bitwise operators, error handling, and a concurrent pipeline construct built into the language itself.
 
 > [日本語版 README はこちら](README_ja.md)
@@ -125,6 +127,8 @@ cascade_spec.md       the Cascade language specification (the only authoritative
 cascade_implementation_notes.md  lessons learned writing an AMIVM-IR-generating front end —
                        general pitfalls/patterns, not Cascade-specific
 CLAUDE.md              project conventions for AI-assisted development
+Makefile               build/install/test/test-examples/fmt/vet/tidy/clean tasks
+.github/workflows/test.yml  CI: gofmt/go vet/go test/make test-examples on push and PR
 LICENSE                MIT license
 ```
 

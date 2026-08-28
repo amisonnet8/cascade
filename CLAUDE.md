@@ -48,6 +48,8 @@ Cascade開発でAMIVMの全命令を使うことが目標として掲げられ�
 make install   # go install ./cmd/amivm — $GOBIN(未設定なら$GOPATH/bin)に配置される
 ```
 
+**amivmリポジトリはPublic化されている**ため、GitHub Actions上でも認証情報無しに`go install github.com/amisonnet8/amivm/cmd/amivm@latest`でインストールできる(`.github/workflows/test.yml`参照)。これにより、これまで手元でしか検証できなかった「実際に`amivm`にかけて`go build`まで通す」確認(下記「開発の進め方」2.参照)をCIで毎回自動実行できる([[Seed]]の`seed/CLAUDE.md`が同じ構成を先に採用しており、Cascadeもこれをそのまま踏襲した)。
+
 ### CLIコマンド仕様
 
 ```
@@ -453,6 +455,14 @@ amivm本体に、Goのジェネリクス(型パラメータ・明示的型引数
 - **`FUNCVAL`**: `local := callname`という形で、`!xxx`(トップレベル関数)のような従来`callname`カテゴリでしか使えなかったトークンを、コピー1つ挟むだけで`%`変数(`value`/`callname`両カテゴリで使える)へ変換できる命令。これは実は、Step9で「トップレベル関数を名前で直接値として渡すことは今回サポートしない」と確定し、AMIVM命令改修・第1弾でも「`value`カテゴリへの`!xxx`/`?xxx`追加への追従は意図的にスコープ外とした」と重ねて確定した**あの制限を、全く別の命令から回避する新しい選択肢**になりうる。ただし今回はあくまで「amivm仕様変更への追従」が目的であり、`filter(numbers, isEven)`のようにトップレベル関数を値として渡せるようにすること自体はCascadeの新機能追加(`cascade_spec.md`の変更を要する可能性がある独立した設計判断)であって、仕様変更への追従の範囲を超える。そのため今回は着手せず、「対応するCascade言語機能が今も存在しない」という理由のまま対象外にとどめた——ただし`FUNCVAL`という具体的な実装手段が使える状態にあることは、この機能を将来検討する際のために本節に記録しておく。
 - **`FUNCM`/`ENDFUNCM`(Goネイティブのレシーバー付きメソッド)**: これだけは他の4つと違い、対応するCascade機能(レシーバー付き関数、3本柱の1つ)が明確に存在する。Step8時点で「レシーバーを第一引数とする普通の`FUNC`として`StructName_Method`という名前で生成する」という方針を確定させた際の理由は「オープンな設計課題の候補の中で最も単純」というものであり、当時`FUNCM`はまだ存在しなかった。今回`FUNCM`が使えるようになったことで再検討したが、以下の理由で**切り替えないことに決めた**: (1) 現行方式は今回のamivm改修でも無変更で動作し続けており、壊れてはいない。(2) `FUNCM`への切り替えは、レシーバー命名規則(`StructName_Method`)・値/ポインタレシーバー自動変換(`genReceiverOperand`)・呼び出し側の`callname`解決など、`internal/codegen`の複数ファイルにまたがる作り直しを要する広範囲な変更になる一方、Cascadeには現状インターフェースも多態も無く、Goのネイティブなメソッドセット(interface実装の判定基準になる)を必要とする言語機能が無いため、切り替えても実行時・利用者向けの挙動は何一つ変わらない。(3) CLAUDE.md冒頭の「全命令使用という目標について」が明言するとおり、「無理に全命令を使う必要はない・不自然な機能をこじつけてまで未使用命令を消化する必要はない」——`FUNCM`は不自然ではないが、今この時点で切り替える積極的な理由(バグ修正・新機能実現)が無い以上、リスクだけを負うことになる。**将来、Cascadeが外部Goパッケージ型のメソッド呼び出しやインターフェース相当の機能を必要とした時点で、`FUNCM`への切り替えを改めて検討する**(Step8の「確定した設計判断」に残した「外部Goパッケージ型のメソッド呼び出しが必要になった時点で改めて検討する」という保留と同じ条件)。
 
+### CI(GitHub Actions)の導入
+
+amivmリポジトリがPublic化されたことを受け、`.github/workflows/test.yml`を新設した。**[[Seed]]が同じ状況(amivmのPublic化)に一足先に対応しており、`seed/.github/workflows/test.yml`・`seed/Makefile`の`test-examples`ターゲットをそのままCascade向けに移植する形で実装した**(Seedを参考実装として再利用する、CLAUDE.md「ドキュメント構成」節の既存方針どおり)。
+
+**Public化以前はCIを組めなかった。** amivmがPrivateリポジトリだった間は、GitHub Actions上の`go install github.com/amisonnet8/amivm/cmd/amivm@latest`が認証情報無しには失敗するため、「実際に`amivm`にかけて`go build`まで通す」という本プロジェクトが繰り返し強調してきた検証(開発の進め方2.参照)はローカル環境でしか実行できず、`go test ./...`(Cascade自身のsema/codegenのユニットテストのみ)しかCIに乗せられなかった。Public化によりこの制約が外れたため、`examples/`配下の全サンプルをamivm経由で最後まで動かす統合テストを、開発者の手元だけでなくpush/PRのたびに自動実行できるようにした。
+
+**`make test-examples`は`cascade run`を`examples/*`の各エントリ(`.cas`ファイル・`14_packages`のようなパッケージディレクトリの両方)へそのまま適用するだけで実装できた。** Seedの`test-examples`(`seed build -o <一時パス>`→実行、という2段の`build`+実行が必要だった)より単純になっている——CascadeのCLIには最初から`run`(コンパイルと即実行を1コマンドで行い、stdin/stdout/stderrをストリームする)サブコマンドがあり(Step 15で確定済み)、`cascade run <path>`は単一ファイル・パッケージディレクトリのどちらも受け付けるため(`pkgloader.Load`の項参照)、`examples/*`をシェルのグロブでそのまま列挙して1つずつ`run`に渡すループだけで全パターンを網羅できた。全13個の`.cas`ファイル+`examples/14_packages`ディレクトリで実地確認済み(全て終了コード0)。
+
 ## 意味検証の責任分担(重要)
 
 型の整合性・未定義識別子・関数シグネチャの不一致・メソッドの存在チェックなどは、**amivm側では検証せず`go/types`に全面的に委ねている。** amivmが保証するのは「構文的に妥当なGoコードを出力すること」だけ。
@@ -493,7 +503,8 @@ amivm本体に、Goのジェネリクス(型パラメータ・明示的型引数
   amivm/                        amivmのローカルクローン(参照用。Cascade本体の一部ではない)
   README.md / README_ja.md      導入ドキュメント(実装が固まってから作成)
   go.mod                        module github.com/amisonnet8/cascade (想定)
-  Makefile                      build/install/test/fmt/vet/tidy/clean タスク
+  Makefile                      build/install/test/test-examples/fmt/vet/tidy/clean タスク
+  .github/workflows/test.yml    CI: push/PR時にgofmt/go vet/go test/make test-examplesを実行
   cmd/cascade/
     main.go                     CLIエントリポイント(build/run/emit-ir/emit-go/help のディスパッチ)
     build.go                    pkgloader.Load → sema.Check → codegen.Generate → amivm → go build の
@@ -544,6 +555,7 @@ Seedは7〜8ステップ(git履歴上は「Step1: hello-worldパイプライン�
 5. 設計上の未確定事項は、着手時に方針を確定させ、確定内容を「確定した設計判断」節(または実装コード側のdocコメント)に書き残す。仮説のまま放置しない
 6. 新しい命令を使うたびに「命令使用ゴール」節の表を更新し、全命令の使用状況を追跡する
 7. amivm本体の仕様が更新された場合(`amivm/amivm_spec.md`を再確認)、本ファイルの「AMIVM-IRの書き方」節が古くなっていないか照合し、必要なら更新する
+8. `.github/workflows/test.yml`によりpush/PR時に`gofmt`・`go vet`・`go test`・`make test-examples`(`examples/`配下を`amivm`→`go build`→実行まで通す統合テスト)がGitHub Actionsで自動実行される。ローカルでも`make test-examples`(`amivm`が`PATH`にある前提)を実行してからpushすること(CIで初めて失敗に気づくのは避ける)
 
 ## AIによる開発支援のための注意点
 
