@@ -3,11 +3,7 @@
   "image": "mcr.microsoft.com/devcontainers/go:1.26-bookworm",
   "customizations": {
     "vscode": {
-      "extensions": [
-        "golang.Go",
-        "ms-vscode.makefile-tools",
-        "timonwong.shellcheck"
-      ],
+      "extensions": ["golang.Go", "ms-vscode.makefile-tools"],
       "settings": {
         "go.useLanguageServer": true,
         "editor.formatOnSave": true,
@@ -15,6 +11,6 @@
       }
     }
   },
-  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y shellcheck make && go install golang.org/x/tools/gopls@latest && go install golang.org/x/tools/cmd/goimports@latest && go install golang.org/x/tools/cmd/stringer@latest",
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y make && go install golang.org/x/tools/gopls@latest && go install golang.org/x/tools/cmd/goimports@latest && go install golang.org/x/tools/cmd/stringer@latest && go install github.com/amisonnet8/amivm/cmd/amivm@latest",
   "remoteUser": "vscode"
 }
