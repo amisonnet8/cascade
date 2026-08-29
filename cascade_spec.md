@@ -701,7 +701,7 @@ func main(): int {
 }
 ```
 
-- 引数を取らない(コマンドライン引数が必要な場合は組み込み関数`args(): []string`を呼ぶ)
+- 引数を取らない(コマンドライン引数が必要な場合は組み込み関数`args(): []string`を呼ぶ想定——13節の**(未実装)**注記を参照)
 - 戻り値は終了コードとして扱う。`0`は正常終了、`0`以外は異常終了
 - 書ける場所については11.4節を参照
 
@@ -716,16 +716,18 @@ func main(): int {
 | `filter` | `(list: []T, pred: func(T): bool) -> []T` | `pred`が`true`を返す要素だけのリストを返す |
 | `map` | `(list: []T, f: func(T): U) -> []U` | 各要素に`f`を適用したリストを返す |
 | `reduce` | `(list: []T, initial: U, f: func(U, T): U) -> U` | `initial`から始めて`f`を畳み込んだ結果を返す |
-| `int` | `(value: int \| float \| bool) -> int`、`(value: string) -> int?` | `int`へ変換する。`string`からの変換は失敗しうるため戻り値が`int?`になる(数値変換の他は失敗しない) |
-| `float` | `(value: int \| float) -> float`、`(value: string) -> float?` | `float`へ変換する。`string`からの変換は失敗しうるため戻り値が`float?`になる |
+| `int` **(未実装)** | `(value: int \| float \| bool) -> int`、`(value: string) -> int?` | `int`へ変換する。`string`からの変換は失敗しうるため戻り値が`int?`になる(数値変換の他は失敗しない) |
+| `float` **(未実装)** | `(value: int \| float) -> float`、`(value: string) -> float?` | `float`へ変換する。`string`からの変換は失敗しうるため戻り値が`float?`になる |
 | `string` | `(value: int \| float \| bool) -> string` | `string`へ変換する |
-| `sqrt` | `(value: float) -> float` | 平方根 |
+| `sqrt` **(未実装)** | `(value: float) -> float` | 平方根 |
 | `send` | `(output: chan<T>, value: T) -> なし` | `source`/`stage`本体内で出力チャネルへ値を送る |
 | `merge` | `(a: chan<T>, b: chan<T>) -> chan<T>` | 2本のチャネルを1本に合流させる(9.5節) |
 | `abort` | `(message: string) -> なし` | 現在のパイプラインを異常終了させる(9.4節) |
-| `args` | `() -> []string` | コマンドライン引数を返す |
+| `args` **(未実装)** | `() -> []string` | コマンドライン引数を返す |
 | `error` | `(message: string) -> error` | エラー値を作る(8.6節) |
 | `delete` | `(m: map<K, V>, key: K) -> なし` | mapから指定キーの要素を削除する |
+
+**(未実装)**マークの4つ(`int`/`float`の`string`からの変換、`sqrt`、`args`)は、当初の設計メモの時点から仕様に載っていたが、15ステップの実装計画には一度も組み込まれず、`internal/sema`・`internal/codegen`のどこにも対応する実装が無いことをドキュメント見直しの過程で確認した(`int("42")`等を実際に`cascade run`へ通すと`"int" cannot be used as a value`という意味検査エラーになる)。それ以外の関数は全て`internal/sema`の`checkCallExprValue`/`checkExprStmt`に対応する`case`があり、`examples/`配下のいずれかのサンプルで実地確認済み。§8.2・§11.2の例で`sqrt`を使っているのはレシーバー付き関数・パッケージ構文そのものの例示が目的で、そのコード片自体は`examples/`に対応する実行可能サンプルを持たない(実行可能な例は常に`examples/*.cas`を参照すること)。
 
 ## 14. キーワード一覧
 

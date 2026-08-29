@@ -193,6 +193,8 @@ Cascadeの`func main(): int`をamivmの`!main`へ直接対応させることは�
 
 **文法上の注意点として記録**: `int`/`float`/`string`/`bool`は型キーワードであると同時に、式の中では組み込み変換関数の呼び出し(`string(x)`)にもなる。これらは`KwString`等の予約語としてlexされ`Ident`にはならないため、`parsePrimary`は`Ident`とは別に型キーワードのケースを持ち、直後が`(`なら呼び出し式として`parseCallExprFrom`に渡す(そうでなければ式の位置に型キーワードが出現したという通常の構文エラー)。将来`int()`/`float()`ビルトイン(それぞれ`string`からの変換は`int?`/`float?`を返す点に注意)を実装する際もこの分岐に相乗りできる。
 
+**ドキュメント見直しの過程で判明した未実装事項として記録**: `int()`/`float()`(`string`からの変換)は、この時点で「将来実装できる分岐だけ用意した」状態のまま、15ステップの実装計画にも以降のAMIVM改修追従にも一度も組み込まれず、今日に至るまで実装されていない(`internal/sema`の`checkCallExprValue`に`case "int"`/`case "float"`が無く、`int("42")`は`"int" cannot be used as a value`という意味検査エラーになる)。同様に`sqrt`・`args`も`cascade_spec.md` 13節に載ったまま一度も実装されなかった。いずれも`cascade_spec.md`側に**(未実装)**と明記した(削除はしない——ユーザーとの合意により、将来実装する可能性を残す形にした)。新しいビルトインを追加する際は、まずこの4つが本当に不要になったのか(削除)・今回実装するのか(`(未実装)`マークを外す)を確認してから着手すること。
+
 ### ビット演算・シフト演算の実地検証結果(Step 4)
 
 `BAND` `BOR` `BXOR` `BCLEAR` `BNOT` `SHL` `SHR`はSeedで未実証だった命令(seed_implementation_notes.md §0)。実装方針はロジック上の予想通りで、生成パターンに驚きは無かった(同notes §5.6の予想が的中): `+`/`-`/`*`と全く同じ「演算子ごとに命令を振り分け、一時変数へ結果を格納する」パターン(`genBinary`/`genUnary`)がそのまま流用でき、`BNOT`(単項)以外は全て2項命令。単項マイナスと違い`~`には対応する命令(`BNOT`)が存在するため、`SUB tmp 0 x`のような回避策は不要だった。
@@ -506,7 +508,7 @@ amivm本体に2つの変更が入った: (1) 名前付き固定長配列型`ARTY
 6. **`fmt.Sprintf`で動的にIR行を組み立てる際、オペランド中の`%`をフォーマット文字列に直接連結しない**(`%s`引数として渡す)
 7. **`STTYPE`/`SEL`はネスト不可**。関数内ローカルな構造体定義を許す言語仕様なら、全てトップレベルへ引き上げる必要がある(Cascadeの`struct`は元々トップレベル宣言のみなので該当しない見込みだが、クロージャー内で新たな構造体を作る発展的な構文を将来追加する場合は要注意)。**`CLOS`だけは例外で、`CLOS`本体の中に`CLOS`をネストできる**(ネストするごとにクロージャー引数のトークンが`&L-N`という階層付きの形へ変わる。下記「確定した設計判断」参照)
 
-## リポジトリ構成(予定・未実装)
+## リポジトリ構成
 
 **`/workspaces/cascade`(このディレクトリ自体)がCascadeのホーム。** Seed(`seed/`)・amivm(`amivm/`)はそれぞれ自分自身が独立リポジトリのルートで、Cascadeから見た参照用クローンとしてこの階層に置かれている。Cascade自身の実装知見(`cascade_implementation_notes.md`)はCascade自身のリポジトリで管理し、Seedの実装知見はSeed自身のリポジトリ(`github.com/amisonnet8/seed`)で管理する——「各言語の実装知見はその言語自身のリポジトリで管理する」方針(前節参照)。
 
@@ -518,8 +520,9 @@ amivm本体に2つの変更が入った: (1) 名前付き固定長配列型`ARTY
   CLAUDE.md                     本ファイル
   seed/                         Seedの参考実装(参照用。Cascade本体の一部ではない)
   amivm/                        amivmのローカルクローン(参照用。Cascade本体の一部ではない)
-  README.md / README_ja.md      導入ドキュメント(実装が固まってから作成)
-  go.mod                        module github.com/amisonnet8/cascade (想定)
+  README.md / README_ja.md      導入ドキュメント(英語版/日本語版)
+  LICENSE                       MITライセンス
+  go.mod                        module github.com/amisonnet8/cascade
   Makefile                      build/install/test/test-examples/fmt/vet/tidy/clean タスク
   .github/workflows/test.yml    CI: push/PR時にgofmt/go vet/go test/make test-examplesを実行
   cmd/cascade/
@@ -559,7 +562,7 @@ Seedは7〜8ステップ(git履歴上は「Step1: hello-worldパイプライン�
 | 12 ✅ | パイプライン基礎 | `source`/`stage`/`sink`、`chan<T>`、`send`、`for v in channel`、`\|>`連結(9.1/9.2節) | `CHTYPE` `CHMAKE` `CHSEND` `CHRECV` `SPAWN` `DEFER` | パイプラインの並行実行モデルの一次決定。基礎部分を確定・実装(下記「確定した設計判断」参照。collect/abort/mergeはStep 13へ) |
 | 13 ✅ | パイプライン拡張(collect/abort/merge) | `collect`(9.3節)・`abort`(9.4節)・`merge`(9.5節) | `SEL` `CASESEND` `CASERECV` `DEFAULT` `ENDSEL` | パイプラインの並行実行モデルを最終確定(下記「確定した設計判断」参照) |
 | 14 ✅ | パッケージ/複数ファイル | ディレクトリ=パッケージの統合(11.1節)、`import`/`pub`(11.2/11.3節)、循環import検出(11.5節)、識別子一意化(11.6節)、トップレベル`let`/`const`(11.3節) | `GVAR`。新規AMIVM命令は無いが`GVAR`が初めて実際に使われた | パッケージ/モジュール解決を確定(下記「確定した設計判断」参照) |
-| 15 ✅ | CLI・配布 | `cascade build/run/emit-ir/emit-go/help`、`cascadert`の`go:embed`配布、README作成 | — | — |
+| 15 ✅ | CLI・配布 | `cascade build/run/emit-ir/emit-go/help`、`cascadert`の`go:embed`配布(後日`MPKEYS`追加を受けて削除済み——下記「独自のGoランタイムを呼ぶ」参照)、README作成 | — | — |
 
 特にStep4(ビット演算)・Step8(ポインタ・構造体)・Step9(クロージャー)・Step10(map)・Step12/13(チャネル・SPAWN・SEL)はSeedで未実証だった命令なので、「ロジック上正しそうに見える」だけで次のステップへ進まないこと。設計上の未確定事項に着手する際は、方針を確定させたら「確定した設計判断」節に記録し、仮説のまま放置しないこと。
 

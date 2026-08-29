@@ -8,7 +8,7 @@ A programming language, implemented in Go, that compiles to Go source via AMIVM-
 
 ## Status
 
-Cascade's front end (lexer, parser, semantic checker, and AMIVM-IR code generator) implements the full language described in [`cascade_spec.md`](cascade_spec.md): scalars and null-checked (`T?`) types, the full operator set including bitwise/shift, control flow, lists, user-defined functions with multi-value returns, structs/pointers/receiver functions, closures and higher-order functions (`filter`/`map`/`reduce`), `map<K, V>`, error handling (`error`, `(T, error?)`, postfix `?`), concurrent pipelines (`source`/`stage`/`sink`, `|>`, `send`, `collect`, `abort`, `merge`), and packages/multi-file programs (`import`, `pub`).
+Cascade's front end (lexer, parser, semantic checker, and AMIVM-IR code generator) implements the full language described in [`cascade_spec.md`](cascade_spec.md): scalars and null-checked (`T?`) types, the full operator set including bitwise/shift, control flow, lists, user-defined functions with multi-value returns, structs/pointers/receiver functions, closures and higher-order functions (`filter`/`map`/`reduce`), `map<K, V>`, error handling (`error`, `(T, error?)`, postfix `?`), concurrent pipelines (`source`/`stage`/`sink`, `|>`, `send`, `collect`, `abort`, `merge`), and packages/multi-file programs (`import`, `pub`). A handful of builtins listed in `cascade_spec.md` §13 — `int()`/`float()` string conversions, `sqrt`, `args` — are marked "(未実装)" there and not yet implemented.
 
 ## Pipeline
 

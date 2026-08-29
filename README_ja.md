@@ -8,7 +8,7 @@ AMIVM-IRを経由してGoソースコードへコンパイルする、Go実装�
 
 ## ステータス
 
-Cascadeのフロントエンド(字句解析・構文解析・意味検査・AMIVM-IRコード生成)は、[`cascade_spec.md`](cascade_spec.md)に記載された言語仕様を一通り実装済みです: スカラー型とnull許容(`T?`)型、ビット演算・シフトを含む全演算子、制御構文、リスト、複数戻り値対応のユーザー定義関数、構造体/ポインタ/レシーバー関数、クロージャーと高階関数(`filter`/`map`/`reduce`)、`map<K, V>`、エラー処理(`error`型・`(T, error?)`・後置`?`)、並行パイプライン(`source`/`stage`/`sink`・`|>`・`send`・`collect`・`abort`・`merge`)、パッケージ/複数ファイル対応(`import`・`pub`)。
+Cascadeのフロントエンド(字句解析・構文解析・意味検査・AMIVM-IRコード生成)は、[`cascade_spec.md`](cascade_spec.md)に記載された言語仕様を一通り実装済みです: スカラー型とnull許容(`T?`)型、ビット演算・シフトを含む全演算子、制御構文、リスト、複数戻り値対応のユーザー定義関数、構造体/ポインタ/レシーバー関数、クロージャーと高階関数(`filter`/`map`/`reduce`)、`map<K, V>`、エラー処理(`error`型・`(T, error?)`・後置`?`)、並行パイプライン(`source`/`stage`/`sink`・`|>`・`send`・`collect`・`abort`・`merge`)、パッケージ/複数ファイル対応(`import`・`pub`)。ただし`cascade_spec.md` 13節に載っている組み込み関数のうち`int()`/`float()`(`string`からの変換)・`sqrt`・`args`の4つは「(未実装)」と明記のとおり未実装です。
 
 ## パイプライン
 
