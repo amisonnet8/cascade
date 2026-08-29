@@ -88,3 +88,80 @@ func TestLexString_EscapeErrors(t *testing.T) {
 		})
 	}
 }
+
+// lexOneInt tokenizes src (expected to be exactly one integer literal)
+// and returns its raw Literal text — the lexer keeps base prefixes and
+// '_' separators verbatim (parseIntLiteral, in the parser package, is
+// what strips them and picks the base — see its doc for why).
+func lexOneInt(t *testing.T, src string) string {
+	t.Helper()
+	toks, err := Tokenize(src)
+	if err != nil {
+		t.Fatalf("Tokenize(%q) = %v, want nil error", src, err)
+	}
+	if len(toks) < 1 || toks[0].Kind != Int {
+		t.Fatalf("Tokenize(%q) = %v, want a single Int token first", src, toks)
+	}
+	return toks[0].Literal
+}
+
+// TestLexNumber_IntLiteralForms covers the base prefixes and digit
+// separators cascade_spec.md §3.2 adds on top of plain decimal
+// (mirroring amivm_spec.md §6, itself Go 1.13+'s native integer literal
+// grammar). The lexer only recognizes and passes these through — legacy
+// leading-zero decimals like "0755" keep meaning decimal 755, exactly as
+// before this change (see parseIntLiteral's doc for why that matters).
+func TestLexNumber_IntLiteralForms(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+		want string
+	}{
+		{"plain decimal", "1234", "1234"},
+		{"bare zero", "0", "0"},
+		{"legacy leading-zero decimal unaffected", "0755", "0755"},
+		{"decimal digit separators", "1_000_000", "1_000_000"},
+		{"hex lowercase prefix", "0x1a", "0x1a"},
+		{"hex uppercase prefix", "0X1A", "0X1A"},
+		{"hex with separators", "0xFF_FF", "0xFF_FF"},
+		{"hex separator right after prefix", "0x_1A", "0x_1A"},
+		{"octal lowercase prefix", "0o17", "0o17"},
+		{"octal uppercase prefix", "0O17", "0O17"},
+		{"binary lowercase prefix", "0b101", "0b101"},
+		{"binary uppercase prefix", "0B101", "0B101"},
+		{"binary with separators", "0b1010_0101", "0b1010_0101"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := lexOneInt(t, tt.src)
+			if got != tt.want {
+				t.Fatalf("Tokenize(%s) literal = %q, want %q", tt.src, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLexNumber_IntLiteralErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		src     string
+		wantErr string
+	}{
+		{"trailing separator", "1_", "cannot appear at the end"},
+		{"doubled separator", "1__0", "cannot appear twice in a row"},
+		{"hex prefix with no digits", "0x", "expected at least one digit"},
+		{"hex prefix with only a separator", "0x_", "expected at least one digit after '_'"},
+		{"doubled separator right after hex prefix", "0x__1", "cannot appear at the start"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Tokenize(tt.src)
+			if err == nil {
+				t.Fatalf("Tokenize(%s) = nil error, want error containing %q", tt.src, tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Tokenize(%s) = %q, want error containing %q", tt.src, err.Error(), tt.wantErr)
+			}
+		})
+	}
+}

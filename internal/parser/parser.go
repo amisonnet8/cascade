@@ -45,6 +45,7 @@ package parser
 import (
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/amisonnet8/cascade/internal/ast"
 	"github.com/amisonnet8/cascade/internal/lexer"
@@ -1381,7 +1382,7 @@ func (p *parser) parsePrimaryAtom() (ast.Expr, error) {
 		return &ast.StringLit{Value: tok.Literal, Line: tok.Line}, nil
 	case lexer.Int:
 		p.advance()
-		v, err := strconv.ParseInt(tok.Literal, 10, 64)
+		v, err := parseIntLiteral(tok.Literal)
 		if err != nil {
 			return nil, fmt.Errorf("line %d: invalid integer literal %q", tok.Line, tok.Literal)
 		}
@@ -1442,6 +1443,32 @@ func (p *parser) parsePrimaryAtom() (ast.Expr, error) {
 	default:
 		return nil, fmt.Errorf("line %d: unexpected token %q", tok.Line, tok.Literal)
 	}
+}
+
+// parseIntLiteral parses an Int token's literal text (cascade_spec.md
+// §3.2: decimal, or hex/octal/binary via a 0x/0o/0b prefix, with '_'
+// digit separators the lexer has already validated the placement of)
+// into its int64 value. This deliberately doesn't hand the raw literal
+// to strconv.ParseInt with base 0 — Go's own base-0 auto-detection would
+// reinterpret a legacy leading-zero decimal literal like "0755" as
+// octal, which cascade_spec.md does not (leading zeros are just decimal
+// digits, as they always have been here — only an explicit 0x/0o/0b
+// prefix selects a non-decimal base).
+func parseIntLiteral(lit string) (int64, error) {
+	base := 10
+	digits := lit
+	if len(lit) > 2 && lit[0] == '0' {
+		switch lit[1] {
+		case 'x', 'X':
+			base, digits = 16, lit[2:]
+		case 'o', 'O':
+			base, digits = 8, lit[2:]
+		case 'b', 'B':
+			base, digits = 2, lit[2:]
+		}
+	}
+	digits = strings.ReplaceAll(digits, "_", "")
+	return strconv.ParseInt(digits, base, 64)
 }
 
 // parseClosureLit parses a closure literal (cascade_spec.md §8.3):

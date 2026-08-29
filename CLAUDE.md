@@ -102,6 +102,7 @@ amivm <IRファイルパス> [-o|--output <出力ファイルパス>] [-v|--verb
 | 比較 | `EQ` `NEQ` `LT` `LTE` `GT` `GTE` |
 | 文字列連結 | `CONCAT single slice1 slice2 ...` |
 | ラベル・GOTO | `LABEL label` / `GOTO label` |
+| 配列 | `ARTYPE typename1 type1 imm`(名前付き固定長配列型。配列自体は本命令を使わず`^[n]type1`という複合形でインラインに宣言することもでき、`ARTYPE`はあくまで再利用したい場合の選択肢。Cascadeは未使用——下記「命令使用ゴール」参照) |
 | 条件分岐 | `IF boolean1` / `ELIF boolean1` / `ELSE` / `ENDIF`(ブロック形。Goの`if`/`else if`/`else`に対応) |
 | ループ | `LOOP` / `BREAK` / `CONTINUE` / `ENDLOOP`(Goの無限`for {}`。条件付きループは`LOOP`の中で`IF`+`BREAK`を組み合わせて表現する) |
 | 型アサーション | `ASSERT multi1 (multi2) variable type1`(Goの`v.(T)`。`any`型相当をCascadeが持たないため対象外——下記「命令使用ゴール」参照) |
@@ -118,7 +119,9 @@ amivm <IRファイルパス> [-o|--output <出力ファイルパス>] [-v|--verb
 | インターフェース | `INTYPE typename1` / `METHOD method type1 ... : type3 ...` / `ENDINTYPE`(Cascadeは未使用——下記「命令使用ゴール」参照) |
 | ジェネリクス型の実体化 | `GETYPE typename1 typename2 type1 ...`(型引数を当てはめた別名宣言。Cascadeは未使用——下記「命令使用ゴール」参照) |
 
-各命令の生成Goコード・オペランドカテゴリ(`whole`/`integer`/`value`/`single`/`multi`等)・Kind分類は`amivm/amivm_spec.md`の4〜6節を参照。**キャスト・組み込み関数(`close`/`len`/`cap`等)は専用命令を持たず`CALL`に統合されている**(Goの型変換`T(v)`は構文上`ast.CallExpr`と同一のため)。型アサーション(`v.(T)`)だけは構文が異なる別ASTノード(Goの`ast.TypeAssertExpr`)になるため`CALL`に含めず`ASSERT`という専用命令になっている。
+各命令の生成Goコード・オペランドカテゴリ(`whole`/`integer`/`value`/`single`/`multi`/`imm`等)・Kind分類は`amivm/amivm_spec.md`の4〜6節を参照。**キャスト・組み込み関数(`close`/`len`/`cap`等)は専用命令を持たず`CALL`に統合されている**(Goの型変換`T(v)`は構文上`ast.CallExpr`と同一のため)。型アサーション(`v.(T)`)だけは構文が異なる別ASTノード(Goの`ast.TypeAssertExpr`)になるため`CALL`に含めず`ASSERT`という専用命令になっている。`imm`は`ARTYPE`の配列長専用の、識別子を許さないコンパイル時定数リテラルのオペランドカテゴリ。
+
+整数リテラルは10進に加えて16進(`0x`/`0X`)・8進(`0o`/`0O`)・2進(`0b`/`0B`)の基数プレフィックスと、桁区切りの`_`(基数プレフィックス直後、または数字と数字の間のみ)を受け付ける(`imm`/`whole`/`from`・`to`/`integer`/`ordered`/`value`/`point`の全カテゴリで等しく許容)。Cascade自身の整数リテラル構文(`cascade_spec.md` 3.2節)もこれに合わせて同じ基数プレフィックス・桁区切りを受け付けるよう拡張済み——詳細は下記「確定した設計判断」参照。
 
 ## 命令使用ゴール(Cascade機能とAMIVM命令の対応表)
 
@@ -138,6 +141,7 @@ amivm <IRファイルパス> [-o|--output <出力ファイルパス>] [-v|--verb
 | `LABEL` `GOTO` | `switch`の`break`(ネイティブの`BREAK`で抜けられる構造がswitchには無いため)、list/map for-inの`continue`(添字カウンタの更新が本体の後にあるため、ループ先頭に戻るネイティブ`CONTINUE`だけでは足りない) | 確定 |
 | `FUNC` `RET` `ENDFUNC` `CALL` | 通常関数・レシーバー付き関数・複数戻り値(8節) | 確定 |
 | `ADDR` `PGET` `PSET` | `&x`(アドレス取得。単純な変数だけでなく、amivmのADDRの`point`オペランド追加後は`&p.x`/`&xs[0]`のような単一階層のフィールド/添字アクセスも含む)・`*p`(デリファレンス)・`*ptr = v`(2.2/4.4/6節) | 確定 |
+| `ARTYPE` | 対応するCascade機能なし。Goの固定長配列型`[n]T`に対応するが、Cascadeの`[]T`は常に可変長(4.3節。`SLTYPE`ベース)で、固定長配列に相当する言語機能がCascadeに存在しない。`ASSERT`等と同じ理由で意図的に対象外とする(下記「確定した設計判断」参照) | 対象外 |
 | `SLTYPE` `SLMAKE` `ASET` `AGET` | `[]T`(可変長リスト、4.3節)。`append`は再SLMAKE+コピーで実現する見込み(Seedの配列と異なり可変長なので再確保が前提) | 確定 |
 | `SLICE` | Step 9で実装。ユーザー向け構文としては今も存在しないが、`filter`組み込み関数の内部実装(結果件数が事前にわからないため入力と同じ長さで`SLMAKE`し、マッチ分だけ前方に詰めてから実際の件数へ`SLICE`で切り詰める)で自然な使い道が見つかった | 確定 |
 | `STTYPE` `FIELD` `ENDSTTYPE` `FSET` `FGET` | `struct`定義・フィールドアクセス(4.1/5節) | 確定 |
@@ -462,6 +466,19 @@ amivmリポジトリがPublic化されたことを受け、`.github/workflows/te
 **Public化以前はCIを組めなかった。** amivmがPrivateリポジトリだった間は、GitHub Actions上の`go install github.com/amisonnet8/amivm/cmd/amivm@latest`が認証情報無しには失敗するため、「実際に`amivm`にかけて`go build`まで通す」という本プロジェクトが繰り返し強調してきた検証(開発の進め方2.参照)はローカル環境でしか実行できず、`go test ./...`(Cascade自身のsema/codegenのユニットテストのみ)しかCIに乗せられなかった。Public化によりこの制約が外れたため、`examples/`配下の全サンプルをamivm経由で最後まで動かす統合テストを、開発者の手元だけでなくpush/PRのたびに自動実行できるようにした。
 
 **`make test-examples`は`cascade run`を`examples/*`の各エントリ(`.cas`ファイル・`14_packages`のようなパッケージディレクトリの両方)へそのまま適用するだけで実装できた。** Seedの`test-examples`(`seed build -o <一時パス>`→実行、という2段の`build`+実行が必要だった)より単純になっている——CascadeのCLIには最初から`run`(コンパイルと即実行を1コマンドで行い、stdin/stdout/stderrをストリームする)サブコマンドがあり(Step 15で確定済み)、`cascade run <path>`は単一ファイル・パッケージディレクトリのどちらも受け付けるため(`pkgloader.Load`の項参照)、`examples/*`をシェルのグロブでそのまま列挙して1つずつ`run`に渡すループだけで全パターンを網羅できた。全13個の`.cas`ファイル+`examples/14_packages`ディレクトリで実地確認済み(全て終了コード0)。
+
+### AMIVM命令改修・第6弾(ARTYPE+imm追加、整数リテラルの16進/8進/2進・桁区切り対応)への追従
+
+amivm本体に2つの変更が入った: (1) 名前付き固定長配列型`ARTYPE typename1 type1 imm`(識別子を許さないコンパイル時定数専用の新オペランドカテゴリ`imm`を伴う)の追加、(2) 整数リテラルへの16進(`0x`/`0X`)・8進(`0o`/`0O`)・2進(`0b`/`0B`)基数プレフィックスと桁区切り`_`の追加(`imm`/`whole`/`from`・`to`/`integer`/`ordered`/`value`/`point`の全カテゴリで等しく許容)。
+
+**(1) `ARTYPE`は対象外と判断した。** Cascadeの`[]T`は常に`SLTYPE`ベースの可変長リストであり(Step 6で確定済み)、Goの固定長配列`[n]T`に対応する言語機能自体がCascadeに無い。既存13サンプル+`examples/14_packages`を新amivmで無変更のまま実行確認済み(`ARTYPE`はオプション命令——インライン`^[n]type1`の代替選択肢——のため、未使用でも既存IRの妥当性に影響しない)。`ASSERT`/`INTYPE`等と同じ「対応する言語機能が無い」パターンとして「命令使用ゴール」表に記録した。
+
+**(2) 整数リテラルの基数・桁区切りは、Cascade言語自身にも追加することにした(ユーザーへ確認の上で決定)。** 前回の文字列エスケープシーケンス対応(AMIVM文字列/ルーンリテラル修正を受けて)と同型の判断——amivmのIR側の変更自体はCascadeのcodegenに影響しない(`ast.IntLit.Value`は`int64`で保持し、`strconv.FormatInt(v, 10)`で常に10進として出力する既存実装のため、10進しか書けない状態でも困らない)が、「対象言語がリッチな整数リテラル構文を持てるようになった」という機会そのものは活かす価値があると判断した。
+
+- `internal/lexer/lexer.go`の`lexNumber`を拡張し、`0`の直後が`x`/`X`・`o`/`O`・`b`/`B`なら該当の基数プレフィックスとして扱い、以降その基数の桁のみを受け付ける(桁区切り`_`は基数プレフィックスの直後、または桁と桁の間にのみ許可——`validateDigitSeparators`という専用ヘルパーに切り出した)。トークンの`Literal`はプレフィックス・アンダースコアを含む生の文字列のまま保持する。
+- **値への変換(パース)は、Go標準の`strconv.ParseInt(lit, 0, 64)`(base 0による基数自動判定)を使わなかった。** base 0はGoの整数リテラル構文をそのまま踏襲するため、`0755`のような「先頭`0`+数字列」を**8進として**再解釈してしまう(`0755`→10進493)。Cascadeは元々`0755`を10進755として受け付けており(Step 2から無変更の既存動作)、amivmの今回の改修も「旧式の先頭`0`だけによる8進表記は視覚的な区別が付きにくいため対象外とする」と明記して同じ判断をしている。そのため`internal/parser/parser.go`に新設した`parseIntLiteral`ヘルパーが、プレフィックス(`0x`/`0o`/`0b`)の有無を自前で判定して基数を選び、`_`を除去してから明示的な基数で`strconv.ParseInt`を呼ぶ——`0755`は今回追加した基数プレフィックス判定に引っかからない(先頭2文字が`0x`/`0o`/`0b`のいずれでもない)ため、常に基数10かつ元の文字列のまま渡され、既存の解釈が一切変わらない。
+- codegen側は無変更で済んだ——`ast.IntLit.Value`はどの基数で書かれても最終的に同じ`int64`になり、IRへは常に`strconv.FormatInt(v.Value, 10)`で10進として出力されるため(元々`amivm_spec.md`のトークン形状分類がIR側でも10進を代表例として使っているのと同じ理由で、Cascade側が非10進のIRを生成する必要は無い)。
+- `cascade_spec.md` 3.2節に新設し、`examples/02_variables.cas`に`0x1A`/`0o17`/`0b101`/`1_000_000`の実地確認コードを追加した(`amivm`→`go build`→実行まで確認済み)。回帰テストは`internal/lexer/lexer_test.go`(`TestLexNumber_IntLiteralForms`/`TestLexNumber_IntLiteralErrors`)と`internal/parser/parser_test.go`(`TestParseIntLiteral_BasesAndSeparators`——`0755`が755のままであることを明示的に固定するケースを含む——および`TestParse_IntLiteralEndToEnd`)に追加した。
 
 ## 意味検証の責任分担(重要)
 

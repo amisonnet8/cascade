@@ -161,13 +161,56 @@ func (l *Lexer) lexIdent(line int) Token {
 // §3). Unary minus is not part of the literal itself — `-1234` lexes as
 // Minus followed by Int/Float, the same as any other unary expression
 // (§6) — but that operator isn't lexed until Step 3.
+//
+// Integer literals (only — floats stay plain decimal, mirroring
+// amivm_spec.md §6, which doesn't extend its own float grammar either)
+// may use a 0x/0X, 0o/0O, or 0b/0B base prefix (§3.2) and '_' digit
+// separators anywhere between digits, including right after the prefix.
+// The token's Literal keeps the prefix and separators verbatim; the
+// parser (parseIntLiteral) is the one that strips them and picks the
+// base, since Go's own base-0 strconv.ParseInt would misinterpret a
+// legacy leading-zero decimal literal like "0755" as octal.
 func (l *Lexer) lexNumber(line int) (Token, error) {
 	start := l.pos
-	for l.pos < len(l.src) && isDigit(l.peekRune()) {
+	base := 10
+	allowLeadingUnderscore := false
+	digitsStart := start
+	if l.peekRune() == '0' {
+		switch l.peekRuneAt(1) {
+		case 'x', 'X':
+			base = 16
+		case 'o', 'O':
+			base = 8
+		case 'b', 'B':
+			base = 2
+		}
+		if base != 10 {
+			l.pos += 2
+			digitsStart = l.pos
+			allowLeadingUnderscore = true
+		}
+	}
+	isBaseDigit := func(r rune) bool {
+		switch base {
+		case 16:
+			return isDigit(r) || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')
+		case 8:
+			return r >= '0' && r <= '7'
+		case 2:
+			return r == '0' || r == '1'
+		default:
+			return isDigit(r)
+		}
+	}
+	for l.pos < len(l.src) && (isBaseDigit(l.peekRune()) || l.peekRune() == '_') {
 		l.pos++
 	}
+	digits := string(l.src[digitsStart:l.pos])
+	if err := validateDigitSeparators(digits, allowLeadingUnderscore, line); err != nil {
+		return Token{}, err
+	}
 	isFloat := false
-	if l.peekRune() == '.' && isDigit(l.peekRuneAt(1)) {
+	if base == 10 && l.peekRune() == '.' && isDigit(l.peekRuneAt(1)) {
 		isFloat = true
 		l.pos++ // consume '.'
 		for l.pos < len(l.src) && isDigit(l.peekRune()) {
@@ -179,6 +222,38 @@ func (l *Lexer) lexNumber(line int) (Token, error) {
 		return Token{Kind: Float, Literal: lit, Line: line}, nil
 	}
 	return Token{Kind: Int, Literal: lit, Line: line}, nil
+}
+
+// validateDigitSeparators checks the digit/underscore run following an
+// integer literal's optional base prefix. A single leading '_' is valid
+// only right after a base prefix (allowLeadingUnderscore) — mirroring
+// amivm_spec.md §6's own grammar, which permits e.g. "0x_1A" but not a
+// bare "_123" (decimal has no prefix for a leading '_' to attach to).
+// Beyond that one allowance, '_' must sit strictly between two digits:
+// never first, last, or doubled.
+func validateDigitSeparators(digits string, allowLeadingUnderscore bool, line int) error {
+	if digits == "" {
+		return fmt.Errorf("line %d: expected at least one digit", line)
+	}
+	body := digits
+	if allowLeadingUnderscore && body[0] == '_' {
+		body = body[1:]
+		if body == "" {
+			return fmt.Errorf("line %d: expected at least one digit after '_'", line)
+		}
+	}
+	if body[0] == '_' {
+		return fmt.Errorf("line %d: digit separator '_' cannot appear at the start of a number", line)
+	}
+	if body[len(body)-1] == '_' {
+		return fmt.Errorf("line %d: digit separator '_' cannot appear at the end of a number", line)
+	}
+	for i := 0; i+1 < len(body); i++ {
+		if body[i] == '_' && body[i+1] == '_' {
+			return fmt.Errorf("line %d: digit separator '_' cannot appear twice in a row", line)
+		}
+	}
+	return nil
 }
 
 func (l *Lexer) lexString(line int) (Token, error) {

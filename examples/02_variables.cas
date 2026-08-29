@@ -18,5 +18,12 @@ func main(): int {
     print("line1\nline2")
     print("emoji: \U0001F600")
 
+    // 整数リテラルの基数・桁区切り(3.2節、AMIVM/Go準拠)
+    let hex: int = 0x1A
+    let oct: int = 0o17
+    let bin: int = 0b101
+    let million: int = 1_000_000
+    print(string(hex) + " " + string(oct) + " " + string(bin) + " " + string(million))
+
     return 0
 }
